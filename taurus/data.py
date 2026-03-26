@@ -350,8 +350,9 @@ def _fetch_single_fundamental(ticker: str) -> dict:
             rec["total_debt"] = _row(["Total Debt", "Long Term Debt"])
             rec["total_equity"] = _row(["Stockholders Equity", "Total Equity"])
             rec["total_assets"] = _row(["Total Assets"])
+            rec["cash"] = _row(["Cash And Cash Equivalents", "Cash"])
         else:
-            rec["total_debt"] = rec["total_equity"] = rec["total_assets"] = np.nan
+            rec["total_debt"] = rec["total_equity"] = rec["total_assets"] = rec["cash"] = np.nan
 
         # Income statement
         inc = t.quarterly_income_stmt
@@ -374,16 +375,30 @@ def _fetch_single_fundamental(ticker: str) -> dict:
             if not np.isnan(tax_exp) and not np.isnan(pretax) and pretax > 0:
                 rec["tax_rate"] = min(tax_exp / pretax, 0.40)
             else:
-                rec["tax_rate"] = 0.21  # US statutory rate
+                rec["tax_rate"] = 0.21
+
+            # Free Cash Flow
+            cf = t.quarterly_cashflow
+            if cf is not None and not cf.empty:
+                def _cf_row(keywords):
+                    for col in cf.index:
+                        for kw in keywords:
+                            if kw.lower() in col.lower():
+                                vals = cf.loc[col].dropna()
+                                return float(vals.iloc[0]) if len(vals) else np.nan
+                    return np.nan
+                rec["fcf"] = _cf_row(["Free Cash Flow", "Capital Expenditure"])
+            else:
+                rec["fcf"] = np.nan
         else:
-            rec["ebit"] = rec["interest_expense"] = np.nan
+            rec["ebit"] = rec["interest_expense"] = rec["fcf"] = np.nan
             rec["tax_rate"] = 0.21
 
     except Exception as exc:
         logger.debug("Fundamental fetch error for %s: %s", ticker, exc)
         for field in ("market_cap", "sector", "industry", "total_debt",
-                      "total_equity", "total_assets", "ebit",
-                      "interest_expense", "tax_rate"):
+                      "total_equity", "total_assets", "cash", "ebit",
+                      "interest_expense", "tax_rate", "fcf"):
             rec.setdefault(field, np.nan if field != "sector" else "Unknown")
 
     return rec

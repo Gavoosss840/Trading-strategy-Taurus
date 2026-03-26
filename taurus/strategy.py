@@ -199,36 +199,40 @@ class TaurusStrategy:
             logger.warning("FF5 regression returned no results.")
             return self._empty_snapshot(as_of)
 
-        # ── 3. MM capital structure screen (run on ALL stocks, not just sig) ── #
-        logger.info("[%s] Running MM capital structure screen...", as_of.date())
+        # ── 3. MM valuation screen (full universe) ────────────────────────── #
+        logger.info("[%s] Running MM valuation screen...", as_of.date())
         live_fund = fund.loc[fund.index.intersection(alpha_df.index)]
         if live_fund.empty:
             logger.warning("No fundamental data for alpha candidates.")
             return self._empty_snapshot(as_of)
 
-        mm_df = mm_capital_structure_screen(live_fund, cfg)
+        # Pass returns for Merton volatility estimation
+        mm_df = mm_capital_structure_screen(live_fund, cfg, returns=window_returns)
 
-        # ── 4. Combined signal (dual confirmation) ─────────────────────── #
+        # ── 4. Combined signal — dual confirmation ─────────────────────── #
         #
-        # LONG  : |t| > threshold AND α > 0  AND underleveraged
-        # SHORT : cross-sectional bottom-quintile alpha AND overleveraged
-        #         (absolute negative-α signal is rare in bull markets; we use
-        #          relative underperformance = bottom 20% of alpha t-stat)
+        # LONG  : VL > market_cap (MM undervalued)  AND  top-half alpha  AND  mom+
+        # SHORT : VL < market_cap (MM overvalued)   AND  bottom-quintile alpha  AND  mom-
         #
-        alpha_sig_long = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+        # Using cross-sectional alpha ranking for the short leg avoids the
+        # "no negative alpha in bull markets" problem: we always short the
+        # *relative* underperformers confirmed by MM overvaluation.
+        #
+        under_tickers = mm_df[mm_df["underleveraged"]].index   # MM undervalued → LONG
+        over_tickers  = mm_df[mm_df["overleveraged"]].index    # MM overvalued  → SHORT
 
-        # Short alpha: stocks in the bottom quintile of t-stat (worst relative alpha)
+        # LONG alpha: positive alpha AND |t| > threshold
+        alpha_long  = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+
+        # SHORT alpha: bottom 20% of t-stat cross-sectionally (worst relative alpha)
         q20 = alpha_df["alpha_tstat"].quantile(0.20)
-        alpha_sig_short = alpha_df[alpha_df["alpha_tstat"] <= q20]
+        alpha_short = alpha_df[alpha_df["alpha_tstat"] <= q20]
 
-        under_tickers = mm_df[mm_df["underleveraged"]].index
-        over_tickers  = mm_df[mm_df["overleveraged"]].index
-
-        long_candidates  = alpha_sig_long.index.intersection(under_tickers)
-        short_candidates = alpha_sig_short.index.intersection(over_tickers)
+        long_candidates  = alpha_long.index.intersection(under_tickers)
+        short_candidates = alpha_short.index.intersection(over_tickers)
 
         logger.info(
-            "[%s] Dual confirmation: %d long, %d short candidates.",
+            "[%s] Dual confirmation: %d long (MM underval + α+), %d short (MM overval + α-).",
             as_of.date(), len(long_candidates), len(short_candidates),
         )
 
@@ -239,8 +243,8 @@ class TaurusStrategy:
             logger.warning("Momentum signal is empty.")
             return self._empty_snapshot(as_of)
 
-        mom_long  = mom_df[mom_df["mom_pos"]].index   # above-median momentum
-        mom_short = mom_df[mom_df["mom_neg"]].index   # below-median momentum
+        mom_long  = mom_df[mom_df["mom_pos"]].index   # above-median momentum → LONG
+        mom_short = mom_df[mom_df["mom_neg"]].index   # below-median momentum → SHORT
 
         long_final  = long_candidates.intersection(mom_long)
         short_final = short_candidates.intersection(mom_short)
