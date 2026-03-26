@@ -87,16 +87,31 @@ def get_sp500_tickers(cfg: TaurusConfig = DEFAULT_CONFIG) -> List[str]:
     tickers: List[str] = []
     try:
         import requests as _req
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; TaurusBot/1.0)"}
+        from bs4 import BeautifulSoup
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         resp = _req.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            headers=headers, timeout=15,
+            headers=headers, timeout=20,
         )
         resp.raise_for_status()
-        tables = pd.read_html(resp.text, attrs={"id": "constituents"})
-        df = tables[0]
-        tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table", {"id": "constituents"})
+        if table is None:
+            raise ValueError("Table #constituents not found in Wikipedia page")
+        rows = table.find_all("tr")[1:]   # skip header
+        tickers = []
+        for row in rows:
+            cells = row.find_all("td")
+            if cells:
+                sym = cells[0].get_text(strip=True).replace(".", "-")
+                if sym:
+                    tickers.append(sym)
+        if len(tickers) < 100:
+            raise ValueError(f"Only {len(tickers)} tickers parsed — page structure may have changed")
         logger.info("Loaded %d S&P 500 tickers from Wikipedia.", len(tickers))
+    except ImportError:
+        logger.warning("beautifulsoup4 not installed – using fallback tickers. Run: pip install beautifulsoup4")
+        tickers = _SP500_FALLBACK
     except Exception as exc:
         logger.warning("Wikipedia fetch failed (%s). Using fallback tickers.", exc)
         tickers = _SP500_FALLBACK

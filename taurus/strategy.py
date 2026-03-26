@@ -199,48 +199,48 @@ class TaurusStrategy:
             logger.warning("FF5 regression returned no results.")
             return self._empty_snapshot(as_of)
 
-        alpha_sig = alpha_df[alpha_df["signal"]]  # |t| > threshold
-
-        # ── 3. MM capital structure screen ────────────────────────────── #
+        # ── 3. MM capital structure screen (run on ALL stocks, not just sig) ── #
         logger.info("[%s] Running MM capital structure screen...", as_of.date())
-        live_fund = fund.loc[fund.index.intersection(alpha_sig.index)]
+        live_fund = fund.loc[fund.index.intersection(alpha_df.index)]
         if live_fund.empty:
             logger.warning("No fundamental data for alpha candidates.")
             return self._empty_snapshot(as_of)
 
         mm_df = mm_capital_structure_screen(live_fund, cfg)
 
-        # ── 4. Combined signal (dual confirmation) ────────────────────── #
-        long_alpha_tickers  = alpha_sig[alpha_sig["alpha_sign"] > 0].index
-        short_alpha_tickers = alpha_sig[alpha_sig["alpha_sign"] < 0].index
+        # ── 4. Combined signal (dual confirmation) ─────────────────────── #
+        #
+        # LONG  : |t| > threshold AND α > 0  AND underleveraged
+        # SHORT : cross-sectional bottom-quintile alpha AND overleveraged
+        #         (absolute negative-α signal is rare in bull markets; we use
+        #          relative underperformance = bottom 20% of alpha t-stat)
+        #
+        alpha_sig_long = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+
+        # Short alpha: stocks in the bottom quintile of t-stat (worst relative alpha)
+        q20 = alpha_df["alpha_tstat"].quantile(0.20)
+        alpha_sig_short = alpha_df[alpha_df["alpha_tstat"] <= q20]
 
         under_tickers = mm_df[mm_df["underleveraged"]].index
         over_tickers  = mm_df[mm_df["overleveraged"]].index
 
-        # Intersection: alpha signal AND leverage confirmation
-        long_candidates  = long_alpha_tickers.intersection(under_tickers)
-        short_candidates = short_alpha_tickers.intersection(over_tickers)
+        long_candidates  = alpha_sig_long.index.intersection(under_tickers)
+        short_candidates = alpha_sig_short.index.intersection(over_tickers)
 
         logger.info(
             "[%s] Dual confirmation: %d long, %d short candidates.",
             as_of.date(), len(long_candidates), len(short_candidates),
         )
 
-        # ── 5. Momentum filter ────────────────────────────────────────── #
+        # ── 5. Momentum filter ─────────────────────────────────────────── #
         logger.info("[%s] Applying momentum filter...", as_of.date())
         mom_df = momentum_signal(prices, as_of, cfg)
         if mom_df.empty:
             logger.warning("Momentum signal is empty.")
             return self._empty_snapshot(as_of)
 
-        # Use strict tercile if enough candidates, else fall back to median split
-        n_long_cands  = len(long_candidates)
-        n_short_cands = len(short_candidates)
-        use_strict_long  = n_long_cands  >= 6
-        use_strict_short = n_short_cands >= 6
-
-        mom_long  = mom_df[mom_df["mom_pos_strict"] if use_strict_long  else mom_df["mom_pos"]].index
-        mom_short = mom_df[mom_df["mom_neg_strict"] if use_strict_short else mom_df["mom_neg"]].index
+        mom_long  = mom_df[mom_df["mom_pos"]].index   # above-median momentum
+        mom_short = mom_df[mom_df["mom_neg"]].index   # below-median momentum
 
         long_final  = long_candidates.intersection(mom_long)
         short_final = short_candidates.intersection(mom_short)
