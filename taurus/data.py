@@ -105,13 +105,37 @@ def get_sp500_tickers(cfg: TaurusConfig = DEFAULT_CONFIG) -> List[str]:
     return tickers
 
 
-# A representative 50-stock fallback used when Wikipedia is unreachable.
+# 120-stock diversified fallback covering all 11 GICS sectors so the MM
+# screen always has enough overleveraged AND underleveraged candidates.
 _SP500_FALLBACK = [
-    "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "GOOG", "BRK-B", "LLY",
-    "AVGO", "JPM", "TSLA", "UNH", "V", "XOM", "MA", "PG", "COST", "JNJ",
-    "HD", "ABBV", "MRK", "CVX", "CRM", "BAC", "AMD", "PEP", "KO", "ACN",
-    "TMO", "MCD", "CSCO", "ADBE", "LIN", "ABT", "WMT", "NFLX", "DIS", "TXN",
-    "DHR", "PM", "NEE", "INTU", "AMGN", "IBM", "RTX", "CAT", "GE", "SPGI",
+    # Information Technology (low debt → underleveraged)
+    "AAPL", "MSFT", "NVDA", "AVGO", "AMD", "ADBE", "CRM", "CSCO", "TXN",
+    "INTU", "ORCL", "QCOM", "ACN", "IBM", "NOW", "AMAT", "MU", "LRCX", "KLAC",
+    # Communication Services
+    "GOOGL", "META", "NFLX", "DIS", "VZ", "T", "CMCSA", "CHTR",
+    # Consumer Discretionary
+    "AMZN", "TSLA", "MCD", "HD", "NKE", "SBUX", "TGT", "LOW", "BKNG", "MAR",
+    # Consumer Staples (moderate debt)
+    "PG", "COST", "KO", "PEP", "WMT", "PM", "MO", "CL", "KHC", "GIS",
+    # Health Care
+    "LLY", "UNH", "JNJ", "ABBV", "MRK", "TMO", "ABT", "DHR", "BMY", "AMGN",
+    "CVS", "CI", "HUM", "ISRG", "REGN",
+    # Financials (high leverage by design)
+    "JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "C", "AXP", "BRK-B",
+    "CB", "PGR", "MET", "PRU", "AFL",
+    # Industrials (moderate-high debt)
+    "RTX", "CAT", "GE", "HON", "UPS", "BA", "LMT", "NOC", "DE", "MMM",
+    "EMR", "ETN", "PH", "ROK", "FDX",
+    # Energy (high leverage, cyclical)
+    "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "PSX", "VLO", "HAL", "DVN",
+    # Materials (moderate-high debt)
+    "LIN", "APD", "ECL", "NEM", "FCX", "NUE", "VMC", "MLM",
+    # Utilities (highest leverage → overleveraged candidates)
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "ED", "ETR", "FE",
+    # Real Estate (high leverage)
+    "PLD", "AMT", "EQIX", "CCI", "PSA", "O", "WELL", "AVB",
+    # Misc large-cap
+    "V", "MA", "SPGI", "MCO", "BX", "KKR",
 ]
 
 

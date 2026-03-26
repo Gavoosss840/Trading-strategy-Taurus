@@ -221,12 +221,24 @@ def top_positions_table(result: "BacktestResult", n: int = 20) -> pd.DataFrame:
     if not result.snapshots:
         return pd.DataFrame()
 
-    snap = result.snapshots[-1]
+    # Find the most recent non-empty snapshot
+    snap = None
+    for s in reversed(result.snapshots):
+        if not s.long_weights.empty or not s.short_weights.empty:
+            snap = s
+            break
+
+    if snap is None:
+        return pd.DataFrame()
+
     rows = []
     for t, w in snap.long_weights.items():
         rows.append({"ticker": t, "leg": "LONG",  "weight": w})
     for t, w in snap.short_weights.items():
         rows.append({"ticker": t, "leg": "SHORT", "weight": -w})
+
+    if not rows:
+        return pd.DataFrame()
 
     df = pd.DataFrame(rows).sort_values("weight", ascending=False)
     return df.head(n).reset_index(drop=True)

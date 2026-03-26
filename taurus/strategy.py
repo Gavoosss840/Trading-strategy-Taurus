@@ -233,8 +233,14 @@ class TaurusStrategy:
             logger.warning("Momentum signal is empty.")
             return self._empty_snapshot(as_of)
 
-        mom_long  = mom_df[mom_df["mom_pos_strict"]].index
-        mom_short = mom_df[mom_df["mom_neg_strict"]].index
+        # Use strict tercile if enough candidates, else fall back to median split
+        n_long_cands  = len(long_candidates)
+        n_short_cands = len(short_candidates)
+        use_strict_long  = n_long_cands  >= 6
+        use_strict_short = n_short_cands >= 6
+
+        mom_long  = mom_df[mom_df["mom_pos_strict"] if use_strict_long  else mom_df["mom_pos"]].index
+        mom_short = mom_df[mom_df["mom_neg_strict"] if use_strict_short else mom_df["mom_neg"]].index
 
         long_final  = long_candidates.intersection(mom_long)
         short_final = short_candidates.intersection(mom_short)
