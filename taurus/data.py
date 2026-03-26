@@ -86,10 +86,14 @@ def get_sp500_tickers(cfg: TaurusConfig = DEFAULT_CONFIG) -> List[str]:
 
     tickers: List[str] = []
     try:
-        tables = pd.read_html(
+        import requests as _req
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; TaurusBot/1.0)"}
+        resp = _req.get(
             "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
-            attrs={"id": "constituents"},
+            headers=headers, timeout=15,
         )
+        resp.raise_for_status()
+        tables = pd.read_html(resp.text, attrs={"id": "constituents"})
         df = tables[0]
         tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
         logger.info("Loaded %d S&P 500 tickers from Wikipedia.", len(tickers))
@@ -209,8 +213,9 @@ def get_ff5_factors(
 
     if ff5 is None:
         raise RuntimeError(
-            "Could not retrieve Fama-French 5-factor data. "
-            "Install pandas-datareader or ensure internet access."
+            "Could not retrieve Fama-French 5-factor data.\n"
+            "Try: pip install pandas-datareader\n"
+            "Or check your internet connection."
         )
 
     _cache_save(key, ff5, cfg)
@@ -228,7 +233,7 @@ def _download_ff5_directly(start: str, end: str) -> Optional[pd.DataFrame]:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         zf = zipfile.ZipFile(io.BytesIO(resp.content))
-        name = [n for n in zf.namelist() if n.endswith(".CSV")][0]
+        name = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
         raw = pd.read_csv(
             io.StringIO(zf.read(name).decode()),
             skiprows=3,
