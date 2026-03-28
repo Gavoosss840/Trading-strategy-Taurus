@@ -392,10 +392,19 @@ class BacktestResult:
                 (self.returns.index <= hold_end)
             ]
 
+            # Leverage scaling: gross_leverage=1.5 → each leg runs at 75% of NAV
+            lev  = self.cfg.gross_leverage
+            half = lev / 2.0  # weight applied to each leg
+
+            # Monthly financing cost (margin + borrow), deducted pro-rata
+            margin_cost_m = (self.cfg.margin_cost_annual + self.cfg.borrow_cost_annual) / 12
+            leverage_cost_m = (lev - 1.0) * margin_cost_m  # only on borrowed portion
+
             for month_date, month_ret in month_range.iterrows():
                 long_ret  = (snap.long_weights  * month_ret.reindex(snap.long_weights.index,  fill_value=0)).sum()
                 short_ret = (snap.short_weights * month_ret.reindex(snap.short_weights.index, fill_value=0)).sum()
-                gross_ret = 0.5 * long_ret - 0.5 * short_ret  # dollar-neutral
+                gross_ret = half * long_ret - half * short_ret  # leveraged dollar-neutral
+                gross_ret -= leverage_cost_m                     # deduct financing cost
                 pnl_records.append({"date": month_date, "return": gross_ret})
 
             # Turnover-based cost at rebalance

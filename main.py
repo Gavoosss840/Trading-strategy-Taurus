@@ -62,6 +62,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache-dir",   default=".cache")
     p.add_argument("--cache-ttl",   type=float, default=12.0, help="Cache TTL in hours")
 
+    # Leverage
+    p.add_argument("--leverage",      type=float, default=1.0,
+                   help="Gross leverage (1.0=no leverage, 1.5=150%% gross)")
+    p.add_argument("--margin-cost",   type=float, default=0.058,
+                   help="Annual margin financing cost (default: 5.8%% IBKR)")
+    p.add_argument("--borrow-cost",   type=float, default=0.010,
+                   help="Annual stock borrow fee for shorts (default: 1.0%%)")
+
     # Optional ticker list
     p.add_argument("--tickers", nargs="*", default=None,
                    help="Explicit ticker list (defaults to full S&P 500)")
@@ -82,6 +90,9 @@ def build_config(args: argparse.Namespace):
         cov_shrinkage=not args.no_shrinkage,
         cache_dir=args.cache_dir,
         cache_ttl_hours=args.cache_ttl,
+        gross_leverage=args.leverage,
+        margin_cost_annual=args.margin_cost,
+        borrow_cost_annual=args.borrow_cost,
     )
 
 

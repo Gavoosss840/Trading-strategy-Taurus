@@ -60,6 +60,16 @@ class TaurusConfig:
     optimizer_max_iter: int = 1_000
 
     # ------------------------------------------------------------------ #
+    #  Leverage                                                           #
+    # ------------------------------------------------------------------ #
+    # gross_leverage: 1.0 = no leverage, 1.5 = 150% gross (75L/75S)
+    # margin_cost_annual: annual cost of borrowed capital (IBKR ~5.8%)
+    # borrow_cost_annual: stock borrow fee for short positions (~0.5-2%)
+    gross_leverage: float = 1.0
+    margin_cost_annual: float = 0.058    # 5.8%/an (fed funds + spread)
+    borrow_cost_annual: float = 0.010    # 1.0%/an avg stock borrow fee
+
+    # ------------------------------------------------------------------ #
     #  Execution / back-test                                              #
     # ------------------------------------------------------------------ #
     rebalance_freq: str = "ME"           # pandas offset alias
