@@ -205,6 +205,7 @@ def run_backtest(args, cfg) -> None:
             end=args.end,
             tickers=tickers,
             factors_df=factors,
+            fundamentals_fn=udef.get_fundamentals,   # yfinance for non-US, EDGAR for US
         )
 
         analytics = result.analytics()

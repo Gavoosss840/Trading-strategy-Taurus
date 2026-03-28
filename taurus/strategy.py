@@ -125,16 +125,21 @@ class TaurusStrategy:
         end: str,
         tickers: Optional[List[str]] = None,
         factors_df: Optional[pd.DataFrame] = None,
+        fundamentals_fn=None,
     ) -> None:
         """
         Pre-fetch and cache all data required for the strategy.
 
         Parameters
         ----------
-        start, end  : ISO date strings  (e.g. "2015-01-01")
-        tickers     : optional list; defaults to full S&P 500
-        factors_df  : optional pre-loaded FF5 factors (for multi-universe use);
-                      if None, falls back to get_ff5_factors() for US data
+        start, end       : ISO date strings  (e.g. "2015-01-01")
+        tickers          : optional list; defaults to full S&P 500
+        factors_df       : optional pre-loaded FF5 factors (for multi-universe use);
+                           if None, falls back to get_ff5_factors() for US data
+        fundamentals_fn  : callable(tickers, cfg) → DataFrame
+                           Defaults to get_fundamentals (SEC EDGAR + yfinance).
+                           Pass universe.get_fundamentals for non-US universes
+                           so yfinance is used directly (EDGAR is US-only).
         """
         cfg = self.cfg
 
@@ -152,7 +157,8 @@ class TaurusStrategy:
         logger.info("Loading fundamental data...")
         # Only load fundamentals for tickers that survived the price filter
         live_tickers = self._prices.columns.tolist()
-        self._fundamentals = get_fundamentals(live_tickers, cfg)
+        _fund_fn = fundamentals_fn if fundamentals_fn is not None else get_fundamentals
+        self._fundamentals = _fund_fn(live_tickers, cfg)
 
         logger.info(
             "Data loaded: %d tickers, %d months, FF5 %d months.",
@@ -415,6 +421,7 @@ class TaurusStrategy:
         end: str,
         tickers: Optional[List[str]] = None,
         factors_df: Optional[pd.DataFrame] = None,
+        fundamentals_fn=None,
     ) -> "BacktestResult":
         """
         Run a full vectorised back-test over [start, end].
@@ -427,7 +434,8 @@ class TaurusStrategy:
             pd.Timestamp(start) - pd.DateOffset(months=warm_up_months)
         ).strftime("%Y-%m-%d")
 
-        self.load_data(warm_start, end, tickers, factors_df=factors_df)
+        self.load_data(warm_start, end, tickers, factors_df=factors_df,
+                       fundamentals_fn=fundamentals_fn)
 
         prices  = self._prices
         returns = self._returns
