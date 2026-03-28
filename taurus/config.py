@@ -13,18 +13,20 @@ from typing import Optional
 @dataclass
 class UniverseConfig:
     """Per-universe metadata for data sourcing and IBKR execution."""
-    name:                 str              # "sp500" | "nasdaq100" | "cac40" | "dax" | "ftse100"
+    name:                 str              # "sp500" | "nasdaq100" | "cac40" | ...
     display_name:         str              # "S&P 500"
-    region:               str              # "US" | "Europe"
-    currency:             str              # "USD" | "EUR" | "GBP"
-    ff5_dataset:          str              # Ken French dataset key
-    futures_symbol:       str              # "ES" | "NQ" | "CAC" | "DAX" | "Z"
-    futures_exchange:     str              # "CME" | "EUREX" | "MONEP" | "LIFFE"
-    futures_currency:     str             # "USD" | "EUR" | "GBP"
-    futures_multiplier:   float            # ES=50, NQ=20, CAC=10, DAX=25, FTSE=10
-    ibkr_exchange:        str              # "SMART" | "SBF" | "IBIS" | "LSE"
-    wikipedia_url:        str              # URL for ticker scraping
+    region:               str              # "US" | "Europe" | "Japan" | "Asia" | "MiddleEast"
+    currency:             str              # "USD" | "EUR" | "GBP" | "JPY" | "HKD" | "SAR"
+    ff5_dataset:          str              # Ken French dataset name
+    futures_symbol:       str              # "ES" | "NQ" | "CAC" | "DAX" | "Z" | "NK225" | ...
+    futures_exchange:     str              # "CME" | "EUREX" | "MONEP" | "LIFFE" | "OSE" | "HKEX"
+    futures_currency:     str             # "USD" | "EUR" | "GBP" | "JPY" | "HKD"
+    futures_multiplier:   float            # contract multiplier
+    ibkr_exchange:        str              # "SMART" | "SBF" | "IBIS" | "LSE" | "TSEJ" | "SEHK"
+    wikipedia_url:        str              # URL for constituent scraping
     wikipedia_table_id:   str              # HTML table id on Wikipedia page
+    ticker_suffix:        str   = ""       # appended after scrape: ".T" Japan, ".HK" HK, ".SR" Saudi
+    ticker_col_index:     int   = 0        # column index of ticker in Wikipedia table
     min_market_cap_usd:   float = 2e9
     n_longs:              int   = 25
     n_shorts:             int   = 25
