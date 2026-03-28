@@ -20,11 +20,26 @@ def test_connection():
         return None
 
 
+def _market_is_open() -> bool:
+    """Vérifie si le marché US est ouvert (9h30-16h EST, lun-ven)."""
+    from datetime import datetime
+    import zoneinfo
+    now = datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:   # samedi=5, dimanche=6
+        return False
+    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
 def test_stock_price(ib: IB, ticker: str = "AAPL"):
-    print(f"\n--- Prix (données différées) : {ticker} ---")
-    # Type 1 = temps réel (abonnement IBKR actif requis)
-    # Type 3 = différé 15min (fallback si pas d'abonnement)
-    ib.reqMarketDataType(1)
+    is_open = _market_is_open()
+    mode    = "temps réel" if is_open else "frozen (dernier close vendredi)"
+    print(f"\n--- Prix {mode} : {ticker} ---")
+
+    # Type 1 = temps réel | Type 2 = frozen last close (marché fermé)
+    ib.reqMarketDataType(1 if is_open else 2)
+
     contract = Stock(ticker, "SMART", "USD")
     ib.qualifyContracts(contract)
     mkt = ib.reqMktData(contract, "", False, False)
