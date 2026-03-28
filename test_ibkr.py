@@ -21,11 +21,14 @@ def test_connection():
 
 
 def test_stock_price(ib: IB, ticker: str = "AAPL"):
-    print(f"\n--- Prix temps réel : {ticker} ---")
+    print(f"\n--- Prix (données différées) : {ticker} ---")
+    # Type 3 = données différées gratuites (15 min de délai)
+    # Suffisant pour Taurus qui rebalance mensuellement
+    ib.reqMarketDataType(3)
     contract = Stock(ticker, "SMART", "USD")
     ib.qualifyContracts(contract)
     mkt = ib.reqMktData(contract, "", False, False)
-    ib.sleep(2)
+    ib.sleep(3)
     print(f"  Last  : {mkt.last}")
     print(f"  Bid   : {mkt.bid}")
     print(f"  Ask   : {mkt.ask}")
@@ -37,15 +40,24 @@ def test_historical_data(ib: IB, ticker: str = "AAPL"):
     print(f"\n--- Historique mensuel : {ticker} (12 derniers mois) ---")
     contract = Stock(ticker, "SMART", "USD")
     ib.qualifyContracts(contract)
+    # ADJUSTED_LAST non supporté en mensuel → on prend journalier TRADES
+    # et on resample en mensuel (fin de mois)
     bars = ib.reqHistoricalData(
         contract,
         endDateTime="",
         durationStr="12 M",
-        barSizeSetting="1 month",
-        whatToShow="ADJUSTED_LAST",
+        barSizeSetting="1 day",
+        whatToShow="TRADES",
         useRTH=True,
+        keepUpToDate=False,
     )
-    df = util.df(bars)[["date", "open", "high", "low", "close", "volume"]]
+    if not bars:
+        print("  ⚠ Aucune donnée retournée (abonnement ou heure de marché)")
+        return
+    import pandas as pd
+    df = util.df(bars)[["date", "close", "volume"]]
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").resample("ME").last().reset_index()
     print(df.tail(6).to_string(index=False))
 
 
