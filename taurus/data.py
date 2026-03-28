@@ -28,11 +28,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-try:
-    import pandas_datareader.data as web
-    _HAS_PDR = True
-except ImportError:
-    _HAS_PDR = False
+_HAS_PDR = False  # lazy-loaded inside get_ff5_factors to avoid import-time errors
 
 from .config import TaurusConfig, DEFAULT_CONFIG
 
@@ -238,15 +234,15 @@ def get_ff5_factors(
 
     ff5: Optional[pd.DataFrame] = None
 
-    if _HAS_PDR:
-        try:
-            ff5 = web.DataReader(
-                "F-F_Research_Data_5_Factors_2x3",
-                "famafrench",
-                start=start,
-                end=end,
-            )[0]
-            ff5.index = ff5.index.to_timestamp("M")
+    try:
+        import pandas_datareader.data as web
+        ff5 = web.DataReader(
+            "F-F_Research_Data_5_Factors_2x3",
+            "famafrench",
+            start=start,
+            end=end,
+        )[0]
+        ff5.index = ff5.index.to_timestamp("M")
             ff5 = ff5 / 100.0          # percent → decimal
             ff5.index.name = "Date"
             logger.info("FF5 factors loaded via pandas_datareader.")
