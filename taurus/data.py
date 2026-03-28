@@ -36,6 +36,12 @@ except ImportError:
 
 from .config import TaurusConfig, DEFAULT_CONFIG
 
+try:
+    from .sec_edgar import get_fundamentals_batch as _edgar_batch
+    _HAS_EDGAR = True
+except ImportError:
+    _HAS_EDGAR = False
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
@@ -301,28 +307,62 @@ def get_fundamentals(
     cfg: TaurusConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
     """
-    Retrieve key fundamental metrics for each ticker via yfinance.
+    Retrieve key fundamental metrics for each ticker.
+
+    Source priority:
+      1. SEC EDGAR (gratuit, <15min après publication 10-Q/10-K)
+      2. yfinance (fallback si EDGAR indisponible)
 
     Returns a DataFrame indexed by ticker with columns:
         total_debt, total_equity, ebit, interest_expense,
-        total_assets, market_cap, sector, tax_rate
+        total_assets, market_cap, sector, tax_rate, cash, fcf
     """
     key = f"fundamentals_{'_'.join(sorted(tickers[:5]))}_{len(tickers)}"
     cached = _cache_load(key, cfg)
     if cached is not None:
         return cached
 
-    records = []
-    batch_size = 10
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i : i + batch_size]
-        for ticker in batch:
+    if _HAS_EDGAR:
+        logger.info("Fetching fundamentals from SEC EDGAR for %d tickers...", len(tickers))
+        edgar_data = _edgar_batch(tickers, max_workers=5)
+        records = []
+        for ticker in tickers:
+            row = edgar_data.get(ticker, {})
+            rec = {"ticker": ticker}
+            rec["total_debt"]       = row.get("total_debt",       np.nan)
+            rec["total_equity"]     = row.get("total_equity",     np.nan)
+            rec["total_assets"]     = row.get("total_assets",     np.nan)
+            rec["ebit"]             = row.get("ebit",             np.nan)
+            rec["interest_expense"] = row.get("interest_expense", np.nan)
+            rec["cash"]             = row.get("cash",             np.nan)
+            rec["market_cap"]       = row.get("market_cap",       np.nan)
+            rec["sector"]           = row.get("sector",           "Unknown")
+            rec["tax_rate"]         = 0.21   # taux standard US
+            rec["fcf"]              = row.get("net_income",       np.nan)  # proxy FCF
+            records.append(rec)
+        df = pd.DataFrame(records).set_index("ticker")
+
+        # Compléter market_cap et sector via yfinance (données légères)
+        missing_mktcap = df[df["market_cap"].isna()].index.tolist()
+        if missing_mktcap:
+            logger.info("Completing market_cap/sector for %d tickers via yfinance...", len(missing_mktcap))
+            for ticker in missing_mktcap[:50]:   # limite pour éviter les timeouts
+                try:
+                    info = yf.Ticker(ticker).info or {}
+                    df.loc[ticker, "market_cap"] = info.get("marketCap", np.nan)
+                    df.loc[ticker, "sector"]     = info.get("sector", "Unknown")
+                except Exception:
+                    pass
+    else:
+        logger.info("SEC EDGAR non disponible, utilisation de yfinance...")
+        records = []
+        for ticker in tickers:
             rec = _fetch_single_fundamental(ticker)
             records.append(rec)
+        df = pd.DataFrame(records).set_index("ticker")
 
-    df = pd.DataFrame(records).set_index("ticker")
     _cache_save(key, df, cfg)
-    logger.info("Fundamentals fetched for %d tickers.", len(df))
+    logger.info("Fundamentals ready for %d tickers.", len(df))
     return df
 
 
