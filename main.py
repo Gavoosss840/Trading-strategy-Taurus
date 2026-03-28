@@ -158,6 +158,10 @@ def run_snapshot(args, cfg) -> None:
 def run_backtest(args, cfg) -> None:
     from taurus.strategy import TaurusStrategy
     from taurus.reporting import (
+        combined_positions_df,
+        plot_combined_equity_curve,
+        plot_combined_heatmap,
+        plot_combined_rolling_sharpe,
         plot_equity_curve,
         plot_monthly_heatmap,
         plot_rolling_sharpe,
@@ -165,6 +169,7 @@ def run_backtest(args, cfg) -> None:
         top_positions_table,
     )
     from taurus.universe import REGISTRY
+    import dataclasses
     import json
     import pandas as pd
 
@@ -173,8 +178,8 @@ def run_backtest(args, cfg) -> None:
 
     universes = args.universes if hasattr(args, "universes") and args.universes else ["sp500"]
 
-    all_analytics = {}
-    all_results   = {}
+    all_analytics: dict = {}
+    all_results:   dict = {}
 
     for universe_name in universes:
         logger.info("=" * 60)
@@ -186,15 +191,8 @@ def run_backtest(args, cfg) -> None:
         uni_out = output / universe_name
         uni_out.mkdir(parents=True, exist_ok=True)
 
-        # Per-universe config overrides
-        import dataclasses
-        u_cfg = dataclasses.replace(
-            cfg,
-            n_longs=ucfg.n_longs,
-            n_shorts=ucfg.n_shorts,
-        )
+        u_cfg = dataclasses.replace(cfg, n_longs=ucfg.n_longs, n_shorts=ucfg.n_shorts)
 
-        # FF5 doit couvrir la fenêtre warm-up (60+ mois avant args.start)
         warm_months = u_cfg.lookback_months + u_cfg.momentum_months + 6
         warm_start  = (pd.Timestamp(args.start) - pd.DateOffset(months=warm_months)).strftime("%Y-%m-%d")
 
@@ -216,7 +214,7 @@ def run_backtest(args, cfg) -> None:
 
         print_analytics(analytics)
 
-        # Per-universe artefacts
+        # ── Per-universe artefacts ──────────────────────────────────────── #
         with open(uni_out / "analytics.json", "w") as f:
             json.dump(analytics, f, indent=2)
         result.positions_df().to_csv(uni_out / "positions.csv", index=False)
@@ -225,56 +223,61 @@ def run_backtest(args, cfg) -> None:
             plot_equity_curve(result,    save_path=str(uni_out / "equity_curve.png"))
             plot_monthly_heatmap(result, save_path=str(uni_out / "monthly_heatmap.png"))
             plot_rolling_sharpe(result,  save_path=str(uni_out / "rolling_sharpe.png"))
+            logger.info("Per-universe charts saved to %s/", uni_out)
         except Exception as exc:
-            logger.warning("Charts failed for %s: %s", universe_name, exc)
+            logger.warning("Per-universe charts failed for %s: %s", universe_name, exc)
 
         top = top_positions_table(result, n=10)
         if not top.empty:
             logger.info("[%s] Top positions:\n%s", universe_name, top.to_string(index=False))
 
-    # ── Combined summary (multi-universe) ───────────────────────────────── #
-    if len(universes) > 1:
-        logger.info("\n%s", "=" * 60)
-        logger.info("COMBINED SUMMARY")
-        logger.info("=" * 60)
-        for name, a in all_analytics.items():
-            logger.info(
-                "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
-                name.upper(),
-                a.get("total_return",  0) * 100,
-                a.get("annual_return", 0) * 100,
-                a.get("sharpe_ratio",  0),
-                a.get("max_drawdown",  0) * 100,
-            )
-        with open(output / "combined_analytics.json", "w") as f:
-            json.dump(all_analytics, f, indent=2)
+    # ── Combined summary ────────────────────────────────────────────────── #
+    logger.info("\n%s", "=" * 60)
+    logger.info("COMBINED SUMMARY")
+    logger.info("=" * 60)
+    for name, a in all_analytics.items():
+        logger.info(
+            "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+            name.upper(),
+            a.get("total_return",  0) * 100,
+            a.get("annual_return", 0) * 100,
+            a.get("sharpe_ratio",  0),
+            a.get("max_drawdown",  0) * 100,
+        )
+    with open(output / "combined_analytics.json", "w") as f:
+        json.dump(all_analytics, f, indent=2)
 
-    # Keep single-universe analytics for backward compat
-    analytics = all_analytics.get(universes[0], {})
-    result    = all_results.get(universes[0])
+    # ── Combined positions CSV (all universes, universe column added) ──── #
+    pos_path = output / "positions.csv"
+    if len(all_results) > 1:
+        combined_positions_df(all_results).to_csv(pos_path, index=False)
+    else:
+        next(iter(all_results.values())).positions_df().to_csv(pos_path, index=False)
+    logger.info("Positions saved to %s", pos_path)
 
-    # ── Save artefacts ──────────────────────────────────────────────────── #
-    analytics_path = output / "analytics.json"
-    with open(analytics_path, "w") as f:
-        json.dump(analytics, f, indent=2)
-    logger.info("Analytics saved to %s", analytics_path)
-
-    positions_path = output / "positions.csv"
-    result.positions_df().to_csv(positions_path, index=False)
-    logger.info("Positions saved to %s", positions_path)
-
+    # ── Combined charts (multi-universe OR single) ───────────────────────── #
     try:
-        plot_equity_curve(result,  save_path=str(output / "equity_curve.png"))
-        plot_monthly_heatmap(result, save_path=str(output / "monthly_heatmap.png"))
-        plot_rolling_sharpe(result,  save_path=str(output / "rolling_sharpe.png"))
-        logger.info("Charts saved to %s/", output)
+        if len(all_results) > 1:
+            plot_combined_equity_curve(
+                all_results, save_path=str(output / "equity_curve.png"))
+            plot_combined_heatmap(
+                all_results, save_path=str(output / "monthly_heatmap.png"))
+            plot_combined_rolling_sharpe(
+                all_results, save_path=str(output / "rolling_sharpe.png"))
+        else:
+            result = next(iter(all_results.values()))
+            plot_equity_curve(result,    save_path=str(output / "equity_curve.png"))
+            plot_monthly_heatmap(result, save_path=str(output / "monthly_heatmap.png"))
+            plot_rolling_sharpe(result,  save_path=str(output / "rolling_sharpe.png"))
+        logger.info("Combined charts saved to %s/", output)
     except Exception as exc:
-        logger.warning("Chart generation failed: %s", exc)
+        logger.warning("Combined chart generation failed: %s", exc)
 
-    # ── Top positions ────────────────────────────────────────────────────── #
-    top = top_positions_table(result, n=20)
-    if not top.empty:
-        logger.info("Top positions (most recent rebalance):\n%s", top.to_string(index=False))
+    # ── Top positions (most recent, all universes) ───────────────────────── #
+    for name, result in all_results.items():
+        top = top_positions_table(result, n=10)
+        if not top.empty:
+            logger.info("[%s] Latest top positions:\n%s", name.upper(), top.to_string(index=False))
 
 
 def run_live(args, cfg) -> None:
