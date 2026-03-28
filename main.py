@@ -239,11 +239,12 @@ def run_backtest(args, cfg) -> None:
         logger.info("=" * 60)
         for name, a in all_analytics.items():
             logger.info(
-                "  %-12s  Return=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+                "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
                 name.upper(),
-                a.get("total_return_pct", 0),
-                a.get("sharpe_ratio", 0),
-                a.get("max_drawdown_pct", 0),
+                a.get("total_return",  0) * 100,
+                a.get("annual_return", 0) * 100,
+                a.get("sharpe_ratio",  0),
+                a.get("max_drawdown",  0) * 100,
             )
         with open(output / "combined_analytics.json", "w") as f:
             json.dump(all_analytics, f, indent=2)

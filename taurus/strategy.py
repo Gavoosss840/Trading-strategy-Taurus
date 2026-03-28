@@ -226,14 +226,34 @@ class TaurusStrategy:
         under_tickers = mm_df[mm_df["underleveraged"]].index   # MM undervalued → LONG
         over_tickers  = mm_df[mm_df["overleveraged"]].index    # MM overvalued  → SHORT
 
-        # LONG alpha: positive alpha AND |t| > threshold
-        alpha_long  = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+        # LONG alpha: absolute filter (positive alpha AND |t| > threshold)
+        alpha_long_abs = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+        long_candidates_abs = alpha_long_abs.index.intersection(under_tickers)
+
+        # If absolute filter yields too few candidates (e.g. tech-heavy NASDAQ 100),
+        # fall back to cross-sectional ranking: top 50% alpha t-stat within the
+        # MM undervalued pool — mirrors the relative approach used for shorts.
+        min_long_candidates = max(3, cfg.n_longs // 3)
+        if len(long_candidates_abs) >= min_long_candidates:
+            long_candidates = long_candidates_abs
+        else:
+            under_alpha = alpha_df.loc[alpha_df.index.intersection(under_tickers)]
+            if not under_alpha.empty:
+                q50_under = under_alpha["alpha_tstat"].quantile(0.50)
+                alpha_long_cs = under_alpha[under_alpha["alpha_tstat"] >= q50_under]
+                long_candidates = alpha_long_cs.index
+                logger.info(
+                    "[%s] LONG absolute filter yielded %d candidates; "
+                    "using cross-sectional top-50%% within %d undervalued stocks → %d candidates.",
+                    as_of.date(), len(long_candidates_abs), len(under_tickers), len(long_candidates),
+                )
+            else:
+                long_candidates = long_candidates_abs
 
         # SHORT alpha: bottom 20% of t-stat cross-sectionally (worst relative alpha)
         q20 = alpha_df["alpha_tstat"].quantile(0.20)
         alpha_short = alpha_df[alpha_df["alpha_tstat"] <= q20]
 
-        long_candidates  = alpha_long.index.intersection(under_tickers)
         short_candidates = alpha_short.index.intersection(over_tickers)
 
         logger.info(
@@ -468,14 +488,18 @@ class BacktestResult:
         calmar   = ann / abs(drawdown) if drawdown < 0 else np.nan
 
         return {
-            "total_return":     float(total),
-            "annual_return":    float(ann),
-            "annual_vol":       float(vol),
-            "sharpe_ratio":     float(sharpe),
-            "max_drawdown":     float(drawdown),
-            "calmar_ratio":     float(calmar),
-            "n_months":         len(ret),
-            "n_rebalances":     len(self.snapshots),
+            "total_return":         float(total),
+            "total_return_pct":     float(total * 100),
+            "annual_return":        float(ann),
+            "annual_return_pct":    float(ann * 100),
+            "annual_vol":           float(vol),
+            "annual_vol_pct":       float(vol * 100),
+            "sharpe_ratio":         float(sharpe),
+            "max_drawdown":         float(drawdown),
+            "max_drawdown_pct":     float(drawdown * 100),
+            "calmar_ratio":         float(calmar),
+            "n_months":             len(ret),
+            "n_rebalances":         len(self.snapshots),
         }
 
     def positions_df(self) -> pd.DataFrame:
