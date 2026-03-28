@@ -60,23 +60,28 @@ def _download_ff5_region(dataset_name: str, start: str, end: str):
         fname    = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
         raw_text = zf.read(fname).decode("latin-1")
 
-        # Find the first line that starts with a 6-digit YYYYMM date
+        # Pre-strip every line: French files have leading spaces that cause
+        # sep=r"\s+" to produce a spurious empty column 0, breaking the date mask.
         lines = raw_text.splitlines()
-        skip  = next(
-            (i for i, l in enumerate(lines) if l.strip()[:6].isdigit()),
+        clean_lines = [l.strip() for l in lines]
+
+        # Find the first line that starts with a 6-digit YYYYMM date
+        skip = next(
+            (i for i, l in enumerate(clean_lines) if l[:6].isdigit()),
             6,
         )
 
-        # Read as whitespace-delimited; French files use spaces, not commas
+        # Read from the pre-stripped text so col-0 is always the date
+        clean_text = "\n".join(clean_lines)
         raw = pd.read_csv(
-            io.StringIO(raw_text),
+            io.StringIO(clean_text),
             skiprows=skip,
             header=None,
             sep=r"\s+",
             engine="python",
         )
         # Keep only rows where col-0 is a 6-digit YYYYMM string
-        mask = raw.iloc[:, 0].astype(str).str.strip().str.match(r"^\d{6}$")
+        mask = raw.iloc[:, 0].astype(str).str.match(r"^\d{6}$")
         raw  = raw[mask].copy()
 
         # Grab exactly 7 columns: date + 6 factors (ignore any trailing columns)
