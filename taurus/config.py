@@ -11,6 +11,26 @@ from typing import Optional
 
 
 @dataclass
+class UniverseConfig:
+    """Per-universe metadata for data sourcing and IBKR execution."""
+    name:                 str              # "sp500" | "nasdaq100" | "cac40" | "dax" | "ftse100"
+    display_name:         str              # "S&P 500"
+    region:               str              # "US" | "Europe"
+    currency:             str              # "USD" | "EUR" | "GBP"
+    ff5_dataset:          str              # Ken French dataset key
+    futures_symbol:       str              # "ES" | "NQ" | "CAC" | "DAX" | "Z"
+    futures_exchange:     str              # "CME" | "EUREX" | "MONEP" | "LIFFE"
+    futures_currency:     str             # "USD" | "EUR" | "GBP"
+    futures_multiplier:   float            # ES=50, NQ=20, CAC=10, DAX=25, FTSE=10
+    ibkr_exchange:        str              # "SMART" | "SBF" | "IBIS" | "LSE"
+    wikipedia_url:        str              # URL for ticker scraping
+    wikipedia_table_id:   str              # HTML table id on Wikipedia page
+    min_market_cap_usd:   float = 2e9
+    n_longs:              int   = 25
+    n_shorts:             int   = 25
+
+
+@dataclass
 class TaurusConfig:
     # ------------------------------------------------------------------ #
     #  Universe                                                            #
@@ -84,6 +104,17 @@ class TaurusConfig:
     rebalance_freq: str = "ME"           # pandas offset alias
     transaction_cost_bps: float = 10.0   # One-way cost in basis points
     slippage_bps: float = 5.0
+
+    # ------------------------------------------------------------------ #
+    #  IBKR live trading                                                  #
+    # ------------------------------------------------------------------ #
+    ibkr_host:      str   = "127.0.0.1"
+    ibkr_port:      int   = 7497          # 7497=paper, 7496=live
+    ibkr_client_id: int   = 10
+    ibkr_account:   str   = ""            # "" = default account
+    live_trading:   bool  = False         # False=paper, True=live
+    dry_run:        bool  = True          # True=log only, no real orders
+    nav_usd:        float = 100_000.0     # total NAV for position sizing
 
     # ------------------------------------------------------------------ #
     #  Cache                                                              #

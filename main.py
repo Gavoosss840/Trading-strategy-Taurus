@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -80,6 +80,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tickers", nargs="*", default=None,
                    help="Explicit ticker list (defaults to full S&P 500)")
 
+    # Live trading
+    p.add_argument("--universes", nargs="+",
+                   default=["sp500"],
+                   help="Universes to trade: sp500 nasdaq100 cac40 dax ftse100")
+    p.add_argument("--live",      action="store_true",
+                   help="Live trading (port 7496). Default: paper (7497)")
+    p.add_argument("--no-dry-run", action="store_true",
+                   help="Submit real orders. Default: dry-run (log only)")
+    p.add_argument("--nav",       type=float, default=100_000.0,
+                   help="Total portfolio NAV in USD for position sizing")
+
     return p.parse_args()
 
 
@@ -101,6 +112,10 @@ def build_config(args: argparse.Namespace):
         borrow_cost_annual=args.borrow_cost,
         use_futures_hedge=args.futures_hedge,
         futures_roll_cost_quarterly=args.futures_roll_cost,
+        ibkr_port=7496 if args.live else 7497,
+        live_trading=args.live,
+        dry_run=not args.no_dry_run,
+        nav_usd=args.nav,
     )
 
 
@@ -189,6 +204,22 @@ def run_backtest(args, cfg) -> None:
         logger.info("Top positions (most recent rebalance):\n%s", top.to_string(index=False))
 
 
+def run_live(args, cfg) -> None:
+    from taurus.scheduler import RebalanceScheduler
+    logger.info(
+        "Starting live scheduler | universes=%s | %s | dry_run=%s",
+        args.universes,
+        "LIVE" if args.live else "PAPER",
+        cfg.dry_run,
+    )
+    scheduler = RebalanceScheduler(
+        cfg=cfg,
+        universes=args.universes,
+        output_dir=args.output,
+    )
+    scheduler.run_forever()
+
+
 # --------------------------------------------------------------------------- #
 #  Main                                                                        #
 # --------------------------------------------------------------------------- #
@@ -203,6 +234,8 @@ def main() -> None:
         run_snapshot(args, cfg)
     elif args.mode == "backtest":
         run_backtest(args, cfg)
+    elif args.mode == "live":
+        run_live(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)

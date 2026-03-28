@@ -124,14 +124,17 @@ class TaurusStrategy:
         start: str,
         end: str,
         tickers: Optional[List[str]] = None,
+        factors_df: Optional[pd.DataFrame] = None,
     ) -> None:
         """
         Pre-fetch and cache all data required for the strategy.
 
         Parameters
         ----------
-        start, end : ISO date strings  (e.g. "2015-01-01")
-        tickers    : optional list; defaults to full S&P 500
+        start, end  : ISO date strings  (e.g. "2015-01-01")
+        tickers     : optional list; defaults to full S&P 500
+        factors_df  : optional pre-loaded FF5 factors (for multi-universe use);
+                      if None, falls back to get_ff5_factors() for US data
         """
         cfg = self.cfg
 
@@ -144,7 +147,7 @@ class TaurusStrategy:
         self._returns = compute_monthly_returns(self._prices)
 
         logger.info("Loading Fama-French 5-factor data...")
-        self._factors = get_ff5_factors(start, end, cfg)
+        self._factors = factors_df if factors_df is not None else get_ff5_factors(start, end, cfg)
 
         logger.info("Loading fundamental data...")
         # Only load fundamentals for tickers that survived the price filter
