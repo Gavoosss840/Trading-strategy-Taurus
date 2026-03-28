@@ -243,11 +243,11 @@ def get_ff5_factors(
             end=end,
         )[0]
         ff5.index = ff5.index.to_timestamp("M")
-            ff5 = ff5 / 100.0          # percent → decimal
-            ff5.index.name = "Date"
-            logger.info("FF5 factors loaded via pandas_datareader.")
-        except Exception as exc:
-            logger.warning("pandas_datareader FF5 fetch failed: %s", exc)
+        ff5 = ff5 / 100.0
+        ff5.index.name = "Date"
+        logger.info("FF5 factors loaded via pandas_datareader.")
+    except Exception as exc:
+        logger.warning("pandas_datareader FF5 fetch failed: %s", exc)
 
     if ff5 is None:
         ff5 = _download_ff5_directly(start, end)
