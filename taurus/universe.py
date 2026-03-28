@@ -25,6 +25,33 @@ from .data import (
     _download_ff5_directly,
 )
 
+
+def _download_ff5_europe(start: str, end: str):
+    """Download European FF5 factors directly from Kenneth French's website."""
+    import io, zipfile, requests
+    url = (
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+        "Europe_5_Factors_CSV.zip"
+    )
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        zf   = zipfile.ZipFile(io.BytesIO(resp.content))
+        name = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
+        raw  = pd.read_csv(io.StringIO(zf.read(name).decode()), skiprows=6)
+        raw  = raw[raw.iloc[:, 0].astype(str).str.match(r"^\d{6}$")]
+        raw.columns = ["Date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
+        raw["Date"] = pd.to_datetime(raw["Date"], format="%Y%m")
+        raw = raw.set_index("Date")
+        raw.index = raw.index.to_period("M").to_timestamp("M")
+        raw = raw.astype(float) / 100.0
+        raw = raw.loc[start:end]
+        logger.info("Europe FF5 factors downloaded from Kenneth French.")
+        return raw
+    except Exception as e:
+        logger.error("Europe FF5 direct download failed: %s", e)
+        return None
+
 logger = logging.getLogger(__name__)
 
 
@@ -238,24 +265,33 @@ class UniverseDef:
     ) -> pd.DataFrame:
         """Download Fama-French 5 factors for this universe's region."""
         from .data import _cache_load, _cache_save
-        import pandas_datareader.data as web
 
-        dataset = self.config.ff5_dataset
+        dataset   = self.config.ff5_dataset
+        is_europe = self.config.region == "Europe"
         cache_key = f"ff5_{self.config.name}_{start}_{end}"
-        cached = _cache_load(cache_key, cfg)
+        cached    = _cache_load(cache_key, cfg)
         if cached is not None:
             return cached
 
         ff5 = None
+
+        # Try pandas_datareader first (works on Python < 3.12)
         try:
+            import pandas_datareader.data as web
             ff5 = web.DataReader(dataset, "famafrench", start=start, end=end)[0]
             ff5.index = ff5.index.to_timestamp("M")
             ff5 = ff5 / 100.0
             ff5.index.name = "Date"
-            logger.info("[%s] FF5 factors loaded via pandas_datareader.", self.config.name)
+            logger.info("[%s] FF5 loaded via pandas_datareader.", self.config.name)
         except Exception as e:
-            logger.warning("[%s] pandas_datareader failed: %s. Trying direct download.", self.config.name, e)
-            ff5 = _download_ff5_directly(start, end)   # US fallback
+            logger.warning("[%s] pandas_datareader failed (%s). Using direct download.", self.config.name, e)
+
+        # Direct download fallback (works on all Python versions)
+        if ff5 is None:
+            if is_europe:
+                ff5 = _download_ff5_europe(start, end)
+            else:
+                ff5 = _download_ff5_directly(start, end)
 
         if ff5 is None:
             raise RuntimeError(f"Cannot load FF5 factors for universe {self.config.name}")
