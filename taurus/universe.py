@@ -60,35 +60,39 @@ def _download_ff5_region(dataset_name: str, start: str, end: str):
         fname    = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
         raw_text = zf.read(fname).decode("latin-1")
 
-        # Pre-strip every line: French files have leading spaces that cause
-        # sep=r"\s+" to produce a spurious empty column 0, breaking the date mask.
+        # Kenneth French regional files are comma-separated.
+        # Format: "199007    ,4.46    ,0.20   ,-1.52    ,0.28    ,1.10    ,0.68"
+        # Find the header line containing "Mkt-RF" and read from there.
         lines = raw_text.splitlines()
-        clean_lines = [l.strip() for l in lines]
-
-        # Find the first line that starts with a 6-digit YYYYMM date
-        skip = next(
-            (i for i, l in enumerate(clean_lines) if l[:6].isdigit()),
-            6,
+        header_idx = next(
+            (i for i, l in enumerate(lines) if "Mkt-RF" in l),
+            None,
         )
+        if header_idx is None:
+            logger.error("%s: could not find header line with 'Mkt-RF'", dataset_name)
+            return None
 
-        # Read from the pre-stripped text; force col-0 as str so the date
-        # is read as "202201" and not as float 202201.0 (which breaks the mask)
-        clean_text = "\n".join(clean_lines)
+        # Skip everything before the header; use comma separator
         raw = pd.read_csv(
-            io.StringIO(clean_text),
-            skiprows=skip,
-            header=None,
-            sep=r"\s+",
+            io.StringIO(raw_text),
+            skiprows=header_idx,
+            sep=",",
             engine="python",
-            dtype={0: str},
         )
-        # Keep only rows where col-0 is exactly a 6-digit YYYYMM string
-        mask = raw.iloc[:, 0].str.strip().str.match(r"^\d{6}$")
+
+        # Column 0 is the date field (may have trailing spaces: "199007    ")
+        # Rename it and strip whitespace
+        raw = raw.rename(columns={raw.columns[0]: "Date"})
+        raw["Date"] = raw["Date"].astype(str).str.strip()
+
+        # Keep only rows where Date is a 6-digit YYYYMM integer
+        mask = raw["Date"].str.match(r"^\d{6}$")
         raw  = raw[mask].copy()
 
-        # Grab exactly 7 columns: date + 6 factors (ignore any trailing columns)
-        raw = raw.iloc[:, :7].copy()
-        raw.columns = ["Date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
+        # Normalise column names (strip any extra whitespace from header)
+        raw.columns = [c.strip() for c in raw.columns]
+        # Keep exactly the 7 expected columns
+        raw = raw[["Date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]].copy()
 
         raw["Date"] = pd.to_datetime(raw["Date"].astype(str).str.strip(), format="%Y%m")
         raw = raw.set_index("Date")
