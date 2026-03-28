@@ -284,16 +284,16 @@ class TaurusStrategy:
         # 60% so concentration from a small alpha pool doesn't wipe out all positions
         min_final = max(2, cfg.n_longs // 5)
         if len(long_final) < min_final and not mom_df.empty:
-            q40_mom = mom_df["momentum"].quantile(0.40)
-            mom_long_relaxed = mom_df[mom_df["momentum"] >= q40_mom].index
+            q40_mom = mom_df["mom_raw"].quantile(0.40)
+            mom_long_relaxed = mom_df[mom_df["mom_raw"] >= q40_mom].index
             long_final_relaxed = long_candidates.intersection(mom_long_relaxed)
             if len(long_final_relaxed) >= len(long_final):
                 long_final = long_final_relaxed
                 logger.info("[%s] LONG momentum relaxed (top-60%%) → %d candidates.", as_of.date(), len(long_final))
 
         if len(short_final) < min_final and not mom_df.empty:
-            q60_mom = mom_df["momentum"].quantile(0.60)
-            mom_short_relaxed = mom_df[mom_df["momentum"] <= q60_mom].index
+            q60_mom = mom_df["mom_raw"].quantile(0.60)
+            mom_short_relaxed = mom_df[mom_df["mom_raw"] <= q60_mom].index
             short_final_relaxed = short_candidates.intersection(mom_short_relaxed)
             if len(short_final_relaxed) >= len(short_final):
                 short_final = short_final_relaxed
