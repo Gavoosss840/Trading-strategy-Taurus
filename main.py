@@ -164,21 +164,89 @@ def run_backtest(args, cfg) -> None:
         print_analytics,
         top_positions_table,
     )
+    from taurus.universe import REGISTRY
     import json
+    import pandas as pd
 
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
-    strategy = TaurusStrategy(cfg)
-    logger.info("Starting back-test: %s → %s", args.start, args.end)
-    result = strategy.backtest(
-        start=args.start,
-        end=args.end,
-        tickers=args.tickers,
-    )
+    universes = args.universes if hasattr(args, "universes") and args.universes else ["sp500"]
 
-    analytics = result.analytics()
-    print_analytics(analytics)
+    all_analytics = {}
+    all_results   = {}
+
+    for universe_name in universes:
+        logger.info("=" * 60)
+        logger.info("Back-test: %s  (%s → %s)", universe_name.upper(), args.start, args.end)
+        logger.info("=" * 60)
+
+        udef    = REGISTRY.get(universe_name)
+        ucfg    = udef.config
+        uni_out = output / universe_name
+        uni_out.mkdir(parents=True, exist_ok=True)
+
+        # Per-universe config overrides
+        import dataclasses
+        u_cfg = dataclasses.replace(
+            cfg,
+            n_longs=ucfg.n_longs,
+            n_shorts=ucfg.n_shorts,
+        )
+
+        tickers = args.tickers if args.tickers else udef.get_tickers(u_cfg)
+        factors = udef.get_ff5_factors(args.start, args.end, u_cfg)
+
+        strategy = TaurusStrategy(u_cfg)
+        result   = strategy.backtest(
+            start=args.start,
+            end=args.end,
+            tickers=tickers,
+            factors_df=factors,
+        )
+
+        analytics = result.analytics()
+        analytics["universe"] = universe_name
+        all_analytics[universe_name] = analytics
+        all_results[universe_name]   = result
+
+        print_analytics(analytics)
+
+        # Per-universe artefacts
+        with open(uni_out / "analytics.json", "w") as f:
+            json.dump(analytics, f, indent=2)
+        result.positions_df().to_csv(uni_out / "positions.csv", index=False)
+
+        try:
+            plot_equity_curve(result,    save_path=str(uni_out / "equity_curve.png"))
+            plot_monthly_heatmap(result, save_path=str(uni_out / "monthly_heatmap.png"))
+            plot_rolling_sharpe(result,  save_path=str(uni_out / "rolling_sharpe.png"))
+        except Exception as exc:
+            logger.warning("Charts failed for %s: %s", universe_name, exc)
+
+        top = top_positions_table(result, n=10)
+        if not top.empty:
+            logger.info("[%s] Top positions:\n%s", universe_name, top.to_string(index=False))
+
+    # ── Combined summary (multi-universe) ───────────────────────────────── #
+    if len(universes) > 1:
+        logger.info("\n%s", "=" * 60)
+        logger.info("COMBINED SUMMARY")
+        logger.info("=" * 60)
+        for name, a in all_analytics.items():
+            logger.info(
+                "  %-12s  Return=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+                name.upper(),
+                a.get("total_return_pct", 0),
+                a.get("sharpe_ratio", 0),
+                a.get("max_drawdown_pct", 0),
+            )
+        with open(output / "combined_analytics.json", "w") as f:
+            json.dump(all_analytics, f, indent=2)
+
+    # Keep single-universe analytics for backward compat
+    analytics = all_analytics.get(universes[0], {})
+    result    = all_results.get(universes[0])
 
     # ── Save artefacts ──────────────────────────────────────────────────── #
     analytics_path = output / "analytics.json"

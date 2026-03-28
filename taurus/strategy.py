@@ -328,6 +328,7 @@ class TaurusStrategy:
         start: str,
         end: str,
         tickers: Optional[List[str]] = None,
+        factors_df: Optional[pd.DataFrame] = None,
     ) -> "BacktestResult":
         """
         Run a full vectorised back-test over [start, end].
@@ -340,7 +341,7 @@ class TaurusStrategy:
             pd.Timestamp(start) - pd.DateOffset(months=warm_up_months)
         ).strftime("%Y-%m-%d")
 
-        self.load_data(warm_start, end, tickers)
+        self.load_data(warm_start, end, tickers, factors_df=factors_df)
 
         prices  = self._prices
         returns = self._returns
