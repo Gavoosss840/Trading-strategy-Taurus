@@ -194,8 +194,12 @@ def run_backtest(args, cfg) -> None:
             n_shorts=ucfg.n_shorts,
         )
 
+        # FF5 doit couvrir la fenêtre warm-up (60+ mois avant args.start)
+        warm_months = u_cfg.lookback_months + u_cfg.momentum_months + 6
+        warm_start  = (pd.Timestamp(args.start) - pd.DateOffset(months=warm_months)).strftime("%Y-%m-%d")
+
         tickers = args.tickers if args.tickers else udef.get_tickers(u_cfg)
-        factors = udef.get_ff5_factors(args.start, args.end, u_cfg)
+        factors = udef.get_ff5_factors(warm_start, args.end, u_cfg)
 
         strategy = TaurusStrategy(u_cfg)
         result   = strategy.backtest(
