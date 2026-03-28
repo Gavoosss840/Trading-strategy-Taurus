@@ -71,7 +71,8 @@ def _download_ff5_region(dataset_name: str, start: str, end: str):
             6,
         )
 
-        # Read from the pre-stripped text so col-0 is always the date
+        # Read from the pre-stripped text; force col-0 as str so the date
+        # is read as "202201" and not as float 202201.0 (which breaks the mask)
         clean_text = "\n".join(clean_lines)
         raw = pd.read_csv(
             io.StringIO(clean_text),
@@ -79,9 +80,10 @@ def _download_ff5_region(dataset_name: str, start: str, end: str):
             header=None,
             sep=r"\s+",
             engine="python",
+            dtype={0: str},
         )
-        # Keep only rows where col-0 is a 6-digit YYYYMM string
-        mask = raw.iloc[:, 0].astype(str).str.match(r"^\d{6}$")
+        # Keep only rows where col-0 is exactly a 6-digit YYYYMM string
+        mask = raw.iloc[:, 0].str.strip().str.match(r"^\d{6}$")
         raw  = raw[mask].copy()
 
         # Grab exactly 7 columns: date + 6 factors (ignore any trailing columns)
