@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--borrow-cost",   type=float, default=0.010,
                    help="Annual stock borrow fee for shorts (default: 1.0%%)")
 
+    # Futures beta hedge (Phase 2)
+    p.add_argument("--futures-hedge", action="store_true",
+                   help="Use ES/SPY futures overlay for beta neutralisation instead of weight rescaling")
+    p.add_argument("--futures-roll-cost", type=float, default=0.0015,
+                   help="Quarterly futures roll cost as fraction of notional (default: 0.15%%)")
+
     # Optional ticker list
     p.add_argument("--tickers", nargs="*", default=None,
                    help="Explicit ticker list (defaults to full S&P 500)")
@@ -93,6 +99,8 @@ def build_config(args: argparse.Namespace):
         gross_leverage=args.leverage,
         margin_cost_annual=args.margin_cost,
         borrow_cost_annual=args.borrow_cost,
+        use_futures_hedge=args.futures_hedge,
+        futures_roll_cost_quarterly=args.futures_roll_cost,
     )
 
 

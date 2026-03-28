@@ -289,6 +289,58 @@ def beta_neutralise(
 
 
 # --------------------------------------------------------------------------- #
+#  Futures beta hedge overlay                                                  #
+# --------------------------------------------------------------------------- #
+
+def futures_beta_hedge(
+    long_weights: pd.Series,
+    short_weights: pd.Series,
+    betas: pd.Series,
+    cfg: TaurusConfig = DEFAULT_CONFIG,
+) -> float:
+    """
+    Compute the ES/SPY futures overlay weight needed to zero net portfolio beta.
+
+    Instead of distorting alpha-optimised weights (as weight-rescaling does),
+    we keep both legs intact and add a separate futures position:
+
+        β_net = β_long_leg − β_short_leg
+        futures_weight = −β_net  (short futures to cancel positive β_net)
+
+    The returned value is the futures notional as a fraction of portfolio NAV.
+    Negative → short futures (typical: long equity book has positive β_net).
+    Positive → long futures (rare: short book dominates).
+
+    Parameters
+    ----------
+    long_weights, short_weights : leg weights (each sums to 1)
+    betas                       : stock betas vs S&P 500
+
+    Returns
+    -------
+    futures_weight : float — fraction of NAV to trade in index futures
+    """
+    long_tickers  = long_weights.index.intersection(betas.index)
+    short_tickers = short_weights.index.intersection(betas.index)
+
+    half = cfg.gross_leverage / 2.0
+
+    beta_L = (long_weights[long_tickers]  * betas[long_tickers]).sum()  * half
+    beta_S = (short_weights[short_tickers] * betas[short_tickers]).sum() * half
+
+    beta_net = beta_L - beta_S   # net portfolio beta (positive = long bias)
+
+    # Futures overlay: short -beta_net units of index (β_futures = 1.0)
+    futures_weight = -beta_net
+
+    logger.info(
+        "Futures hedge: β_long=%.3f, β_short=%.3f → β_net=%.4f → futures=%.4f × NAV",
+        beta_L, beta_S, beta_net, futures_weight,
+    )
+    return float(futures_weight)
+
+
+# --------------------------------------------------------------------------- #
 #  Full leg construction                                                       #
 # --------------------------------------------------------------------------- #
 

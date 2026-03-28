@@ -70,6 +70,15 @@ class TaurusConfig:
     borrow_cost_annual: float = 0.010    # 1.0%/an avg stock borrow fee
 
     # ------------------------------------------------------------------ #
+    #  Futures beta hedge (Phase 2)                                       #
+    # ------------------------------------------------------------------ #
+    # When True, replaces weight-rescaling beta neutralisation with a
+    # clean futures overlay (ES/SPY) that leaves alpha weights intact.
+    # futures_roll_cost: quarterly roll cost as fraction of notional (~0.15%)
+    use_futures_hedge: bool = False
+    futures_roll_cost_quarterly: float = 0.0015   # 0.15%/quarter = 0.6%/an
+
+    # ------------------------------------------------------------------ #
     #  Execution / back-test                                              #
     # ------------------------------------------------------------------ #
     rebalance_freq: str = "ME"           # pandas offset alias

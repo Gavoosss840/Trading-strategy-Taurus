@@ -56,6 +56,7 @@ from .portfolio import (
     beta_neutralise,
     build_leg,
     estimate_betas,
+    futures_beta_hedge,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,7 @@ class PortfolioSnapshot:
     momentum_df:      pd.DataFrame       # Momentum signal
     combined_longs:   pd.Index           # tickers that passed all 3 filters
     combined_shorts:  pd.Index
+    futures_weight:   float = 0.0        # ES/SPY overlay (-ve = short futures)
 
     @property
     def net_weights(self) -> pd.Series:
@@ -275,13 +277,21 @@ class TaurusStrategy:
         mkt_returns = factors["Mkt-RF"] + factors["RF"]
         betas = estimate_betas(window_returns, mkt_returns)
 
-        long_weights, short_weights = beta_neutralise(
-            long_weights, short_weights, betas, cfg
-        )
+        futures_weight = 0.0
+
+        if cfg.use_futures_hedge:
+            # Futures overlay: keep alpha weights intact, hedge β via ES/SPY
+            futures_weight = futures_beta_hedge(long_weights, short_weights, betas, cfg)
+        else:
+            # Classic weight-rescaling beta neutralisation
+            long_weights, short_weights = beta_neutralise(
+                long_weights, short_weights, betas, cfg
+            )
 
         logger.info(
-            "[%s] Final portfolio: %d longs, %d shorts.",
+            "[%s] Final portfolio: %d longs, %d shorts%s.",
             as_of.date(), len(long_weights), len(short_weights),
+            f", futures={futures_weight:+.4f}×NAV" if cfg.use_futures_hedge else "",
         )
 
         return PortfolioSnapshot(
@@ -293,6 +303,7 @@ class TaurusStrategy:
             momentum_df=mom_df,
             combined_longs=long_final,
             combined_shorts=short_final,
+            futures_weight=futures_weight,
         )
 
     def _empty_snapshot(self, as_of: pd.Timestamp) -> PortfolioSnapshot:
@@ -400,11 +411,26 @@ class BacktestResult:
             margin_cost_m = (self.cfg.margin_cost_annual + self.cfg.borrow_cost_annual) / 12
             leverage_cost_m = (lev - 1.0) * margin_cost_m  # only on borrowed portion
 
+            # Futures roll cost: deducted once per quarter (~3 months)
+            # Approximated as monthly fraction when futures hedge is active
+            futures_roll_m = (
+                self.cfg.futures_roll_cost_quarterly / 3.0
+                if self.cfg.use_futures_hedge and snap.futures_weight != 0.0
+                else 0.0
+            )
+
             for month_date, month_ret in month_range.iterrows():
                 long_ret  = (snap.long_weights  * month_ret.reindex(snap.long_weights.index,  fill_value=0)).sum()
                 short_ret = (snap.short_weights * month_ret.reindex(snap.short_weights.index, fill_value=0)).sum()
                 gross_ret = half * long_ret - half * short_ret  # leveraged dollar-neutral
                 gross_ret -= leverage_cost_m                     # deduct financing cost
+
+                # Futures P&L: futures_weight × market return (β_futures = 1)
+                if snap.futures_weight != 0.0:
+                    mkt_ret = month_ret.mean()   # proxy for index return
+                    gross_ret += snap.futures_weight * mkt_ret
+                    gross_ret -= futures_roll_m  # roll cost
+
                 pnl_records.append({"date": month_date, "return": gross_ret})
 
             # Turnover-based cost at rebalance
