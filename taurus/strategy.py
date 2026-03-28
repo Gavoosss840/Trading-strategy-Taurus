@@ -263,11 +263,23 @@ class TaurusStrategy:
                 len(long_candidates),
             )
 
-        # SHORT alpha: bottom 20% of t-stat cross-sectionally (worst relative alpha)
-        q20 = alpha_df["alpha_tstat"].quantile(0.20)
-        alpha_short = alpha_df[alpha_df["alpha_tstat"] <= q20]
+        # SHORT: same adaptive logic as LONG.
+        # If MM-overvalued pool < 10 % of universe (e.g. European universes where
+        # EDGAR fundamentals are unavailable → all-NaN → over_tickers = 0),
+        # fall back to alpha-only: bottom 30 % alpha t-stat.
+        mm_overval_ratio = len(over_tickers) / max(len(alpha_df), 1)
 
-        short_candidates = alpha_short.index.intersection(over_tickers)
+        if mm_overval_ratio >= MM_MIN_RATIO:
+            q20 = alpha_df["alpha_tstat"].quantile(0.20)
+            short_candidates = alpha_df[alpha_df["alpha_tstat"] <= q20].index.intersection(over_tickers)
+        else:
+            q30 = alpha_df["alpha_tstat"].quantile(0.30)
+            short_candidates = alpha_df[alpha_df["alpha_tstat"] <= q30].index
+            logger.info(
+                "[%s] MM overval pool small (%d/%d = %.0f%%) → alpha-only SHORT: %d candidates.",
+                as_of.date(), len(over_tickers), len(alpha_df), mm_overval_ratio * 100,
+                len(short_candidates),
+            )
 
         logger.info(
             "[%s] Dual confirmation: %d long, %d short.",
