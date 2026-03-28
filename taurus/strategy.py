@@ -226,29 +226,35 @@ class TaurusStrategy:
         under_tickers = mm_df[mm_df["underleveraged"]].index   # MM undervalued → LONG
         over_tickers  = mm_df[mm_df["overleveraged"]].index    # MM overvalued  → SHORT
 
-        # LONG alpha: absolute filter (positive alpha AND |t| > threshold)
-        alpha_long_abs = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+        # LONG alpha — 3-stage fallback to handle tech-heavy universes (e.g. NASDAQ 100)
+        # Stage 1: absolute filter — positive alpha AND |t| > threshold ∩ MM-undervalued
+        alpha_long_abs      = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
         long_candidates_abs = alpha_long_abs.index.intersection(under_tickers)
 
-        # If absolute filter yields too few candidates (e.g. tech-heavy NASDAQ 100),
-        # fall back to cross-sectional ranking: top 50% alpha t-stat within the
-        # MM undervalued pool — mirrors the relative approach used for shorts.
-        min_long_candidates = max(3, cfg.n_longs // 3)
+        # Stage 2: if too few from Stage 1, use cross-sectional top-50% alpha t-stat
+        #           within the MM-undervalued pool (relative ranking, like the short leg)
+        min_long_candidates = max(3, cfg.n_longs // 4)
         if len(long_candidates_abs) >= min_long_candidates:
             long_candidates = long_candidates_abs
         else:
             under_alpha = alpha_df.loc[alpha_df.index.intersection(under_tickers)]
-            if not under_alpha.empty:
-                q50_under = under_alpha["alpha_tstat"].quantile(0.50)
+            if len(under_alpha) >= 2:
+                q50_under    = under_alpha["alpha_tstat"].quantile(0.50)
                 alpha_long_cs = under_alpha[under_alpha["alpha_tstat"] >= q50_under]
                 long_candidates = alpha_long_cs.index
                 logger.info(
-                    "[%s] LONG absolute filter yielded %d candidates; "
-                    "using cross-sectional top-50%% within %d undervalued stocks → %d candidates.",
-                    as_of.date(), len(long_candidates_abs), len(under_tickers), len(long_candidates),
+                    "[%s] LONG Stage-2 (cross-sect. top-50%% of %d undervalued) → %d candidates.",
+                    as_of.date(), len(under_alpha), len(long_candidates),
                 )
             else:
-                long_candidates = long_candidates_abs
+                # Stage 3: MM pool is empty/tiny — take top alpha stocks from full
+                #          universe (alpha signal only, drop MM requirement)
+                q75_all     = alpha_df["alpha_tstat"].quantile(0.75)
+                long_candidates = alpha_df[alpha_df["alpha_tstat"] >= q75_all].index
+                logger.info(
+                    "[%s] LONG Stage-3 (MM pool empty, top-25%% alpha full universe) → %d candidates.",
+                    as_of.date(), len(long_candidates),
+                )
 
         # SHORT alpha: bottom 20% of t-stat cross-sectionally (worst relative alpha)
         q20 = alpha_df["alpha_tstat"].quantile(0.20)
@@ -273,6 +279,25 @@ class TaurusStrategy:
 
         long_final  = long_candidates.intersection(mom_long)
         short_final = short_candidates.intersection(mom_short)
+
+        # Momentum fallback: if momentum filter kills all candidates, relax to top/bottom
+        # 60% so concentration from a small alpha pool doesn't wipe out all positions
+        min_final = max(2, cfg.n_longs // 5)
+        if len(long_final) < min_final and not mom_df.empty:
+            q40_mom = mom_df["momentum"].quantile(0.40)
+            mom_long_relaxed = mom_df[mom_df["momentum"] >= q40_mom].index
+            long_final_relaxed = long_candidates.intersection(mom_long_relaxed)
+            if len(long_final_relaxed) >= len(long_final):
+                long_final = long_final_relaxed
+                logger.info("[%s] LONG momentum relaxed (top-60%%) → %d candidates.", as_of.date(), len(long_final))
+
+        if len(short_final) < min_final and not mom_df.empty:
+            q60_mom = mom_df["momentum"].quantile(0.60)
+            mom_short_relaxed = mom_df[mom_df["momentum"] <= q60_mom].index
+            short_final_relaxed = short_candidates.intersection(mom_short_relaxed)
+            if len(short_final_relaxed) >= len(short_final):
+                short_final = short_final_relaxed
+                logger.info("[%s] SHORT momentum relaxed (bottom-60%%) → %d candidates.", as_of.date(), len(short_final))
 
         logger.info(
             "[%s] Post-momentum: %d long, %d short.",

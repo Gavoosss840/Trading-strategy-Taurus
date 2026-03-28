@@ -149,14 +149,21 @@ def max_sharpe_weights(
 
     if not result.success:
         logger.warning("Max-Sharpe optimisation did not converge: %s", result.message)
-        # Fall back to equal weight
+        # Fall back to equal weight (still capped below)
         w = np.full(N, 1.0 / N)
     else:
         w = result.x
 
-    # Enforce positivity and renormalise
+    # Enforce positivity and max-weight cap, then renormalise
     w = np.maximum(w, 0)
-    w /= w.sum()
+    # Hard cap: each weight ≤ w_max (critical for small-N fallback portfolios)
+    if w_max < 1.0:
+        w = np.minimum(w, w_max)
+    total = w.sum()
+    if total > 0:
+        w /= total
+    else:
+        w = np.full(N, 1.0 / N)
 
     return pd.Series(w, index=tickers)
 
@@ -385,10 +392,22 @@ def build_leg(
     if len(tickers) == 0:
         return pd.Series(dtype=float)
 
+    # Require at least 3 stocks; enforce per-stock cap based on actual count
+    # so a 3-stock portfolio is capped at 33% not 8%, keeping weights well-spread
+    actual_max_w = max(cfg.max_position_weight, 1.0 / max(len(tickers), 1))
+    # But never let a single stock exceed 25% regardless
+    actual_max_w = min(actual_max_w, 0.25)
+
     ret_sub  = returns[tickers].dropna()
     mu       = alpha_scores[tickers].fillna(0.0)
     cov      = estimate_covariance(ret_sub, cfg) * 12  # annualise
 
     weights = max_sharpe_weights(mu, cov, cfg)
+
+    # Apply hard per-position cap (25% max), then renormalise
+    weights = weights.clip(upper=actual_max_w)
+    if weights.sum() > 0:
+        weights /= weights.sum()
+
     weights = apply_sector_constraints(weights, sector_map, cfg)
     return weights
