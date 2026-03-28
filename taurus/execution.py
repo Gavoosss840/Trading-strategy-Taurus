@@ -486,6 +486,19 @@ class IBKRExecutor:
             if not self.cfg.dry_run:
                 self.order_mgr.wait_for_fills(self.conn)
 
+            # 8. Enregistrer les entry prices dans le RiskManager
+            try:
+                from .risk import RiskManager, RiskConfig
+                risk_mgr = RiskManager(RiskConfig())
+                risk_mgr.state.register_rebalance(
+                    snapshot=snapshot,
+                    prices=prices,
+                    nav=nav,
+                    universe=self.udef_cfg.name,
+                )
+            except Exception as e:
+                logger.warning("RiskState update failed: %s", e)
+
         except Exception as e:
             logger.error("[%s] Execution error: %s", self.udef_cfg.name, e)
             report.errors.append(str(e))

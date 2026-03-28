@@ -28,6 +28,7 @@ import pandas as pd
 from .config import TaurusConfig, DEFAULT_CONFIG
 from .execution import IBKRConnection, IBKRExecutor, ExecutionReport
 from .universe import REGISTRY
+from .risk import RiskManager, RiskConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +84,13 @@ class RebalanceScheduler:
         cfg:            TaurusConfig = DEFAULT_CONFIG,
         universes:      List[str]    = None,
         output_dir:     str          = "output",
+        risk_config:    RiskConfig   = None,
     ):
-        self.cfg        = cfg
-        self.universes  = universes or ["sp500"]
-        self.output_dir = output_dir
-        self.conn       = IBKRConnection(cfg)
+        self.cfg         = cfg
+        self.universes   = universes or ["sp500"]
+        self.output_dir  = output_dir
+        self.conn        = IBKRConnection(cfg)
+        self.risk_mgr    = RiskManager(risk_config or RiskConfig())
 
         Path(".cache").mkdir(exist_ok=True)
         Path(output_dir).mkdir(exist_ok=True)
@@ -127,6 +130,8 @@ class RebalanceScheduler:
                         "Waiting for rebalance day. Next: %s | Last: %s",
                         next_reb, last_reb or "never",
                     )
+                    # ── Daily risk check (entre les rebalancements) ───── #
+                    self._daily_risk_check()
 
                 time.sleep(self.POLL_INTERVAL)
 
@@ -206,6 +211,76 @@ class RebalanceScheduler:
             universe_name, len(report.orders), len(report.errors),
         )
         return report
+
+    # ── Daily risk check ────────────────────────────────────────────────── #
+
+    def _daily_risk_check(self) -> None:
+        """
+        Vérifie chaque position quotidiennement contre :
+          - Stop-loss individuel (-10% depuis entrée)
+          - Trailing stop (-10% depuis le pic)
+          - Circuit breaker global (-15% portfolio)
+        Coupe les positions qui franchissent les seuils.
+        """
+        if not self.risk_mgr.state.positions:
+            return   # aucune position à surveiller
+
+        logger.info("Daily risk check: %d positions surveillées", len(self.risk_mgr.state.positions))
+
+        # Récupérer les prix actuels pour toutes les positions
+        from .execution import OrderManager
+        mgr = OrderManager()
+        all_tickers = list(self.risk_mgr.state.positions.keys())
+
+        # Grouper par univers pour récupérer les prix avec le bon exchange
+        by_universe: dict = {}
+        for ticker, pos in self.risk_mgr.state.positions.items():
+            by_universe.setdefault(pos.universe, []).append(ticker)
+
+        current_prices: dict = {}
+        for universe_name, tickers in by_universe.items():
+            try:
+                udef = REGISTRY.get(universe_name)
+                prices = mgr.get_live_prices(self.conn, tickers, udef.config)
+                current_prices.update(prices)
+            except Exception as e:
+                logger.warning("Impossible de récupérer les prix pour %s: %s", universe_name, e)
+
+        if not current_prices:
+            logger.warning("Aucun prix disponible pour le risk check.")
+            return
+
+        # NAV actuelle
+        from .execution import PositionReconciler
+        rec = PositionReconciler()
+        try:
+            current_nav = rec.get_account_nav(self.conn)
+        except Exception:
+            current_nav = self.cfg.nav_usd
+
+        # Évaluer les seuils
+        events, circuit_open = self.risk_mgr.check_positions(current_prices, current_nav)
+
+        if not events:
+            logger.info("✅ Risk check OK — aucun seuil franchi.")
+            return
+
+        logger.warning("⚠️  %d position(s) à couper (circuit_breaker=%s)", len(events), circuit_open)
+
+        # Exécuter les exits par univers
+        for universe_name in by_universe:
+            udef = REGISTRY.get(universe_name)
+            universe_events = [e for e in events
+                               if self.risk_mgr.state.positions.get(e.ticker, None) is None
+                               or self.risk_mgr.state.positions.get(e.ticker).universe == universe_name]
+            if universe_events:
+                self.risk_mgr.execute_exits(
+                    events=universe_events,
+                    conn=self.conn,
+                    universe_cfg=udef.config,
+                    dry_run=self.cfg.dry_run,
+                    output_dir=self.output_dir,
+                )
 
     # ── State persistence ────────────────────────────────────────────────── #
 
