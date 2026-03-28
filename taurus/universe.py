@@ -530,8 +530,11 @@ class UniverseDef:
             # Europe, Japan, Asia, MiddleEast → direct download by dataset name
             ff5 = _download_ff5_region(dataset, start, end)
 
-        if ff5 is None:
-            raise RuntimeError(f"Cannot load FF5 factors for universe {self.config.name}")
+        if ff5 is None or ff5.empty:
+            raise RuntimeError(
+                f"Cannot load FF5 factors for universe {self.config.name} "
+                f"(dataset={dataset}, start={start}, end={end})"
+            )
 
         _cache_save(cache_key, ff5, cfg)
         return ff5
