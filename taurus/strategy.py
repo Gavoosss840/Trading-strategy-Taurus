@@ -216,45 +216,52 @@ class TaurusStrategy:
 
         # ── 4. Combined signal — dual confirmation ─────────────────────── #
         #
-        # LONG  : VL > market_cap (MM undervalued)  AND  top-half alpha  AND  mom+
-        # SHORT : VL < market_cap (MM overvalued)   AND  bottom-quintile alpha  AND  mom-
+        # LONG  : MM undervalued  AND  top alpha  AND  mom+
+        # SHORT : MM overvalued   AND  bottom alpha  AND  mom-
         #
-        # Using cross-sectional alpha ranking for the short leg avoids the
-        # "no negative alpha in bull markets" problem: we always short the
-        # *relative* underperformers confirmed by MM overvaluation.
+        # Adaptive: if the MM-undervalued pool is < 10 % of the universe
+        # (e.g. NASDAQ 100 with cash-rich tech stocks that look "underleveraged"
+        # to MM theory but are valued on growth, not capital structure), skip the
+        # MM requirement for LONGs and rank by FF5 alpha alone.  The dual
+        # confirmation for SHORTs (overvalued + worst relative alpha) is kept
+        # because tech stocks with poor FF5 alpha AND high valuations are valid.
         #
         under_tickers = mm_df[mm_df["underleveraged"]].index   # MM undervalued → LONG
         over_tickers  = mm_df[mm_df["overleveraged"]].index    # MM overvalued  → SHORT
 
-        # LONG alpha — 3-stage fallback to handle tech-heavy universes (e.g. NASDAQ 100)
-        # Stage 1: absolute filter — positive alpha AND |t| > threshold ∩ MM-undervalued
-        alpha_long_abs      = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
-        long_candidates_abs = alpha_long_abs.index.intersection(under_tickers)
+        mm_underval_ratio = len(under_tickers) / max(len(alpha_df), 1)
+        MM_MIN_RATIO = 0.10   # if < 10 % of universe is MM-undervalued, relax for LONGs
 
-        # Stage 2: if too few from Stage 1, use cross-sectional top-50% alpha t-stat
-        #           within the MM-undervalued pool (relative ranking, like the short leg)
-        min_long_candidates = max(3, cfg.n_longs // 4)
-        if len(long_candidates_abs) >= min_long_candidates:
-            long_candidates = long_candidates_abs
-        else:
-            under_alpha = alpha_df.loc[alpha_df.index.intersection(under_tickers)]
-            if len(under_alpha) >= 2:
-                q50_under    = under_alpha["alpha_tstat"].quantile(0.50)
-                alpha_long_cs = under_alpha[under_alpha["alpha_tstat"] >= q50_under]
-                long_candidates = alpha_long_cs.index
-                logger.info(
-                    "[%s] LONG Stage-2 (cross-sect. top-50%% of %d undervalued) → %d candidates.",
-                    as_of.date(), len(under_alpha), len(long_candidates),
-                )
+        if mm_underval_ratio >= MM_MIN_RATIO:
+            # ── Standard dual confirmation (S&P 500-style universe) ──────── #
+            alpha_long_abs      = alpha_df[alpha_df["signal"] & (alpha_df["alpha_sign"] > 0)]
+            long_candidates_abs = alpha_long_abs.index.intersection(under_tickers)
+
+            min_long_candidates = max(3, cfg.n_longs // 4)
+            if len(long_candidates_abs) >= min_long_candidates:
+                long_candidates = long_candidates_abs
             else:
-                # Stage 3: MM pool is empty/tiny — take top alpha stocks from full
-                #          universe (alpha signal only, drop MM requirement)
-                q75_all     = alpha_df["alpha_tstat"].quantile(0.75)
-                long_candidates = alpha_df[alpha_df["alpha_tstat"] >= q75_all].index
-                logger.info(
-                    "[%s] LONG Stage-3 (MM pool empty, top-25%% alpha full universe) → %d candidates.",
-                    as_of.date(), len(long_candidates),
-                )
+                under_alpha = alpha_df.loc[alpha_df.index.intersection(under_tickers)]
+                if not under_alpha.empty:
+                    q50 = under_alpha["alpha_tstat"].quantile(0.50)
+                    long_candidates = under_alpha[under_alpha["alpha_tstat"] >= q50].index
+                    logger.info(
+                        "[%s] LONG Stage-2 (top-50%% of %d undervalued) → %d candidates.",
+                        as_of.date(), len(under_alpha), len(long_candidates),
+                    )
+                else:
+                    long_candidates = long_candidates_abs
+        else:
+            # ── Alpha-only LONGs (NASDAQ-style: MM screen too selective) ─── #
+            # MM theory poorly describes cash-rich growth companies.
+            # Use top 30 % alpha t-stat from full universe instead.
+            q70 = alpha_df["alpha_tstat"].quantile(0.70)
+            long_candidates = alpha_df[alpha_df["alpha_tstat"] >= q70].index
+            logger.info(
+                "[%s] MM underval pool small (%d/%d = %.0f%%) → alpha-only LONG: %d candidates.",
+                as_of.date(), len(under_tickers), len(alpha_df), mm_underval_ratio * 100,
+                len(long_candidates),
+            )
 
         # SHORT alpha: bottom 20% of t-stat cross-sectionally (worst relative alpha)
         q20 = alpha_df["alpha_tstat"].quantile(0.20)
@@ -263,7 +270,7 @@ class TaurusStrategy:
         short_candidates = alpha_short.index.intersection(over_tickers)
 
         logger.info(
-            "[%s] Dual confirmation: %d long (MM underval + α+), %d short (MM overval + α-).",
+            "[%s] Dual confirmation: %d long, %d short.",
             as_of.date(), len(long_candidates), len(short_candidates),
         )
 
@@ -304,8 +311,30 @@ class TaurusStrategy:
             as_of.date(), len(long_final), len(short_final),
         )
 
+        # ── Last-resort fallback: alpha + any-momentum (ignore MM entirely) ─ #
+        # Only triggers if all previous stages still produce 0 candidates.
+        # Guarantees at least some positions every month (worst case: equal-weight
+        # top/bottom alpha stocks with moderate momentum filter).
+        if len(long_final) == 0 and not alpha_df.empty:
+            q75_a = alpha_df["alpha_tstat"].quantile(0.75)
+            q50_m = mom_df["mom_raw"].quantile(0.50) if not mom_df.empty else -np.inf
+            long_fallback = alpha_df[alpha_df["alpha_tstat"] >= q75_a].index
+            if not mom_df.empty:
+                long_fallback = long_fallback.intersection(mom_df[mom_df["mom_raw"] >= q50_m].index)
+            long_final = long_fallback
+            logger.info("[%s] LONG last-resort (top-25%% alpha + median mom) → %d.", as_of.date(), len(long_final))
+
+        if len(short_final) == 0 and not alpha_df.empty:
+            q25_a = alpha_df["alpha_tstat"].quantile(0.25)
+            q50_m = mom_df["mom_raw"].quantile(0.50) if not mom_df.empty else np.inf
+            short_fallback = alpha_df[alpha_df["alpha_tstat"] <= q25_a].index
+            if not mom_df.empty:
+                short_fallback = short_fallback.intersection(mom_df[mom_df["mom_raw"] <= q50_m].index)
+            short_final = short_fallback
+            logger.info("[%s] SHORT last-resort (bottom-25%% alpha + median mom) → %d.", as_of.date(), len(short_final))
+
         if len(long_final) == 0 or len(short_final) == 0:
-            logger.warning("Empty leg(s) after filtering – returning empty snapshot.")
+            logger.warning("Empty leg(s) after all fallbacks – returning empty snapshot.")
             return self._empty_snapshot(as_of)
 
         # ── 6. CML position sizing ────────────────────────────────────── #
