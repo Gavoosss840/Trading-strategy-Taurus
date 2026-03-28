@@ -61,19 +61,46 @@ def test_historical_data(ib: IB, ticker: str = "AAPL"):
     print(df.tail(6).to_string(index=False))
 
 
+def _front_month_es() -> str:
+    """
+    Retourne l'échéance front-month du contrat ES.
+    ES expire le 3ème vendredi de mars/juin/sept/déc (codes H/M/U/Z).
+    On prend le prochain contrat non expiré.
+    """
+    from datetime import date
+    import calendar
+    today = date.today()
+    expiry_months = [3, 6, 9, 12]
+    for year in [today.year, today.year + 1]:
+        for m in expiry_months:
+            # 3ème vendredi du mois
+            first_day = date(year, m, 1)
+            first_friday = first_day + __import__("datetime").timedelta(
+                days=(4 - first_day.weekday()) % 7
+            )
+            third_friday = first_friday + __import__("datetime").timedelta(weeks=2)
+            if third_friday > today:
+                return f"{year}{m:02d}"
+    return "202606"   # fallback
+
+
 def test_es_futures(ib: IB):
     print("\n--- Futures ES Mini (S&P 500) ---")
     try:
-        contract = Future("ES", exchange="CME", currency="USD")
+        expiry = _front_month_es()
+        contract = Future("ES", lastTradeDateOrContractMonth=expiry,
+                          exchange="CME", currency="USD")
         ib.qualifyContracts(contract)
+        print(f"  Contrat front-month : {contract.localSymbol} (expiry {expiry})")
+        ib.reqMarketDataType(3)   # données différées si pas d'abonnement CME
         mkt = ib.reqMktData(contract, "", False, False)
-        ib.sleep(2)
+        ib.sleep(3)
         print(f"  ES last  : {mkt.last}")
         print(f"  ES bid   : {mkt.bid}")
         print(f"  ES ask   : {mkt.ask}")
         ib.cancelMktData(contract)
     except Exception as e:
-        print(f"  ⚠ ES futures non disponible (abonnement CME requis) : {e}")
+        print(f"  ⚠ ES futures : {e}")
 
 
 def test_account_summary(ib: IB):
