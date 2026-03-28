@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     # Live trading
     p.add_argument("--universes", nargs="+",
                    default=["sp500"],
-                   help="Universes to trade: sp500 nasdaq100 cac40 dax ftse100")
+                   help="Universes to trade: sp500 nasdaq100 cac40 ftse100 nikkei225 hangseng tadawul")
     p.add_argument("--live",      action="store_true",
                    help="Live trading (port 7496). Default: paper (7497)")
     p.add_argument("--no-dry-run", action="store_true",

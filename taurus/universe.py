@@ -38,6 +38,9 @@ def _download_ff5_region(dataset_name: str, start: str, end: str):
     """
     Generic downloader for any Kenneth French 5-factor monthly dataset.
 
+    Kenneth French files are whitespace-delimited (not CSV despite the extension).
+    We use sep=r'\\s+' and scan for the first data block automatically.
+
     dataset_name examples:
       "Europe_5_Factors"
       "Japan_5_Factors"
@@ -53,26 +56,44 @@ def _download_ff5_region(dataset_name: str, start: str, end: str):
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
-        zf   = zipfile.ZipFile(io.BytesIO(resp.content))
-        name = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
-        raw_text = zf.read(name).decode("latin-1")
+        zf       = zipfile.ZipFile(io.BytesIO(resp.content))
+        fname    = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
+        raw_text = zf.read(fname).decode("latin-1")
 
-        # Scan for first line that starts with a 6-digit date
+        # Find the first line that starts with a 6-digit YYYYMM date
         lines = raw_text.splitlines()
         skip  = next(
             (i for i, l in enumerate(lines) if l.strip()[:6].isdigit()),
             6,
         )
-        raw = pd.read_csv(io.StringIO(raw_text), skiprows=skip, header=None)
-        raw = raw[raw.iloc[:, 0].astype(str).str.match(r"^\d{6}$")]
+
+        # Read as whitespace-delimited; French files use spaces, not commas
+        raw = pd.read_csv(
+            io.StringIO(raw_text),
+            skiprows=skip,
+            header=None,
+            sep=r"\s+",
+            engine="python",
+        )
+        # Keep only rows where col-0 is a 6-digit YYYYMM string
+        mask = raw.iloc[:, 0].astype(str).str.strip().str.match(r"^\d{6}$")
+        raw  = raw[mask].copy()
+
+        # Grab exactly 7 columns: date + 6 factors (ignore any trailing columns)
+        raw = raw.iloc[:, :7].copy()
         raw.columns = ["Date", "Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
-        raw["Date"] = pd.to_datetime(raw["Date"].astype(str), format="%Y%m")
+
+        raw["Date"] = pd.to_datetime(raw["Date"].astype(str).str.strip(), format="%Y%m")
         raw = raw.set_index("Date")
         raw.index = raw.index.to_period("M").to_timestamp("M")
-        raw = raw.astype(float) / 100.0
+        raw = raw.apply(pd.to_numeric, errors="coerce") / 100.0
+        raw = raw.dropna(how="all")
         raw = raw.loc[start:end]
-        logger.info("%s FF5 factors downloaded from Kenneth French (%d months).",
-                    dataset_name, len(raw))
+
+        logger.info(
+            "%s FF5 factors downloaded from Kenneth French (%d months).",
+            dataset_name, len(raw),
+        )
         return raw
     except Exception as e:
         logger.error("FF5 download failed for %s: %s", dataset_name, e)
@@ -138,24 +159,6 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         futures_multiplier=10.0,
         ibkr_exchange="SBF",
         wikipedia_url="https://en.wikipedia.org/wiki/CAC_40",
-        wikipedia_table_id="constituents",
-        min_market_cap_usd=1e9,
-        n_longs=10,
-        n_shorts=10,
-    ),
-
-    "dax": UniverseConfig(
-        name="dax",
-        display_name="DAX 40",
-        region="Europe",
-        currency="EUR",
-        ff5_dataset="Europe_5_Factors",
-        futures_symbol="DAX",
-        futures_exchange="EUREX",
-        futures_currency="EUR",
-        futures_multiplier=25.0,
-        ibkr_exchange="IBIS",
-        wikipedia_url="https://en.wikipedia.org/wiki/DAX",
         wikipedia_table_id="constituents",
         min_market_cap_usd=1e9,
         n_longs=10,
@@ -268,13 +271,6 @@ _FALLBACKS: Dict[str, List[str]] = {
         "PUB.PA", "AM.PA", "RMS.PA", "DSY.PA", "SHL.PA", "STLAM.MI",
     ],
 
-    "dax": [
-        "SAP.DE", "SIE.DE", "ALV.DE", "MRK.DE", "DTE.DE", "BAYN.DE",
-        "BMW.DE", "MUV2.DE", "DBK.DE", "BAS.DE", "ADS.DE", "VOW3.DE",
-        "HEN3.DE", "RWE.DE", "MTX.DE", "EOAN.DE", "BEI.DE", "FRE.DE",
-        "HEI.DE", "ZAL.DE", "VNA.DE", "CON.DE", "HAB.DE", "PAH3.DE",
-        "DHER.DE", "DB1.DE", "QIA.DE", "SHL.DE", "ENR.DE", "AIR.DE",
-    ],
 
     "ftse100": [
         "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "RIO.L", "GSK.L",
@@ -412,22 +408,33 @@ class UniverseDef:
     # ── Tickers ─────────────────────────────────────────────────────────── #
 
     def get_tickers(self, cfg: TaurusConfig = DEFAULT_CONFIG) -> List[str]:
-        """Scrape Wikipedia for universe constituents, fallback to hardcoded list."""
+        """
+        Return constituent tickers for this universe.
+
+        US universes: scrape Wikipedia (tickers are in col 0, plain symbol).
+        Non-US universes: use the hardcoded fallback list directly — Wikipedia
+        pages for European/Asian indices have company names in the ticker
+        column and require manual mapping.
+        """
         cache_key = f"tickers_{self.config.name}"
         cached = _cache_load(cache_key, cfg)
         if cached is not None:
             return cached
 
-        tickers = self._scrape_wikipedia()
-        if not tickers:
-            logger.warning(
-                "[%s] Wikipedia scrape failed, using fallback tickers.",
-                self.config.name,
-            )
-            tickers = _FALLBACKS.get(
-                self.config.name,
-                _FALLBACKS.get("nasdaq100", []),  # last resort
-            )
+        if self.config.region == "US":
+            tickers = self._scrape_wikipedia()
+            if not tickers:
+                logger.warning(
+                    "[%s] Wikipedia scrape failed, using fallback tickers.",
+                    self.config.name,
+                )
+                tickers = _FALLBACKS.get(self.config.name, [])
+        else:
+            # Non-US: skip Wikipedia scraping, use curated fallback lists
+            # that already have correct Yahoo Finance suffixes (.PA, .L, .T, .HK, .SR)
+            tickers = _FALLBACKS.get(self.config.name, [])
+            if not tickers:
+                logger.warning("[%s] No fallback tickers defined.", self.config.name)
 
         _cache_save(cache_key, tickers, cfg)
         logger.info("[%s] %d tickers loaded.", self.config.name, len(tickers))
@@ -539,6 +546,12 @@ class UniverseDef:
             return get_fundamentals(tickers, cfg)
         else:
             # Europe / Japan / Asia / MiddleEast — IFRS/local GAAP, not on EDGAR
+            if not tickers:
+                _empty_cols = [
+                    "total_debt", "total_equity", "ebit", "interest_expense",
+                    "total_assets", "market_cap", "sector", "tax_rate", "cash", "fcf",
+                ]
+                return pd.DataFrame(columns=_empty_cols)
             from .data import _fetch_single_fundamental
             records = [_fetch_single_fundamental(t) for t in tickers]
             return pd.DataFrame(records).set_index("ticker")

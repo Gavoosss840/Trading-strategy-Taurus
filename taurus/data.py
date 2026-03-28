@@ -313,6 +313,13 @@ def get_fundamentals(
         total_debt, total_equity, ebit, interest_expense,
         total_assets, market_cap, sector, tax_rate, cash, fcf
     """
+    if not tickers:
+        _empty_cols = [
+            "total_debt", "total_equity", "ebit", "interest_expense",
+            "total_assets", "market_cap", "sector", "tax_rate", "cash", "fcf",
+        ]
+        return pd.DataFrame(columns=_empty_cols)
+
     key = f"fundamentals_{'_'.join(sorted(tickers[:5]))}_{len(tickers)}"
     cached = _cache_load(key, cfg)
     if cached is not None:
