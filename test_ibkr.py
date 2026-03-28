@@ -22,9 +22,9 @@ def test_connection():
 
 def test_stock_price(ib: IB, ticker: str = "AAPL"):
     print(f"\n--- Prix (données différées) : {ticker} ---")
-    # Type 3 = données différées gratuites (15 min de délai)
-    # Suffisant pour Taurus qui rebalance mensuellement
-    ib.reqMarketDataType(3)
+    # Type 1 = temps réel (abonnement IBKR actif requis)
+    # Type 3 = différé 15min (fallback si pas d'abonnement)
+    ib.reqMarketDataType(1)
     contract = Stock(ticker, "SMART", "USD")
     ib.qualifyContracts(contract)
     mkt = ib.reqMktData(contract, "", False, False)
@@ -61,38 +61,35 @@ def test_historical_data(ib: IB, ticker: str = "AAPL"):
     print(df.tail(6).to_string(index=False))
 
 
-def _front_month_es() -> str:
+def _es_local_symbol() -> str:
     """
-    Retourne l'échéance front-month du contrat ES.
-    ES expire le 3ème vendredi de mars/juin/sept/déc (codes H/M/U/Z).
-    On prend le prochain contrat non expiré.
+    Calcule le localSymbol ES front-month (ex: ESM6 pour juin 2026).
+    Codes mois : H=mars, M=juin, U=sept, Z=déc
     """
-    from datetime import date
-    import calendar
+    from datetime import date, timedelta
+    month_codes = {3: "H", 6: "M", 9: "U", 12: "Z"}
     today = date.today()
-    expiry_months = [3, 6, 9, 12]
     for year in [today.year, today.year + 1]:
-        for m in expiry_months:
-            # 3ème vendredi du mois
-            first_day = date(year, m, 1)
-            first_friday = first_day + __import__("datetime").timedelta(
-                days=(4 - first_day.weekday()) % 7
-            )
-            third_friday = first_friday + __import__("datetime").timedelta(weeks=2)
-            if third_friday > today:
-                return f"{year}{m:02d}"
-    return "202606"   # fallback
+        for m in [3, 6, 9, 12]:
+            # 3ème vendredi du mois d'expiration
+            d = date(year, m, 1)
+            d += timedelta(days=(4 - d.weekday()) % 7)   # 1er vendredi
+            d += timedelta(weeks=2)                        # 3ème vendredi
+            if d > today:
+                code = month_codes[m]
+                yr   = str(year)[-1]   # dernier chiffre de l'année
+                return f"ES{code}{yr}"
+    return "ESM6"   # fallback
 
 
 def test_es_futures(ib: IB):
     print("\n--- Futures ES Mini (S&P 500) ---")
     try:
-        expiry = _front_month_es()
-        contract = Future("ES", lastTradeDateOrContractMonth=expiry,
-                          exchange="CME", currency="USD")
+        local_sym = _es_local_symbol()
+        contract = Future(localSymbol=local_sym, exchange="CME", currency="USD")
         ib.qualifyContracts(contract)
-        print(f"  Contrat front-month : {contract.localSymbol} (expiry {expiry})")
-        ib.reqMarketDataType(3)   # données différées si pas d'abonnement CME
+        print(f"  Contrat front-month : {local_sym}")
+        ib.reqMarketDataType(3)
         mkt = ib.reqMktData(contract, "", False, False)
         ib.sleep(3)
         print(f"  ES last  : {mkt.last}")
