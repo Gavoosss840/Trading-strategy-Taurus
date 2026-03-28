@@ -18,7 +18,7 @@ class UniverseConfig:
     region:               str              # "US" | "Europe" | "Japan" | "Asia" | "MiddleEast"
     currency:             str              # "USD" | "EUR" | "GBP" | "JPY" | "HKD" | "SAR"
     ff5_dataset:          str              # Ken French dataset name
-    futures_symbol:       str              # "ES" | "NQ" | "CAC" | "DAX" | "Z" | "NK225" | ...
+    futures_symbol:       str              # "ES" | "NQ" | "CAC" | "Z" | "NK225" | ...
     futures_exchange:     str              # "CME" | "EUREX" | "MONEP" | "LIFFE" | "OSE" | "HKEX"
     futures_currency:     str             # "USD" | "EUR" | "GBP" | "JPY" | "HKD"
     futures_multiplier:   float            # contract multiplier

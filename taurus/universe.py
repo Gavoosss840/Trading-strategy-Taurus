@@ -3,7 +3,7 @@ Taurus – Multi-universe registry.
 
 Defines investable universes:
   US      : S&P 500, NASDAQ 100
-  Europe  : CAC 40, DAX 40, FTSE 100
+  Europe  : CAC 40, FTSE 100
   Asia    : Nikkei 225 (Japan), Hang Seng (China/HK)
   Middle East: TADAWUL (Saudi Arabia)
 
@@ -567,7 +567,7 @@ class UniverseDef:
 
         sym = self.config.futures_symbol
         # ES and NQ: quarterly H/M/U/Z, expires 3rd Friday
-        # DAX/CAC: quarterly, similar convention
+        # CAC: quarterly, similar convention
         month_codes = {3: "H", 6: "M", 9: "U", 12: "Z"}
         today = date.today()
 
