@@ -266,6 +266,23 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
 
 _FALLBACKS: Dict[str, List[str]] = {
 
+    "sp500": [
+        # Top ~100 S&P 500 constituents by market cap (Yahoo Finance tickers)
+        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA",
+        "BRK-B", "AVGO", "JPM", "LLY", "V", "UNH", "XOM", "MA", "JNJ",
+        "COST", "PG", "HD", "ABBV", "WMT", "NFLX", "MRK", "CVX", "BAC",
+        "CRM", "ORCL", "AMD", "KO", "ACN", "PEP", "TMO", "MCD", "CSCO",
+        "LIN", "ABT", "GE", "IBM", "TXN", "DHR", "INTU", "PM", "CMCSA",
+        "WFC", "ISRG", "SPGI", "VZ", "NOW", "GS", "UBER", "AXP", "RTX",
+        "MS", "AMGN", "CAT", "HON", "T", "QCOM", "NEE", "BLK", "SYK",
+        "LOW", "UNP", "BSX", "BKNG", "MDT", "AMAT", "PLD", "GILD", "C",
+        "ADI", "CB", "SBUX", "DE", "TJX", "LRCX", "SO", "MMC", "MU",
+        "SCHW", "ADP", "BMY", "PANW", "CI", "ZTS", "REGN", "ETN", "BA",
+        "ELV", "DUK", "AON", "CME", "PH", "NOC", "ITW", "WM", "FI",
+        "APH", "MSI", "ECL", "USB", "GD", "PYPL", "ORLY", "CSX", "NSC",
+        "PSA", "SHW", "KLAC", "PNC", "MET", "HCA", "COF", "ROP", "TGT",
+    ],
+
     "nasdaq100": [
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
         "AVGO", "COST", "NFLX", "AMD", "ADBE", "QCOM", "INTU", "CSCO",
