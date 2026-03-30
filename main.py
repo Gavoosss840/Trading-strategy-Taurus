@@ -245,6 +245,42 @@ def run_backtest(args, cfg) -> None:
             a.get("sharpe_ratio",  0),
             a.get("max_drawdown",  0) * 100,
         )
+
+    # ── Compute equal-weighted combined row ──────────────────────────────── #
+    if len(all_results) > 1:
+        import numpy as np
+        ret_series = {
+            name: result.portfolio_returns()
+            for name, result in all_results.items()
+        }
+        combined_ret = pd.concat(ret_series.values(), axis=1).mean(axis=1).dropna()
+        if not combined_ret.empty:
+            cum_c    = (1 + combined_ret).cumprod()
+            total_c  = cum_c.iloc[-1] - 1
+            ann_c    = (1 + total_c) ** (12 / len(combined_ret)) - 1
+            vol_c    = combined_ret.std() * np.sqrt(12)
+            rf       = cfg.risk_free_rate_annual
+            sharpe_c = (ann_c - rf) / vol_c if vol_c > 0 else float("nan")
+            mdd_c    = (cum_c / cum_c.cummax() - 1).min()
+            logger.info("  %s", "-" * 56)
+            logger.info(
+                "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+                "COMBINED",
+                total_c  * 100,
+                ann_c    * 100,
+                sharpe_c,
+                mdd_c    * 100,
+            )
+            all_analytics["combined"] = {
+                "total_return":  float(total_c),
+                "annual_return": float(ann_c),
+                "annual_vol":    float(vol_c),
+                "sharpe_ratio":  float(sharpe_c),
+                "max_drawdown":  float(mdd_c),
+                "n_months":      len(combined_ret),
+            }
+    logger.info("%s", "=" * 60)
+
     with open(output / "combined_analytics.json", "w") as f:
         json.dump(all_analytics, f, indent=2)
 
