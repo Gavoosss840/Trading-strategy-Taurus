@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -378,6 +378,141 @@ def run_backtest(args, cfg) -> None:
             logger.info("[%s] Latest top positions:\n%s", name.upper(), top.to_string(index=False))
 
 
+def run_report(args, cfg) -> None:
+    """
+    Rebuild report.png from stored monthly_returns.csv files (no backtest needed).
+    Run this anytime after a live rebalance to get fresh charts.
+
+    Reads:  output/{universe}/monthly_returns.csv   (written by live scheduler)
+    Writes: output/report.png
+            output/equity_curve.png
+            output/rolling_sharpe.png
+            output/monthly_heatmap.png
+    """
+    import json
+    import numpy as np
+    import pandas as pd
+    from taurus.reporting import (
+        generate_combined_report,
+        plot_combined_equity_curve,
+        plot_combined_heatmap,
+        plot_combined_rolling_sharpe,
+    )
+
+    output    = Path(args.output)
+    universes = args.universes if hasattr(args, "universes") and args.universes else ["sp500"]
+
+    # ── Load stored monthly returns ──────────────────────────────────────── #
+    ret_map = {}
+    for name in universes:
+        path = output / name / "monthly_returns.csv"
+        if not path.exists():
+            logger.warning("[%s] No monthly_returns.csv found — skipping.", name)
+            continue
+        try:
+            s = pd.read_csv(path, index_col=0, parse_dates=True).squeeze()
+            s.name = name
+            ret_map[name] = s
+            logger.info("[%s] Loaded %d months of returns.", name, len(s))
+        except Exception as e:
+            logger.warning("[%s] Could not load returns: %s", name, e)
+
+    if not ret_map:
+        logger.error("No stored returns found in %s. Run a backtest or live rebalance first.", output)
+        return
+
+    # ── Load analytics if available ──────────────────────────────────────── #
+    analytics_path = output / "combined_analytics.json"
+    all_analytics  = {}
+    if analytics_path.exists():
+        with open(analytics_path) as f:
+            all_analytics = json.load(f)
+    else:
+        # Compute analytics from stored returns
+        for name, ret in ret_map.items():
+            ret = ret.dropna()
+            if ret.empty:
+                continue
+            cum      = (1 + ret).cumprod()
+            total    = cum.iloc[-1] - 1
+            ann      = (1 + total) ** (12 / len(ret)) - 1
+            vol      = ret.std() * np.sqrt(12)
+            sharpe   = (ann - cfg.risk_free_rate_annual) / vol if vol > 0 else float("nan")
+            drawdown = (cum / cum.cummax() - 1).min()
+            all_analytics[name] = {
+                "total_return":  float(total),
+                "annual_return": float(ann),
+                "annual_vol":    float(vol),
+                "sharpe_ratio":  float(sharpe),
+                "max_drawdown":  float(drawdown),
+                "n_months":      len(ret),
+            }
+
+    # ── Print summary ─────────────────────────────────────────────────────── #
+    logger.info("=" * 60)
+    logger.info("LIVE PORTFOLIO REPORT")
+    logger.info("=" * 60)
+    for name, a in all_analytics.items():
+        if name == "combined":
+            continue
+        logger.info(
+            "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+            name.upper(),
+            a.get("total_return",  0) * 100,
+            a.get("annual_return", 0) * 100,
+            a.get("sharpe_ratio",  0),
+            a.get("max_drawdown",  0) * 100,
+        )
+    ca = all_analytics.get("combined", {})
+    if ca:
+        logger.info("  %s", "-" * 56)
+        logger.info(
+            "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+            "COMBINED",
+            ca.get("total_return",  0) * 100,
+            ca.get("annual_return", 0) * 100,
+            ca.get("sharpe_ratio",  0),
+            ca.get("max_drawdown",  0) * 100,
+        )
+    logger.info("=" * 60)
+
+    # ── Build fake BacktestResult-like objects for chart functions ────────── #
+    # We wrap each Series in a lightweight object that exposes portfolio_returns()
+    class _ReturnProxy:
+        def __init__(self, ret, cfg):
+            self.ret = ret
+            self.cfg = cfg
+            self.snapshots = []
+
+        def portfolio_returns(self):
+            return self.ret
+
+    proxy_results = {
+        name: _ReturnProxy(ret.dropna(), cfg)
+        for name, ret in ret_map.items()
+    }
+
+    # ── Generate charts ───────────────────────────────────────────────────── #
+    try:
+        if len(proxy_results) > 1:
+            plot_combined_equity_curve(
+                proxy_results, save_path=str(output / "equity_curve.png"))
+            plot_combined_heatmap(
+                proxy_results, save_path=str(output / "monthly_heatmap.png"))
+            plot_combined_rolling_sharpe(
+                proxy_results, save_path=str(output / "rolling_sharpe.png"))
+        generate_combined_report(
+            results       = proxy_results,
+            all_analytics = all_analytics,
+            save_path     = str(output / "report.png"),
+            start         = str(next(iter(ret_map.values())).index[0].date()),
+            end           = str(next(iter(ret_map.values())).index[-1].date()),
+        )
+        logger.info("Report saved → %s/report.png", output)
+    except Exception as exc:
+        logger.warning("Chart generation failed: %s", exc)
+
+
 def run_live(args, cfg) -> None:
     from taurus.scheduler import RebalanceScheduler
     logger.info(
@@ -410,6 +545,8 @@ def main() -> None:
         run_backtest(args, cfg)
     elif args.mode == "live":
         run_live(args, cfg)
+    elif args.mode == "report":
+        run_report(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)
