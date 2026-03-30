@@ -145,25 +145,82 @@ class RebalanceScheduler:
 
     # ── Rebalance all universes ──────────────────────────────────────────── #
 
+    def _sharpe_weights(self, window: int = 12) -> dict:
+        """
+        Compute Sharpe-weighted NAV allocation fractions from stored monthly
+        returns.  Weights are proportional to max(Sharpe, 0) over the last
+        `window` months; falls back to equal-weight if all Sharpes are ≤ 0.
+        """
+        import numpy as np
+
+        returns = {}
+        for name in self.universes:
+            path = Path(self.output_dir) / name / "monthly_returns.csv"
+            if path.exists():
+                try:
+                    s = pd.read_csv(path, index_col=0, parse_dates=True).squeeze()
+                    returns[name] = s.tail(window)
+                except Exception:
+                    pass
+
+        if len(returns) < 2:
+            n = len(self.universes)
+            return {u: 1.0 / n for u in self.universes}
+
+        sharpes = {}
+        rf = self.cfg.risk_free_rate_annual
+        for name, r in returns.items():
+            r = r.dropna()
+            if len(r) < 3:
+                sharpes[name] = 0.0
+            else:
+                ann = (1 + r.mean()) ** 12 - 1
+                vol = r.std() * np.sqrt(12)
+                sharpes[name] = (ann - rf) / vol if vol > 0 else 0.0
+
+        # Universes with no stored history default to 0
+        for name in self.universes:
+            if name not in sharpes:
+                sharpes[name] = 0.0
+
+        raw = {k: max(v, 0.0) for k, v in sharpes.items()}
+        total = sum(raw.values())
+        if total < 1e-9:
+            n = len(self.universes)
+            weights = {k: 1.0 / n for k in self.universes}
+        else:
+            weights = {k: v / total for k, v in raw.items()}
+
+        logger.info(
+            "Sharpe-weighted NAV allocation: %s",
+            "  ".join(f"{k.upper()}={v*100:.1f}%" for k, v in weights.items()),
+        )
+        return weights
+
     def _run_all_universes(self, as_of: pd.Timestamp) -> None:
         """
         For each universe:
         1. Build strategy snapshot
-        2. Execute orders via IBKRExecutor
+        2. Execute orders via IBKRExecutor with Sharpe-weighted NAV fraction
         European markets open ~09:00 CET, US markets open 09:30 ET.
         We run European universes first, then US.
         """
+        nav_weights = self._sharpe_weights()
+
         european = [u for u in self.universes if REGISTRY.get(u).config.region == "Europe"]
         american = [u for u in self.universes if REGISTRY.get(u).config.region == "US"]
 
         for universe_name in european + american:
             try:
                 logger.info("--- Running universe: %s ---", universe_name)
-                self._run_single_universe(universe_name, as_of)
+                self._run_single_universe(
+                    universe_name, as_of,
+                    nav_fraction=nav_weights.get(universe_name, 1.0 / len(self.universes)),
+                )
             except Exception as e:
                 logger.error("Universe %s failed: %s", universe_name, e, exc_info=True)
 
-    def _run_single_universe(self, universe_name: str, as_of: pd.Timestamp) -> ExecutionReport:
+    def _run_single_universe(self, universe_name: str, as_of: pd.Timestamp, nav_fraction: float = 1.0) -> ExecutionReport:
         from .strategy import TaurusStrategy
 
         udef = REGISTRY.get(universe_name)
@@ -205,7 +262,7 @@ class RebalanceScheduler:
             universe_cfg=ucfg,
             output_dir=self.output_dir,
         )
-        report = executor.execute_rebalance(snapshot)
+        report = executor.execute_rebalance(snapshot, nav_fraction=nav_fraction)
         logger.info(
             "[%s] Execution: %d orders placed, %d errors",
             universe_name, len(report.orders), len(report.errors),

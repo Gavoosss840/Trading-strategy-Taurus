@@ -232,9 +232,14 @@ def run_backtest(args, cfg) -> None:
         if not top.empty:
             logger.info("[%s] Top positions:\n%s", universe_name, top.to_string(index=False))
 
-    # ── Combined summary ────────────────────────────────────────────────── #
+    # ── Save monthly returns per universe (used by scheduler for Sharpe weights) ── #
+    for name, result in all_results.items():
+        ret_path = output / name / "monthly_returns.csv"
+        result.portfolio_returns().to_csv(ret_path, header=["return"])
+
+    # ── Combined summary ─────────────────────────────────────────────────── #
     logger.info("\n%s", "=" * 60)
-    logger.info("COMBINED SUMMARY")
+    logger.info("COMBINED SUMMARY  (Sharpe-weighted allocation)")
     logger.info("=" * 60)
     for name, a in all_analytics.items():
         logger.info(
@@ -246,22 +251,54 @@ def run_backtest(args, cfg) -> None:
             a.get("max_drawdown",  0) * 100,
         )
 
-    # ── Compute equal-weighted combined row ──────────────────────────────── #
+    # ── Compute Sharpe-weighted combined row (no lookahead) ──────────────── #
     if len(all_results) > 1:
         import numpy as np
-        ret_series = {
-            name: result.portfolio_returns()
-            for name, result in all_results.items()
-        }
-        combined_ret = pd.concat(ret_series.values(), axis=1).mean(axis=1).dropna()
+
+        ret_map = {name: result.portfolio_returns() for name, result in all_results.items()}
+        df_ret  = pd.concat(ret_map, axis=1).sort_index()
+
+        combined_monthly = []
+        final_weights    = {name: 1.0 / len(all_results) for name in all_results}
+        window           = 12
+
+        for i, t in enumerate(df_ret.index):
+            hist = df_ret.iloc[max(0, i - window): i]
+            sharpes = {}
+            for name in df_ret.columns:
+                r = hist[name].dropna()
+                if len(r) < 3:
+                    sharpes[name] = 0.0
+                else:
+                    ann = (1 + r.mean()) ** 12 - 1
+                    vol = r.std() * np.sqrt(12)
+                    sharpes[name] = (ann - cfg.risk_free_rate_annual) / vol if vol > 0 else 0.0
+
+            raw   = {k: max(v, 0.0) for k, v in sharpes.items()}
+            total = sum(raw.values())
+            if total < 1e-9:
+                w = {k: 1.0 / len(df_ret.columns) for k in df_ret.columns}
+            else:
+                w = {k: v / total for k, v in raw.items()}
+
+            row_ret = sum(
+                w[name] * df_ret.loc[t, name]
+                for name in df_ret.columns
+                if not pd.isna(df_ret.loc[t, name])
+            )
+            combined_monthly.append(row_ret)
+            final_weights = w   # keep last for display
+
+        combined_ret = pd.Series(combined_monthly, index=df_ret.index).dropna()
+
         if not combined_ret.empty:
             cum_c    = (1 + combined_ret).cumprod()
             total_c  = cum_c.iloc[-1] - 1
             ann_c    = (1 + total_c) ** (12 / len(combined_ret)) - 1
             vol_c    = combined_ret.std() * np.sqrt(12)
-            rf       = cfg.risk_free_rate_annual
-            sharpe_c = (ann_c - rf) / vol_c if vol_c > 0 else float("nan")
+            sharpe_c = (ann_c - cfg.risk_free_rate_annual) / vol_c if vol_c > 0 else float("nan")
             mdd_c    = (cum_c / cum_c.cummax() - 1).min()
+
             logger.info("  %s", "-" * 56)
             logger.info(
                 "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
@@ -271,14 +308,24 @@ def run_backtest(args, cfg) -> None:
                 sharpe_c,
                 mdd_c    * 100,
             )
+            logger.info("  %s", "-" * 56)
+            logger.info("  Current NAV allocation (next rebalance):")
+            for name, w in sorted(final_weights.items(), key=lambda x: -x[1]):
+                logger.info("    %-12s  %.1f%%", name.upper(), w * 100)
+
             all_analytics["combined"] = {
-                "total_return":  float(total_c),
-                "annual_return": float(ann_c),
-                "annual_vol":    float(vol_c),
-                "sharpe_ratio":  float(sharpe_c),
-                "max_drawdown":  float(mdd_c),
-                "n_months":      len(combined_ret),
+                "total_return":   float(total_c),
+                "annual_return":  float(ann_c),
+                "annual_vol":     float(vol_c),
+                "sharpe_ratio":   float(sharpe_c),
+                "max_drawdown":   float(mdd_c),
+                "n_months":       len(combined_ret),
+                "nav_allocation": {k: round(v, 4) for k, v in final_weights.items()},
             }
+
+            # Save Sharpe-weighted combined returns for charts
+            combined_ret.to_csv(output / "combined_monthly_returns.csv", header=["return"])
+
     logger.info("%s", "=" * 60)
 
     with open(output / "combined_analytics.json", "w") as f:

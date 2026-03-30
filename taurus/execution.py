@@ -447,7 +447,7 @@ class IBKRExecutor:
         self.reconciler   = PositionReconciler()
         self.order_mgr    = OrderManager()
 
-    def execute_rebalance(self, snapshot) -> ExecutionReport:
+    def execute_rebalance(self, snapshot, nav_fraction: float = 1.0) -> ExecutionReport:
         """
         Full rebalance pipeline:
         1. Get live NAV and positions
@@ -470,9 +470,12 @@ class IBKRExecutor:
             return report
 
         try:
-            # 1. NAV
-            nav = self.reconciler.get_account_nav(self.conn)
-            logger.info("[%s] NAV = %.2f %s", self.udef_cfg.name, nav, self.udef_cfg.currency)
+            # 1. NAV (scaled by Sharpe-weighted fraction)
+            nav = self.reconciler.get_account_nav(self.conn) * nav_fraction
+            logger.info(
+                "[%s] NAV = %.2f %s (fraction=%.1f%%)",
+                self.udef_cfg.name, nav, self.udef_cfg.currency, nav_fraction * 100,
+            )
 
             # 2. Live prices
             all_tickers = list(snapshot.long_weights.index) + list(snapshot.short_weights.index)
