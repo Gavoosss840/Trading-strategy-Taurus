@@ -355,7 +355,10 @@ def _render_heatmap(ret: pd.Series, title: str, plt, save_path=None):
 
 
 def _render_heatmap_ax(ret: pd.Series, ax, title: str = "") -> None:
-    """Render a year×month heatmap onto an existing Axes."""
+    """Render a year×month heatmap onto an existing Axes, with annual Total column."""
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
     df = ret.to_frame("return")
     df["year"]  = df.index.year
     df["month"] = df.index.month
@@ -363,29 +366,51 @@ def _render_heatmap_ax(ret: pd.Series, ax, title: str = "") -> None:
     pivot.columns = ["Jan","Feb","Mar","Apr","May","Jun",
                      "Jul","Aug","Sep","Oct","Nov","Dec"]
 
+    # Annual total: compound monthly returns for each year
+    annual = pivot.apply(
+        lambda row: (1 + row.dropna()).prod() - 1, axis=1
+    )
+
     vals = pivot.values[~np.isnan(pivot.values)]
     vmax = max(abs(vals).max(), 0.01) if len(vals) else 0.01
 
-    im = ax.imshow(pivot.values, cmap="RdYlGn", vmin=-vmax, vmax=vmax, aspect="auto")
+    # Plot heatmap on columns 0..11, leave column 12 for Total
+    n_rows, n_cols = pivot.shape[0], 12
+    im = ax.imshow(pivot.values, cmap="RdYlGn", vmin=-vmax, vmax=vmax,
+                   aspect="auto", extent=[-0.5, n_cols - 0.5, n_rows - 0.5, -0.5])
 
-    try:
-        import matplotlib.pyplot as plt
-        plt.colorbar(im, ax=ax, format=lambda x, _: f"{x:.1%}")
-    except Exception:
-        pass
-
-    ax.set_xticks(range(12))
-    ax.set_xticklabels(pivot.columns, fontsize=8)
-    ax.set_yticks(range(len(pivot)))
+    # Month labels + cell text
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(list(pivot.columns), fontsize=8)
+    ax.set_yticks(range(n_rows))
     ax.set_yticklabels(pivot.index.astype(str), fontsize=8)
     ax.set_title(title, fontsize=11, fontweight="bold")
 
-    for i in range(pivot.shape[0]):
-        for j in range(pivot.shape[1]):
+    for i in range(n_rows):
+        for j in range(n_cols):
             val = pivot.iloc[i, j]
             if not np.isnan(val):
                 ax.text(j, i, f"{val:.1%}", ha="center", va="center",
                         fontsize=6, color="black")
+
+    try:
+        plt.colorbar(im, ax=ax, format=lambda x, _: f"{x:.1%}")
+    except Exception:
+        pass
+
+    # ── Total column drawn as text boxes outside the imshow area ─────────── #
+    ax.set_xlim(-0.5, n_cols + 0.6)   # extend x-axis to fit Total column
+
+    # Header "Total"
+    ax.text(n_cols + 0.05, -0.65, "Total", ha="center", va="center",
+            fontsize=8, fontweight="bold", color="white",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#2c3e50", edgecolor="none"))
+
+    for i, (year, tot) in enumerate(annual.items()):
+        color = "#2ecc71" if tot >= 0 else "#e74c3c"   # green / red
+        ax.text(n_cols + 0.05, i, f"{tot:+.1%}", ha="center", va="center",
+                fontsize=7, fontweight="bold", color="white",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor=color, edgecolor="none"))
 
 
 def _render_rolling_sharpe(series_dict, rf_m, window, title, plt, save_path=None):
