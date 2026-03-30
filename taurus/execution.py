@@ -242,24 +242,37 @@ class OrderManager:
         delta:        int,              # positive=buy, negative=sell/short
         universe_cfg: UniverseConfig,
         dry_run:      bool = True,
+        trail_pct:    float = 0.10,     # trailing stop % (10% par défaut)
     ) -> Optional[dict]:
-        """Place a single market order. Returns order info dict."""
-        from ib_insync import Stock, MarketOrder
+        """
+        Place a bracket order: MarketOrder + native TrailingStop on IBKR servers.
 
-        action = "BUY" if delta > 0 else "SELL"
-        qty    = abs(delta)
+        The trailing stop lives on IBKR's servers — your PC can be off after
+        the order is placed and the stop will still trigger automatically.
+
+        trail_pct = 0.10 → stop follows the price, cuts if -10% from peak.
+        """
+        from ib_insync import Stock, MarketOrder, Order
+
+        action       = "BUY"  if delta > 0 else "SELL"
+        stop_action  = "SELL" if delta > 0 else "BUY"
+        qty          = abs(delta)
 
         order_info = {
-            "ticker":   ticker,
-            "action":   action,
-            "quantity": qty,
-            "type":     "MKT",
-            "dry_run":  dry_run,
-            "status":   "pending",
+            "ticker":    ticker,
+            "action":    action,
+            "quantity":  qty,
+            "type":      "MKT+TRAIL",
+            "trail_pct": trail_pct,
+            "dry_run":   dry_run,
+            "status":    "pending",
         }
 
         if dry_run:
-            logger.info("[DRY RUN] %s %d %s @ MKT", action, qty, ticker)
+            logger.info(
+                "[DRY RUN] %s %d %s @ MKT + TrailingStop %.0f%%",
+                action, qty, ticker, trail_pct * 100,
+            )
             order_info["status"] = "dry_run"
             return order_info
 
@@ -271,11 +284,32 @@ class OrderManager:
         try:
             contract = Stock(ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
             conn.ib.qualifyContracts(contract)
-            order   = MarketOrder(action, qty)
-            trade   = conn.ib.placeOrder(contract, order)
-            order_info["ibkr_order_id"] = trade.order.orderId
-            order_info["status"]        = "submitted"
-            logger.info("Order submitted: %s %d %s (id=%d)", action, qty, ticker, trade.order.orderId)
+
+            # ── Parent: market order (don't transmit yet) ──────────────── #
+            parent          = MarketOrder(action, qty)
+            parent.transmit = False   # hold until child is ready
+
+            # ── Child: native trailing stop on IBKR servers ────────────── #
+            trail           = Order()
+            trail.action    = stop_action
+            trail.orderType = "TRAIL"
+            trail.totalQuantity   = qty
+            trail.trailingPercent = trail_pct * 100   # IBKR expects integer %
+            trail.parentId  = parent.orderId
+            trail.transmit  = True   # transmits both parent + child together
+
+            parent_trade = conn.ib.placeOrder(contract, parent)
+            trail_trade  = conn.ib.placeOrder(contract, trail)
+
+            order_info["ibkr_order_id"]       = parent_trade.order.orderId
+            order_info["ibkr_trail_order_id"] = trail_trade.order.orderId
+            order_info["status"] = "submitted"
+            logger.info(
+                "Bracket submitted: %s %d %s | parent=%d trail=%d (%.0f%%)",
+                action, qty, ticker,
+                parent_trade.order.orderId, trail_trade.order.orderId,
+                trail_pct * 100,
+            )
             return order_info
         except Exception as e:
             logger.error("Order failed for %s: %s", ticker, e)
@@ -466,10 +500,14 @@ class IBKRExecutor:
             )]
             entries = delta_df[~delta_df.index.isin(exits.index)]
 
+            from .risk import RiskConfig
+            trail_pct = RiskConfig().trailing_stop_pct
+
             for _, row in pd.concat([exits, entries]).iterrows():
                 order_info = self.order_mgr.place_order(
                     self.conn, row["ticker"], int(row["delta"]),
                     self.udef_cfg, dry_run=self.cfg.dry_run,
+                    trail_pct=trail_pct,
                 )
                 if order_info:
                     report.orders.append(order_info)
