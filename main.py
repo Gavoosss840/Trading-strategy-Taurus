@@ -159,6 +159,7 @@ def run_backtest(args, cfg) -> None:
     from taurus.strategy import TaurusStrategy
     from taurus.reporting import (
         combined_positions_df,
+        generate_combined_report,
         plot_combined_equity_curve,
         plot_combined_heatmap,
         plot_combined_rolling_sharpe,
@@ -356,6 +357,19 @@ def run_backtest(args, cfg) -> None:
         logger.info("Combined charts saved to %s/", output)
     except Exception as exc:
         logger.warning("Combined chart generation failed: %s", exc)
+
+    # ── One-page combined report ─────────────────────────────────────────── #
+    try:
+        generate_combined_report(
+            results       = all_results,
+            all_analytics = all_analytics,
+            save_path     = str(output / "report.png"),
+            start         = args.start,
+            end           = args.end,
+        )
+        logger.info("One-page report saved to %s", output / "report.png")
+    except Exception as exc:
+        logger.warning("Report generation failed: %s", exc)
 
     # ── Top positions (most recent, all universes) ───────────────────────── #
     for name, result in all_results.items():
