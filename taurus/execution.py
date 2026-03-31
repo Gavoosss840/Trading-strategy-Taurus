@@ -508,19 +508,27 @@ class OrderManager:
                         return None
 
                 if entry_price > 0:
+                    # OCA group: when STP fills, IBKR auto-cancels LMT and vice-versa.
+                    # Prevents zombie orders after position is closed by one of them.
+                    oca_group = f"TRS_{ibkr_ticker}_{parent_trade.order.orderId}"
+
                     stp               = Order()
                     stp.action        = stop_action
                     stp.orderType     = "STP"
                     stp.tif           = "GTC"
                     stp.totalQuantity = qty
                     stp.auxPrice      = round(stop_price, 2)
+                    stp.ocaGroup      = oca_group
+                    stp.ocaType       = 1   # cancel with block (most protective)
                     stp.transmit      = True
                     stp_id = _try_order(stp, "STP")
                     if stp_id:
                         order_info["ibkr_stp_order_id"] = stp_id
 
                     lmt = LimitOrder(stop_action, qty, round(tp_price, 2))
-                    lmt.tif = "GTC"
+                    lmt.tif      = "GTC"
+                    lmt.ocaGroup = oca_group
+                    lmt.ocaType  = 1
                     lmt.transmit = True
                     lmt_id = _try_order(lmt, "LMT")
                     if lmt_id:
