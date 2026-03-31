@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -513,6 +513,28 @@ def run_report(args, cfg) -> None:
         logger.warning("Chart generation failed: %s", exc)
 
 
+def run_live_report(args, cfg) -> None:
+    """
+    Generate live trading reports from IBKR NAV snapshots.
+
+    Reads:  output/live/nav_history.csv   (written by scheduler after each rebalance)
+    Writes: output/live/analytics.json
+            output/live/monthly_returns.csv
+            output/live/equity_curve.png
+            output/live/monthly_heatmap.png
+            output/live/rolling_sharpe.png
+            output/live/report.png
+    """
+    from taurus.live_reporting import generate_live_reports
+
+    output = Path(args.output)
+    logger.info("Generating live reports from %s/live/nav_history.csv …", output)
+    generate_live_reports(
+        output_dir=str(output),
+        rf_annual=cfg.risk_free_rate_annual,
+    )
+
+
 def run_live(args, cfg) -> None:
     from taurus.scheduler import RebalanceScheduler
     logger.info(
@@ -547,6 +569,8 @@ def main() -> None:
         run_live(args, cfg)
     elif args.mode == "report":
         run_report(args, cfg)
+    elif args.mode == "live-report":
+        run_live_report(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)

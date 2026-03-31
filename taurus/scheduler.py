@@ -223,6 +223,9 @@ class RebalanceScheduler:
             except Exception as e:
                 logger.error("Universe %s failed: %s", universe_name, e, exc_info=True)
 
+        # ── Record live performance snapshot after all universes ──────────── #
+        self._record_live_snapshot(as_of)
+
     def _run_single_universe(self, universe_name: str, as_of: pd.Timestamp, nav_fraction: float = 1.0) -> ExecutionReport:
         from .strategy import TaurusStrategy
 
@@ -351,6 +354,45 @@ class RebalanceScheduler:
         if added or removed:
             logger.info("Risk state synced: +%d added, -%d removed", added, len(removed))
             self.risk_mgr.state.save()
+
+    def _record_live_snapshot(self, as_of: pd.Timestamp) -> None:
+        """
+        Called once after all universes finish rebalancing.
+        Records total portfolio NAV and position snapshot for live reports.
+        """
+        from .execution import PositionReconciler
+        from .live_reporting import record_nav_snapshot, record_positions_snapshot
+
+        rec = PositionReconciler()
+        try:
+            # Get total NAV in account base currency (EUR for this portfolio)
+            nav = rec.get_account_nav(self.conn)
+            if nav and nav > 0:
+                # Detect account currency from account summary
+                try:
+                    summary = self.conn.ib.accountSummary(
+                        account=self.conn.cfg.ibkr_account or ""
+                    )
+                    currency = next(
+                        (v.currency for v in summary
+                         if v.tag == "NetLiquidation" and v.currency not in ("BASE", "")),
+                        "EUR",
+                    )
+                except Exception:
+                    currency = "EUR"
+                record_nav_snapshot(nav, currency, self.output_dir,
+                                    note=f"rebalance {as_of.date()}")
+            else:
+                logger.warning("Could not record NAV snapshot: NAV=%.2f", nav or 0)
+        except Exception as e:
+            logger.warning("_record_live_snapshot: NAV fetch failed: %s", e)
+
+        try:
+            live = rec.get_live_positions(self.conn)   # all positions, no filter
+            if not live.empty:
+                record_positions_snapshot(live, str(as_of.date()), self.output_dir)
+        except Exception as e:
+            logger.warning("_record_live_snapshot: positions fetch failed: %s", e)
 
     def _daily_risk_check(self) -> None:
         """
