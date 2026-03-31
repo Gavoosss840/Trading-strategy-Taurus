@@ -342,12 +342,16 @@ class OrderManager:
             contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
 
             # Try to qualify with primary exchange; fall back to SMART if market is closed
-            # (e.g. ENXTPA/LSE/TSEJ during overnight US session)
+            # (e.g. ENXTPA/LSE/TSEJ during overnight US session).
+            # ib_insync logs Error 200 as a WARNING without raising — check conId instead.
             try:
                 conn.ib.qualifyContracts(contract)
             except Exception:
+                contract.conId = 0   # force fallback below
+
+            if not contract.conId:
                 logger.warning(
-                    "qualifyContracts failed for %s on %s — retrying with SMART",
+                    "qualifyContracts failed for %s on %s (conId=0) — retrying with SMART",
                     ibkr_ticker, universe_cfg.ibkr_exchange,
                 )
                 contract = Stock(ibkr_ticker, "SMART", universe_cfg.currency)
