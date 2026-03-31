@@ -340,12 +340,26 @@ class OrderManager:
             # Strip Yahoo Finance exchange suffixes (.L, .PA, .T, .HK, .SR, etc.)
             ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
             contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
-            conn.ib.qualifyContracts(contract)
+
+            # Try to qualify with primary exchange; fall back to SMART if market is closed
+            # (e.g. ENXTPA/LSE/TSEJ during overnight US session)
+            try:
+                conn.ib.qualifyContracts(contract)
+            except Exception:
+                logger.warning(
+                    "qualifyContracts failed for %s on %s — retrying with SMART",
+                    ibkr_ticker, universe_cfg.ibkr_exchange,
+                )
+                contract = Stock(ibkr_ticker, "SMART", universe_cfg.currency)
+                conn.ib.qualifyContracts(contract)
 
             # ── Parent: market order (don't transmit yet) ──────────────── #
             parent          = MarketOrder(action, qty)
             parent.tif      = "DAY"   # explicit TIF to prevent TWS preset override (Error 10349)
             parent.transmit = False   # hold until child is ready
+
+            # Place parent first so its orderId is assigned before we reference it
+            parent_trade = conn.ib.placeOrder(contract, parent)
 
             # ── Child: native trailing stop on IBKR servers ────────────── #
             trail           = Order()
@@ -354,10 +368,9 @@ class OrderManager:
             trail.tif       = "GTC"   # explicit TIF to prevent TWS preset override (Error 10349)
             trail.totalQuantity   = qty
             trail.trailingPercent = trail_pct * 100   # IBKR expects integer %
-            trail.parentId  = parent.orderId
+            trail.parentId  = parent_trade.order.orderId   # use orderId assigned by placeOrder
             trail.transmit  = True   # transmits both parent + child together
 
-            parent_trade = conn.ib.placeOrder(contract, parent)
             trail_trade  = conn.ib.placeOrder(contract, trail)
 
             order_info["ibkr_order_id"]       = parent_trade.order.orderId
@@ -506,16 +519,27 @@ class IBKRExecutor:
         self.reconciler   = PositionReconciler()
         self.order_mgr    = OrderManager()
 
-    def execute_rebalance(self, snapshot, nav_fraction: float = 1.0) -> ExecutionReport:
+    def execute_rebalance(
+        self,
+        snapshot,
+        nav_fraction: float = 1.0,
+        yf_prices: Optional[Dict[str, float]] = None,
+    ) -> ExecutionReport:
         """
         Full rebalance pipeline:
         1. Get live NAV and positions
-        2. Get live prices for all target stocks
+        2. Get live prices for all target stocks (IBKR snapshot, fallback to yf_prices)
         3. Compute target share counts
         4. Compute delta vs live positions
         5. Place exits first, then entries
         6. Place futures hedge
         7. Save and return ExecutionReport
+
+        yf_prices: optional dict {ticker: last_close_price} from yfinance (already
+                   downloaded by strategy.load_data()).  Used as fallback when IBKR
+                   market data subscription is missing (e.g. LSE, TSEJ on paper
+                   account).  Tickers missing from IBKR prices but present in
+                   yf_prices will use the yfinance close.
         """
         report = ExecutionReport(
             universe=self.udef_cfg.name,
@@ -536,9 +560,21 @@ class IBKRExecutor:
                 self.udef_cfg.name, nav, self.udef_cfg.currency, nav_fraction * 100,
             )
 
-            # 2. Live prices
+            # 2. Live prices (IBKR snapshot), with yfinance fallback for missing tickers
             all_tickers = list(snapshot.long_weights.index) + list(snapshot.short_weights.index)
             prices = self.order_mgr.get_live_prices(self.conn, all_tickers, self.udef_cfg)
+
+            # Fill any tickers that had no IBKR market data (no subscription / market closed)
+            if yf_prices:
+                missing = [t for t in all_tickers if t not in prices or prices[t] <= 0]
+                filled  = [t for t in missing if yf_prices.get(t, 0) > 0]
+                for t in filled:
+                    prices[t] = yf_prices[t]
+                if filled:
+                    logger.info(
+                        "[%s] Used yfinance close prices for %d tickers (no IBKR data): %s",
+                        self.udef_cfg.name, len(filled), filled,
+                    )
 
             # 3. Target shares
             target = self.reconciler.compute_target_shares(

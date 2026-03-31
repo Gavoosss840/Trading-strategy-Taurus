@@ -258,6 +258,21 @@ class RebalanceScheduler:
             universe_name, snapshot.n_longs, snapshot.n_shorts,
         )
 
+        # Extract last yfinance close prices — used as fallback when IBKR market data
+        # subscription is missing (e.g. LSE / TSEJ on paper account, or market closed)
+        yf_prices: dict = {}
+        try:
+            prices_df = strategy._prices   # DataFrame: rows=dates, cols=tickers
+            if prices_df is not None and not prices_df.empty:
+                last_row = prices_df.iloc[-1].dropna()
+                yf_prices = last_row.to_dict()
+                logger.info(
+                    "[%s] yfinance fallback prices ready for %d tickers (last date: %s)",
+                    universe_name, len(yf_prices), prices_df.index[-1].date(),
+                )
+        except Exception as e:
+            logger.warning("[%s] Could not extract yfinance prices: %s", universe_name, e)
+
         # Execute via IBKR
         executor = IBKRExecutor(
             conn=self.conn,
@@ -265,7 +280,7 @@ class RebalanceScheduler:
             universe_cfg=ucfg,
             output_dir=self.output_dir,
         )
-        report = executor.execute_rebalance(snapshot, nav_fraction=nav_fraction)
+        report = executor.execute_rebalance(snapshot, nav_fraction=nav_fraction, yf_prices=yf_prices)
         logger.info(
             "[%s] Execution: %d orders placed, %d errors",
             universe_name, len(report.orders), len(report.errors),
