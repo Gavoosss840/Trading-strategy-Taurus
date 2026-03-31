@@ -300,7 +300,7 @@ _FALLBACKS: Dict[str, List[str]] = {
         "AIR.PA", "OR.PA", "DG.PA", "KER.PA", "SGO.PA", "CAP.PA", "ACA.PA",
         "STM.PA", "VIE.PA", "ORA.PA", "SAF.PA", "SW.PA", "HO.PA",
         "EL.PA", "CS.PA", "GLE.PA", "ML.PA", "URW.PA", "ENGI.PA",
-        "PUB.PA", "AM.PA", "RMS.PA", "DSY.PA", "SHL.PA", "STLAM.MI",
+        "PUB.PA", "AM.PA", "RMS.PA", "DSY.PA", "SHL.PA",
     ],
 
 
