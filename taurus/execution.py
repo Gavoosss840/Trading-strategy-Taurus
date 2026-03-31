@@ -144,49 +144,72 @@ class PositionReconciler:
         Long: positive shares. Short: negative shares.
         """
         half = cfg.gross_leverage / 2.0
-        target: Dict[str, int] = {}
+        target: Dict[str, float] = {}
 
-        lot = getattr(cfg, "min_lot_size", 1) or 1  # fallback to 1 if not set
-        # Use universe min_lot_size if available (e.g. TSE = 100)
-        ulot = getattr(universe_cfg, "min_lot_size", 1) if universe_cfg else 1
-        lot = max(lot, ulot)
+        fractional = getattr(universe_cfg, "fractional_shares", False) if universe_cfg else False
 
         # nav_scale converts NAV to match price units (e.g. LSE: GBP × 100 → GBp pence)
-        nav_scale = getattr(universe_cfg, "nav_scale", 1.0) if universe_cfg else 1.0
+        nav_scale     = getattr(universe_cfg, "nav_scale", 1.0) if universe_cfg else 1.0
         effective_nav = nav_usd * nav_scale
 
-        def _round_lot(shares: int) -> int:
-            """Round DOWN to nearest lot. Returns 0 if below 1 lot (skip position)."""
-            return (shares // lot) * lot
+        # lot-size rounding for non-fractional markets
+        lot  = getattr(cfg, "min_lot_size", 1) or 1
+        ulot = getattr(universe_cfg, "min_lot_size", 1) if universe_cfg else 1
+        lot  = max(lot, ulot)
+
+        def _round_lot(shares: float) -> float:
+            """Round DOWN to nearest lot (integer). Returns 0.0 if below 1 lot."""
+            n = int(shares) // lot * lot
+            return float(n)
 
         skipped = []
         for ticker, w in long_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
                 dollars = w * effective_nav * half
-                rounded = _round_lot(int(dollars / price))
-                if rounded > 0:
-                    target[ticker] = rounded
+                if fractional:
+                    shares = round(dollars / price, 2)
+                    if shares >= 0.01:
+                        target[ticker] = shares
+                    else:
+                        skipped.append(ticker)
                 else:
-                    skipped.append(ticker)
+                    rounded = _round_lot(dollars / price)
+                    if rounded > 0:
+                        target[ticker] = rounded
+                    else:
+                        skipped.append(ticker)
 
         for ticker, w in short_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
                 dollars = w * effective_nav * half
-                rounded = _round_lot(int(dollars / price))
-                if rounded > 0:
-                    target[ticker] = -rounded
+                if fractional:
+                    shares = round(dollars / price, 2)
+                    if shares >= 0.01:
+                        target[ticker] = -shares
+                    else:
+                        skipped.append(ticker)
                 else:
-                    skipped.append(ticker)
+                    rounded = _round_lot(dollars / price)
+                    if rounded > 0:
+                        target[ticker] = -rounded
+                    else:
+                        skipped.append(ticker)
 
         if skipped:
-            logger.warning(
-                "Skipped %d positions below min lot size (%d): %s",
-                len(skipped), lot, skipped,
-            )
+            if fractional:
+                logger.warning(
+                    "Skipped %d positions (allocation < 0.01 shares): %s",
+                    len(skipped), skipped,
+                )
+            else:
+                logger.warning(
+                    "Skipped %d positions below min lot size (%d): %s",
+                    len(skipped), lot, skipped,
+                )
 
-        return pd.Series(target, dtype=int)
+        return pd.Series(target, dtype=float)
 
     def get_pending_shares(self, conn: IBKRConnection) -> pd.Series:
         """
@@ -244,13 +267,13 @@ class PositionReconciler:
         )
         records = []
         for ticker in all_tickers:
-            filled  = int(live_positions.loc[ticker, "quantity"]) \
-                      if ticker in live_positions.index else 0
-            inflight = int(pending_shares.get(ticker, 0))
+            filled   = float(live_positions.loc[ticker, "quantity"]) \
+                       if ticker in live_positions.index else 0.0
+            inflight = float(pending_shares.get(ticker, 0.0))
             current  = filled + inflight
-            target   = int(target_shares.get(ticker, 0))
+            target   = float(target_shares.get(ticker, 0.0))
             delta    = target - current
-            if delta != 0:
+            if abs(delta) >= 0.01:   # ignore dust (< 0.01 share)
                 records.append({
                     "ticker":  ticker,
                     "current": current,
@@ -328,7 +351,7 @@ class OrderManager:
         self,
         conn:             IBKRConnection,
         ticker:           str,
-        delta:            int,              # positive=buy, negative=sell/short
+        delta:            float,            # positive=buy, negative=sell/short (fractional ok)
         universe_cfg:     UniverseConfig,
         dry_run:          bool  = True,
         trail_pct:        float = 0.10,     # stop loss % below/above entry (10%)
@@ -719,7 +742,7 @@ class IBKRExecutor:
 
             for _, row in pd.concat([exits, entries]).iterrows():
                 order_info = self.order_mgr.place_order(
-                    self.conn, row["ticker"], int(row["delta"]),
+                    self.conn, row["ticker"], float(row["delta"]),
                     self.udef_cfg, dry_run=self.cfg.dry_run,
                     trail_pct=trail_pct,
                     entry_price=prices.get(row["ticker"], 0.0),
