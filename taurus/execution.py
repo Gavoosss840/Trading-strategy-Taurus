@@ -154,24 +154,68 @@ class PositionReconciler:
 
         return pd.Series(target, dtype=int)
 
+    def get_pending_shares(self, conn: IBKRConnection) -> pd.Series:
+        """
+        Returns signed share counts for open entry orders (MKT/LMT) that are
+        not yet filled.  TRAIL stop orders are excluded — they are protective,
+        not entries.
+
+        Used to avoid duplicate orders when restarting the algo on the same day
+        before fills have settled.
+        """
+        try:
+            trades = conn.ib.openTrades()
+        except Exception:
+            return pd.Series(dtype=float)
+
+        ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
+        ENTRY_TYPES = {"MKT", "LMT", "MOC", "MKT ON CLOSE"}
+
+        pending: dict = {}
+        for trade in trades:
+            if trade.orderStatus.status not in ACTIVE:
+                continue
+            if trade.order.orderType not in ENTRY_TYPES:
+                continue   # skip TRAIL, STOP, etc.
+            symbol = trade.contract.symbol
+            qty    = trade.order.totalQuantity
+            signed = qty if trade.order.action == "BUY" else -qty
+            pending[symbol] = pending.get(symbol, 0) + signed
+
+        if pending:
+            logger.info(
+                "Pending entry orders detected (%d tickers) — included in delta calc to avoid duplicates",
+                len(pending),
+            )
+        return pd.Series(pending, dtype=float)
+
     def compute_order_delta(
         self,
         target_shares:  pd.Series,
         live_positions: pd.DataFrame,
+        pending_shares: pd.Series = None,
     ) -> pd.DataFrame:
         """
         Returns DataFrame with columns: ticker, current, target, delta.
         Filters out zero deltas.
+
+        pending_shares: signed share counts for open but unfilled entry orders.
+        Passing this prevents duplicate orders when relaunching on the same day.
         """
+        if pending_shares is None:
+            pending_shares = pd.Series(dtype=float)
+
         all_tickers = target_shares.index.union(
             live_positions.index if not live_positions.empty else pd.Index([])
         )
         records = []
         for ticker in all_tickers:
-            current = int(live_positions.loc[ticker, "quantity"]) \
+            filled  = int(live_positions.loc[ticker, "quantity"]) \
                       if ticker in live_positions.index else 0
-            target  = int(target_shares.get(ticker, 0))
-            delta   = target - current
+            inflight = int(pending_shares.get(ticker, 0))
+            current  = filled + inflight
+            target   = int(target_shares.get(ticker, 0))
+            delta    = target - current
             if delta != 0:
                 records.append({
                     "ticker":  ticker,
@@ -501,9 +545,10 @@ class IBKRExecutor:
                 nav, self.cfg, prices,
             )
 
-            # 4. Delta vs live
-            live = self.reconciler.get_live_positions(self.conn)
-            delta_df = self.reconciler.compute_order_delta(target, live)
+            # 4. Delta vs live (filled positions + pending entry orders)
+            live    = self.reconciler.get_live_positions(self.conn)
+            pending = self.reconciler.get_pending_shares(self.conn)
+            delta_df = self.reconciler.compute_order_delta(target, live, pending)
 
             if delta_df.empty:
                 logger.info("[%s] No trades needed — portfolio already at target.", self.udef_cfg.name)
