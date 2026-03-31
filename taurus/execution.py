@@ -827,6 +827,8 @@ class IBKRExecutor:
 
             if delta_df.empty:
                 logger.info("[%s] No trades needed — portfolio already at target.", self.udef_cfg.name)
+                if not self.cfg.dry_run:
+                    self._log_reconciliation(target, delta_df, report)
                 report.save(self.output_dir)
                 return report
 
