@@ -360,5 +360,5 @@ class RebalanceScheduler:
         }
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
-        Path(tmp).rename(self.STATE_FILE)
+        Path(tmp).replace(self.STATE_FILE)  # replace() works on Windows (rename() fails if dest exists)
         logger.info("State saved: last_rebalance=%s", rebalance_date)

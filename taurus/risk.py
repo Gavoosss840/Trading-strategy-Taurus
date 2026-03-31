@@ -120,7 +120,7 @@ class RiskState:
         }
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
-        Path(tmp).rename(self.config.state_file)
+        Path(tmp).replace(self.config.state_file)  # replace() works on Windows (rename() fails if dest exists)
 
     def register_rebalance(
         self,
