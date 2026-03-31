@@ -213,9 +213,13 @@ class OrderManager:
 
         prices: Dict[str, float] = {}
         contracts = []
+        # Map ibkr_ticker → original ticker for price dict
+        ticker_map: Dict[str, str] = {}
         for ticker in tickers:
-            c = Stock(ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
+            ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
+            c = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
             contracts.append(c)
+            ticker_map[ibkr_ticker] = ticker
 
         try:
             conn.ib.qualifyContracts(*contracts)
@@ -233,11 +237,12 @@ class OrderManager:
             bid = td.bid if td.bid and td.bid > 0 else float("nan")
             ask = td.ask if td.ask and td.ask > 0 else float("nan")
             last = td.last if td.last and td.last > 0 else float("nan")
-            # Mid price or last
+            # Mid price or last; store under original ticker key
+            orig = ticker_map.get(symbol, symbol)
             if bid == bid and ask == ask:
-                prices[symbol] = (bid + ask) / 2.0
+                prices[orig] = (bid + ask) / 2.0
             elif last == last:
-                prices[symbol] = last
+                prices[orig] = last
 
         return prices
 
@@ -288,11 +293,14 @@ class OrderManager:
             return order_info
 
         try:
-            contract = Stock(ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
+            # Strip Yahoo Finance exchange suffixes (.L, .PA, .T, .HK, .SR, etc.)
+            ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
+            contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
             conn.ib.qualifyContracts(contract)
 
             # ── Parent: market order (don't transmit yet) ──────────────── #
             parent          = MarketOrder(action, qty)
+            parent.tif      = "DAY"   # explicit TIF to prevent TWS preset override (Error 10349)
             parent.transmit = False   # hold until child is ready
 
             # ── Child: native trailing stop on IBKR servers ────────────── #
