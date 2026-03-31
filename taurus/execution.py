@@ -102,24 +102,29 @@ class PositionReconciler:
     """
 
     def get_live_positions(self, conn: IBKRConnection) -> pd.DataFrame:
-        """Returns DataFrame: ticker, quantity (+long / -short), market_value."""
+        """Returns DataFrame: ticker, quantity (+long / -short), avg_cost."""
         positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
         if not positions:
-            return pd.DataFrame(columns=["ticker", "quantity", "market_value", "avg_cost"])
+            return pd.DataFrame(columns=["ticker", "quantity", "avg_cost"])
 
         records = []
         for p in positions:
             records.append({
-                "ticker":       p.contract.symbol,
-                "quantity":     p.position,
-                "market_value": p.marketValue,
-                "avg_cost":     p.averageCost,
+                "ticker":   p.contract.symbol,
+                "quantity": p.position,
+                "avg_cost": p.averageCost,
             })
         return pd.DataFrame(records).set_index("ticker")
 
-    def get_account_nav(self, conn: IBKRConnection) -> float:
-        """Returns total NAV in account currency from IBKR."""
+    def get_account_nav(self, conn: IBKRConnection, currency: str = None) -> float:
+        """Returns NAV in the requested currency (falls back to account base currency)."""
         summary = conn.ib.accountSummary(account=conn.cfg.ibkr_account or "")
+        # IBKR reports NetLiquidation in multiple currencies — prefer the universe's currency
+        if currency:
+            for item in summary:
+                if item.tag == "NetLiquidation" and item.currency == currency:
+                    return float(item.value)
+        # Fallback: account base currency
         for item in summary:
             if item.tag == "NetLiquidation":
                 return float(item.value)
@@ -338,21 +343,25 @@ class OrderManager:
         stop_action  = "SELL" if delta > 0 else "BUY"
         qty          = abs(delta)
 
+        _use_trail = getattr(universe_cfg, "supports_trail_stop", True)
         order_info = {
             "ticker":    ticker,
             "action":    action,
             "quantity":  qty,
-            "type":      "MKT+TRAIL",
-            "trail_pct": trail_pct,
+            "type":      "MKT+TRAIL" if _use_trail else "MKT",
+            "trail_pct": trail_pct if _use_trail else None,
             "dry_run":   dry_run,
             "status":    "pending",
         }
 
         if dry_run:
-            logger.info(
-                "[DRY RUN] %s %d %s @ MKT + TrailingStop %.0f%%",
-                action, qty, ticker, trail_pct * 100,
-            )
+            if _use_trail:
+                logger.info(
+                    "[DRY RUN] %s %d %s @ MKT + TrailingStop %.0f%%",
+                    action, qty, ticker, trail_pct * 100,
+                )
+            else:
+                logger.info("[DRY RUN] %s %d %s @ MKT (no trail)", action, qty, ticker)
             order_info["status"] = "dry_run"
             return order_info
 
@@ -382,35 +391,51 @@ class OrderManager:
                 contract = Stock(ibkr_ticker, "SMART", universe_cfg.currency)
                 conn.ib.qualifyContracts(contract)
 
-            # ── Parent: market order (don't transmit yet) ──────────────── #
-            parent          = MarketOrder(action, qty)
-            parent.tif      = "DAY"   # explicit TIF to prevent TWS preset override (Error 10349)
-            parent.transmit = False   # hold until child is ready
+            use_trail = getattr(universe_cfg, "supports_trail_stop", True)
 
-            # Place parent first so its orderId is assigned before we reference it
-            parent_trade = conn.ib.placeOrder(contract, parent)
+            if use_trail:
+                # ── Bracket: MKT (hold) + TRAIL child (transmits both) ── #
+                parent          = MarketOrder(action, qty)
+                parent.tif      = "DAY"
+                parent.transmit = False   # child will trigger transmission
 
-            # ── Child: native trailing stop on IBKR servers ────────────── #
-            trail           = Order()
-            trail.action    = stop_action
-            trail.orderType = "TRAIL"
-            trail.tif       = "GTC"   # explicit TIF to prevent TWS preset override (Error 10349)
-            trail.totalQuantity   = qty
-            trail.trailingPercent = trail_pct * 100   # IBKR expects integer %
-            trail.parentId  = parent_trade.order.orderId   # use orderId assigned by placeOrder
-            trail.transmit  = True   # transmits both parent + child together
+                parent_trade = conn.ib.placeOrder(contract, parent)
 
-            trail_trade  = conn.ib.placeOrder(contract, trail)
+                trail                 = Order()
+                trail.action          = stop_action
+                trail.orderType       = "TRAIL"
+                trail.tif             = "GTC"
+                trail.totalQuantity   = qty
+                trail.trailingPercent = trail_pct * 100
+                trail.parentId        = parent_trade.order.orderId
+                trail.transmit        = True   # transmits both orders
 
-            order_info["ibkr_order_id"]       = parent_trade.order.orderId
-            order_info["ibkr_trail_order_id"] = trail_trade.order.orderId
-            order_info["status"] = "submitted"
-            logger.info(
-                "Bracket submitted: %s %d %s | parent=%d trail=%d (%.0f%%)",
-                action, qty, ticker,
-                parent_trade.order.orderId, trail_trade.order.orderId,
-                trail_pct * 100,
-            )
+                trail_trade = conn.ib.placeOrder(contract, trail)
+
+                order_info["ibkr_order_id"]       = parent_trade.order.orderId
+                order_info["ibkr_trail_order_id"] = trail_trade.order.orderId
+                order_info["status"] = "submitted"
+                logger.info(
+                    "Bracket submitted: %s %d %s | parent=%d trail=%d (%.0f%%)",
+                    action, qty, ticker,
+                    parent_trade.order.orderId, trail_trade.order.orderId,
+                    trail_pct * 100,
+                )
+            else:
+                # ── Simple MKT (Euronext/LSE — TRAIL not supported on MKT) ── #
+                parent          = MarketOrder(action, qty)
+                parent.tif      = "DAY"
+                parent.transmit = True   # transmit immediately, no stop attached
+
+                parent_trade = conn.ib.placeOrder(contract, parent)
+
+                order_info["ibkr_order_id"] = parent_trade.order.orderId
+                order_info["status"] = "submitted"
+                logger.info(
+                    "MKT submitted (no trail): %s %d %s | orderId=%d",
+                    action, qty, ticker, parent_trade.order.orderId,
+                )
+
             return order_info
         except Exception as e:
             logger.error("Order failed for %s: %s", ticker, e)
@@ -582,8 +607,10 @@ class IBKRExecutor:
             return report
 
         try:
-            # 1. NAV (scaled by Sharpe-weighted fraction)
-            nav = self.reconciler.get_account_nav(self.conn) * nav_fraction
+            # 1. NAV in universe's local currency (scaled by Sharpe-weighted fraction)
+            nav = self.reconciler.get_account_nav(
+                self.conn, currency=self.udef_cfg.currency
+            ) * nav_fraction
             logger.info(
                 "[%s] NAV = %.2f %s (fraction=%.1f%%)",
                 self.udef_cfg.name, nav, self.udef_cfg.currency, nav_fraction * 100,

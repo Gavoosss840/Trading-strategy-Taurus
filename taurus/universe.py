@@ -172,6 +172,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_url="https://en.wikipedia.org/wiki/CAC_40",
         wikipedia_table_id="constituents",
         min_market_cap_usd=1e9,
+        supports_trail_stop=False,          # Euronext rejects TRAIL on MKT parent (Error 328)
         n_longs=10,
         n_shorts=10,
     ),
@@ -190,6 +191,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_url="https://en.wikipedia.org/wiki/FTSE_100",
         wikipedia_table_id="constituents",
         min_market_cap_usd=1e9,
+        supports_trail_stop=False,          # LSE rejects TRAIL on MKT parent (Error 328)
         n_longs=15,
         n_shorts=15,
     ),

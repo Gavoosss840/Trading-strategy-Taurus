@@ -29,6 +29,7 @@ class UniverseConfig:
     ticker_col_index:     int   = 0        # column index of ticker in Wikipedia table
     min_market_cap_usd:   float = 2e9
     min_lot_size:         int   = 1        # minimum order size (TSE=100, most others=1)
+    supports_trail_stop:  bool  = True     # False for Euronext/LSE (Error 328: TRAIL only on LMT/STPLMT)
     n_longs:              int   = 25
     n_shorts:             int   = 25
 
