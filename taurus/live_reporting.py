@@ -147,6 +147,52 @@ def load_live_positions_history(output_dir: str = "output") -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def blend_returns_with_live(
+    backtest_returns: dict,
+    output_dir: str = "output",
+) -> pd.Series:
+    """
+    Build a blended combined return series for the main backtesting reports:
+      - dates <  live_start : Sharpe-weighted (or equal-weighted) backtest combined
+      - dates >= live_start : actual IBKR NAV monthly returns
+
+    Parameters
+    ----------
+    backtest_returns : {universe_name: pd.Series of monthly returns}
+    output_dir       : root output directory (live/ subfolder is read automatically)
+
+    Returns a single pd.Series with a continuous DatetimeIndex.
+    The calling chart function can use it as a drop-in replacement for the
+    normal equal-weighted combined series.
+    """
+    live = compute_live_monthly_returns(output_dir)
+
+    if not backtest_returns:
+        return live if not live.empty else pd.Series(dtype=float, name="combined")
+
+    # Equal-weighted backtest combined (same as _combined_returns in reporting.py)
+    df = pd.concat(backtest_returns, axis=1).dropna(how="all")
+    bt_combined = df.mean(axis=1)
+    bt_combined.name = "combined"
+
+    if live.empty:
+        return bt_combined   # no live data yet → pure backtest
+
+    live_start = live.index[0]
+    bt_slice   = bt_combined[bt_combined.index < live_start]
+
+    blended = pd.concat([bt_slice, live]).sort_index()
+    blended.name = "combined"
+
+    n_bt   = len(bt_slice)
+    n_live = len(live)
+    logger.info(
+        "Blended combined returns: %d backtest months + %d live months (from %s)",
+        n_bt, n_live, live_start.strftime("%Y-%m"),
+    )
+    return blended
+
+
 def compute_live_analytics(returns: pd.Series, rf_annual: float = 0.045) -> dict:
     """Compute standard performance metrics from a monthly returns Series."""
     if returns.empty or len(returns) < 2:

@@ -358,14 +358,22 @@ def run_backtest(args, cfg) -> None:
     except Exception as exc:
         logger.warning("Combined chart generation failed: %s", exc)
 
-    # ── One-page combined report ─────────────────────────────────────────── #
+    # ── One-page combined report (blended backtest + live if available) ─────── #
     try:
+        from taurus.live_reporting import blend_returns_with_live
+        bt_rets = {name: r.portfolio_returns() for name, r in all_results.items()}
+        blended = blend_returns_with_live(bt_rets, output_dir=str(output))
+        combined_override = blended if not blended.empty else None
+        report_end = (
+            str(blended.index[-1].date()) if combined_override is not None else args.end
+        )
         generate_combined_report(
-            results       = all_results,
-            all_analytics = all_analytics,
-            save_path     = str(output / "report.png"),
-            start         = args.start,
-            end           = args.end,
+            results           = all_results,
+            all_analytics     = all_analytics,
+            save_path         = str(output / "report.png"),
+            start             = args.start,
+            end               = report_end,
+            combined_override = combined_override,
         )
         logger.info("One-page report saved to %s", output / "report.png")
     except Exception as exc:
@@ -492,6 +500,14 @@ def run_report(args, cfg) -> None:
         for name, ret in ret_map.items()
     }
 
+    # ── Blend backtest returns with live NAV data (if available) ─────────── #
+    from taurus.live_reporting import blend_returns_with_live
+    blended_combined = blend_returns_with_live(
+        {name: r.portfolio_returns() for name, r in proxy_results.items()},
+        output_dir=str(output),
+    )
+    combined_override = blended_combined if not blended_combined.empty else None
+
     # ── Generate charts ───────────────────────────────────────────────────── #
     try:
         if len(proxy_results) > 1:
@@ -501,12 +517,16 @@ def run_report(args, cfg) -> None:
                 proxy_results, save_path=str(output / "monthly_heatmap.png"))
             plot_combined_rolling_sharpe(
                 proxy_results, save_path=str(output / "rolling_sharpe.png"))
+
+        all_ret = next(iter(ret_map.values()))
+        blended_end = blended_combined.index[-1].date() if not blended_combined.empty else all_ret.index[-1].date()
         generate_combined_report(
-            results       = proxy_results,
-            all_analytics = all_analytics,
-            save_path     = str(output / "report.png"),
-            start         = str(next(iter(ret_map.values())).index[0].date()),
-            end           = str(next(iter(ret_map.values())).index[-1].date()),
+            results           = proxy_results,
+            all_analytics     = all_analytics,
+            save_path         = str(output / "report.png"),
+            start             = str(all_ret.index[0].date()),
+            end               = str(blended_end),
+            combined_override = combined_override,
         )
         logger.info("Report saved → %s/report.png", output)
     except Exception as exc:

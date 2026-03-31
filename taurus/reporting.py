@@ -445,11 +445,12 @@ def _render_rolling_sharpe(series_dict, rf_m, window, title, plt, save_path=None
 # --------------------------------------------------------------------------- #
 
 def generate_combined_report(
-    results:      Dict[str, "BacktestResult"],
-    all_analytics: dict,
-    save_path:    Optional[str] = None,
-    start:        str = "",
-    end:          str = "",
+    results:           Dict[str, "BacktestResult"],
+    all_analytics:     dict,
+    save_path:         Optional[str] = None,
+    start:             str = "",
+    end:               str = "",
+    combined_override: Optional[pd.Series] = None,
 ):
     """
     One-page PDF/PNG report:
@@ -461,37 +462,49 @@ def generate_combined_report(
       ├──────────────────────┴───────────────────────────┤
       │  Combined monthly returns heatmap                │
       └──────────────────────────────────────────────────┘
+
+    Parameters
+    ----------
+    combined_override : optional pre-computed combined return series (e.g. blended
+                        backtest + live).  When provided, replaces the Sharpe-weighted
+                        combined computation for the equity curve, heatmap and rolling
+                        Sharpe.  Individual universe lines are unaffected.
     """
     plt, gridspec = _plt()
 
-    # ── Build Sharpe-weighted combined return series ─────────────────────── #
+    # ── Build combined return series ─────────────────────────────────────── #
     ret_map = {name: r.portfolio_returns() for name, r in results.items()}
     df_ret  = pd.concat(ret_map, axis=1).sort_index()
     window  = 12
 
-    combined_monthly = []
-    for i, t in enumerate(df_ret.index):
-        hist = df_ret.iloc[max(0, i - window): i]
-        sharpes = {}
-        for name in df_ret.columns:
-            r = hist[name].dropna()
-            if len(r) < 3:
-                sharpes[name] = 0.0
-            else:
-                ann = (1 + r.mean()) ** 12 - 1
-                vol = r.std() * np.sqrt(12)
-                sharpes[name] = ann / vol if vol > 0 else 0.0
-        raw   = {k: max(v, 0.0) for k, v in sharpes.items()}
-        total = sum(raw.values())
-        w     = ({k: v / total for k, v in raw.items()} if total > 1e-9
-                 else {k: 1.0 / len(df_ret.columns) for k in df_ret.columns})
-        row_ret = sum(
-            w[name] * df_ret.loc[t, name]
-            for name in df_ret.columns if not pd.isna(df_ret.loc[t, name])
-        )
-        combined_monthly.append(row_ret)
+    if combined_override is not None:
+        # Use the caller-supplied series (e.g. backtest + live blend)
+        combined_ret = combined_override.dropna()
+    else:
+        # Sharpe-weighted rolling combination (original logic)
+        combined_monthly = []
+        for i, t in enumerate(df_ret.index):
+            hist = df_ret.iloc[max(0, i - window): i]
+            sharpes = {}
+            for name in df_ret.columns:
+                r = hist[name].dropna()
+                if len(r) < 3:
+                    sharpes[name] = 0.0
+                else:
+                    ann = (1 + r.mean()) ** 12 - 1
+                    vol = r.std() * np.sqrt(12)
+                    sharpes[name] = ann / vol if vol > 0 else 0.0
+            raw   = {k: max(v, 0.0) for k, v in sharpes.items()}
+            total = sum(raw.values())
+            w     = ({k: v / total for k, v in raw.items()} if total > 1e-9
+                     else {k: 1.0 / len(df_ret.columns) for k in df_ret.columns})
+            row_ret = sum(
+                w[name] * df_ret.loc[t, name]
+                for name in df_ret.columns if not pd.isna(df_ret.loc[t, name])
+            )
+            combined_monthly.append(row_ret)
+        combined_ret = pd.Series(combined_monthly, index=df_ret.index).dropna()
 
-    combined_ret = pd.Series(combined_monthly, index=df_ret.index).dropna()
     cum_c = (1 + combined_ret).cumprod()
     dd_c  = cum_c / cum_c.cummax() - 1
 
@@ -590,10 +603,25 @@ def generate_combined_report(
                    color=_PALETTE[i % len(_PALETTE)],
                    linestyle="--", alpha=0.65, label=name.upper())
 
+    combined_label = "COMBINED (Live)" if combined_override is not None else "COMBINED (Sharpe-wtd)"
     ax_eq.plot(cum_c.index, cum_c.values, linewidth=2.2,
-               color="black", label="COMBINED (Sharpe-wtd)")
+               color="black", label=combined_label)
     ax_eq.axhline(1.0, color="grey", linewidth=0.7, linestyle=":")
-    ax_eq.set_title("Equity Curve – Sharpe-Weighted Combined", fontsize=11, fontweight="bold")
+
+    # Mark the transition from backtest to live data with a vertical line.
+    # The live portion starts where combined_override extends beyond the last
+    # backtest-only date, i.e. beyond the last date present in all universe returns.
+    if combined_override is not None and not df_ret.empty:
+        last_bt_date = df_ret.dropna(how="all").index[-1]
+        live_dates   = combined_override.index[combined_override.index > last_bt_date]
+        if len(live_dates):
+            live_start = live_dates[0]
+            ax_eq.axvline(live_start, color="#e67e22", linewidth=1.2,
+                          linestyle="--", label=f"Live start ({live_start.strftime('%Y-%m')})")
+            ax_dd.axvline(live_start, color="#e67e22", linewidth=1.2, linestyle="--")
+
+    title_suffix = " (Backtest → Live)" if combined_override is not None else ""
+    ax_eq.set_title(f"Equity Curve – Combined{title_suffix}", fontsize=11, fontweight="bold")
     ax_eq.set_ylabel("Cumulative Return")
     ax_eq.legend(fontsize=7, loc="upper left")
     ax_eq.grid(alpha=0.25)
