@@ -191,7 +191,8 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_url="https://en.wikipedia.org/wiki/FTSE_100",
         wikipedia_table_id="constituents",
         min_market_cap_usd=1e9,
-        supports_trail_stop=False,          # LSE rejects TRAIL on MKT parent (Error 328)
+        nav_scale=100.0,                    # LSE prices in GBp (pence): NAV(GBP)*100 = GBp units
+        supports_trail_stop=False,          # LSE: MKT transmits alone, STP sent as standalone order
         n_longs=15,
         n_shorts=15,
     ),

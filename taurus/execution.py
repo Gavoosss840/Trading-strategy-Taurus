@@ -151,6 +151,10 @@ class PositionReconciler:
         ulot = getattr(universe_cfg, "min_lot_size", 1) if universe_cfg else 1
         lot = max(lot, ulot)
 
+        # nav_scale converts NAV to match price units (e.g. LSE: GBP × 100 → GBp pence)
+        nav_scale = getattr(universe_cfg, "nav_scale", 1.0) if universe_cfg else 1.0
+        effective_nav = nav_usd * nav_scale
+
         def _round_lot(shares: int) -> int:
             """Round DOWN to nearest lot. Returns 0 if below 1 lot (skip position)."""
             return (shares // lot) * lot
@@ -159,7 +163,7 @@ class PositionReconciler:
         for ticker, w in long_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
-                dollars = w * nav_usd * half
+                dollars = w * effective_nav * half
                 rounded = _round_lot(int(dollars / price))
                 if rounded > 0:
                     target[ticker] = rounded
@@ -169,7 +173,7 @@ class PositionReconciler:
         for ticker, w in short_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
-                dollars = w * nav_usd * half
+                dollars = w * effective_nav * half
                 rounded = _round_lot(int(dollars / price))
                 if rounded > 0:
                     target[ticker] = -rounded
@@ -327,13 +331,15 @@ class OrderManager:
         delta:        int,              # positive=buy, negative=sell/short
         universe_cfg: UniverseConfig,
         dry_run:      bool = True,
-        trail_pct:    float = 0.10,     # trailing stop % (10% par défaut)
+        trail_pct:    float = 0.10,     # stop loss % from entry price (10% par défaut)
+        entry_price:  float = 0.0,      # last known price for stop calculation
     ) -> Optional[dict]:
         """
-        Place a bracket order: MarketOrder + native TrailingStop on IBKR servers.
+        Place a MKT order with a fixed STP (stop loss) at -stop_pct% from entry price.
 
-        The trailing stop lives on IBKR's servers — your PC can be off after
-        the order is placed and the stop will still trigger automatically.
+        US markets (bracket_mode=True): MKT + STP as bracket — both transmit together.
+        EU markets (bracket_mode=False): MKT transmits immediately; STP sent standalone
+        so a stop rejection never freezes the parent in PreSubmitted state.
 
         trail_pct = 0.10 → stop follows the price, cuts if -10% from peak.
         """
@@ -343,25 +349,29 @@ class OrderManager:
         stop_action  = "SELL" if delta > 0 else "BUY"
         qty          = abs(delta)
 
-        _use_trail = getattr(universe_cfg, "supports_trail_stop", True)
+        # Fixed stop loss: -stop_pct from entry for longs, +stop_pct for shorts
+        stop_pct    = trail_pct   # reuse the same risk parameter (default 10%)
+        stop_price  = (entry_price * (1 - stop_pct)) if delta > 0 else (entry_price * (1 + stop_pct))
+
+        # For EU markets: MKT transmits independently; STP sent as standalone order after
+        bracket_mode = getattr(universe_cfg, "supports_trail_stop", True)
+
         order_info = {
-            "ticker":    ticker,
-            "action":    action,
-            "quantity":  qty,
-            "type":      "MKT+TRAIL" if _use_trail else "MKT",
-            "trail_pct": trail_pct if _use_trail else None,
-            "dry_run":   dry_run,
-            "status":    "pending",
+            "ticker":      ticker,
+            "action":      action,
+            "quantity":    qty,
+            "type":        "MKT+STP",
+            "stop_price":  round(stop_price, 4) if stop_price else None,
+            "stop_pct":    stop_pct,
+            "dry_run":     dry_run,
+            "status":      "pending",
         }
 
         if dry_run:
-            if _use_trail:
-                logger.info(
-                    "[DRY RUN] %s %d %s @ MKT + TrailingStop %.0f%%",
-                    action, qty, ticker, trail_pct * 100,
-                )
-            else:
-                logger.info("[DRY RUN] %s %d %s @ MKT (no trail)", action, qty, ticker)
+            logger.info(
+                "[DRY RUN] %s %d %s @ MKT + STP %.4f (%.0f%%)",
+                action, qty, ticker, stop_price, stop_pct * 100,
+            )
             order_info["status"] = "dry_run"
             return order_info
 
@@ -391,50 +401,79 @@ class OrderManager:
                 contract = Stock(ibkr_ticker, "SMART", universe_cfg.currency)
                 conn.ib.qualifyContracts(contract)
 
-            use_trail = getattr(universe_cfg, "supports_trail_stop", True)
-
-            if use_trail:
-                # ── Bracket: MKT (hold) + TRAIL child (transmits both) ── #
+            if bracket_mode:
+                # ── Bracket: MKT (hold) + STP child (transmits both together) ──
+                # Works on US exchanges (NYSE/NASDAQ). Stop is attached to the parent.
                 parent          = MarketOrder(action, qty)
                 parent.tif      = "DAY"
-                parent.transmit = False   # child will trigger transmission
+                parent.transmit = False   # STP child triggers transmission
 
                 parent_trade = conn.ib.placeOrder(contract, parent)
 
-                trail                 = Order()
-                trail.action          = stop_action
-                trail.orderType       = "TRAIL"
-                trail.tif             = "GTC"
-                trail.totalQuantity   = qty
-                trail.trailingPercent = trail_pct * 100
-                trail.parentId        = parent_trade.order.orderId
-                trail.transmit        = True   # transmits both orders
+                stp                = Order()
+                stp.action         = stop_action
+                stp.orderType      = "STP"
+                stp.tif            = "GTC"
+                stp.totalQuantity  = qty
+                stp.auxPrice       = round(stop_price, 2)   # stop trigger price
+                stp.parentId       = parent_trade.order.orderId
+                stp.transmit       = True   # transmits both orders together
 
-                trail_trade = conn.ib.placeOrder(contract, trail)
+                stp_trade = conn.ib.placeOrder(contract, stp)
 
-                order_info["ibkr_order_id"]       = parent_trade.order.orderId
-                order_info["ibkr_trail_order_id"] = trail_trade.order.orderId
+                order_info["ibkr_order_id"]     = parent_trade.order.orderId
+                order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
                 order_info["status"] = "submitted"
                 logger.info(
-                    "Bracket submitted: %s %d %s | parent=%d trail=%d (%.0f%%)",
+                    "Bracket submitted: %s %d %s | parent=%d stp=%d (stop=%.2f)",
                     action, qty, ticker,
-                    parent_trade.order.orderId, trail_trade.order.orderId,
-                    trail_pct * 100,
+                    parent_trade.order.orderId, stp_trade.order.orderId, stop_price,
                 )
             else:
-                # ── Simple MKT (Euronext/LSE — TRAIL not supported on MKT) ── #
+                # ── EU markets (Euronext/LSE): MKT transmits immediately ──
+                # STP sent as standalone GTC order (not a child — avoids PreSubmitted freeze
+                # if the exchange rejects the stop). If STP is rejected, MKT already went through.
                 parent          = MarketOrder(action, qty)
                 parent.tif      = "DAY"
-                parent.transmit = True   # transmit immediately, no stop attached
+                parent.transmit = True   # transmit at once — never blocks on stop rejection
 
                 parent_trade = conn.ib.placeOrder(contract, parent)
 
                 order_info["ibkr_order_id"] = parent_trade.order.orderId
                 order_info["status"] = "submitted"
-                logger.info(
-                    "MKT submitted (no trail): %s %d %s | orderId=%d",
-                    action, qty, ticker, parent_trade.order.orderId,
-                )
+
+                if stop_price > 0:
+                    stp               = Order()
+                    stp.action        = stop_action
+                    stp.orderType     = "STP"
+                    stp.tif           = "GTC"
+                    stp.totalQuantity = qty
+                    stp.auxPrice      = round(stop_price, 2)
+                    # No parentId — standalone order so MKT fill isn't blocked
+                    stp.transmit      = True
+
+                    try:
+                        stp_trade = conn.ib.placeOrder(contract, stp)
+                        order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
+                        logger.info(
+                            "MKT+STP submitted: %s %d %s | mkt=%d stp=%d (stop=%.2f)",
+                            action, qty, ticker,
+                            parent_trade.order.orderId, stp_trade.order.orderId, stop_price,
+                        )
+                    except Exception as stp_err:
+                        logger.warning(
+                            "MKT submitted but standalone STP failed for %s: %s",
+                            ticker, stp_err,
+                        )
+                        logger.info(
+                            "MKT submitted (STP failed): %s %d %s | mkt=%d",
+                            action, qty, ticker, parent_trade.order.orderId,
+                        )
+                else:
+                    logger.info(
+                        "MKT submitted (no price for STP): %s %d %s | mkt=%d",
+                        action, qty, ticker, parent_trade.order.orderId,
+                    )
 
             return order_info
         except Exception as e:
@@ -663,6 +702,7 @@ class IBKRExecutor:
                     self.conn, row["ticker"], int(row["delta"]),
                     self.udef_cfg, dry_run=self.cfg.dry_run,
                     trail_pct=trail_pct,
+                    entry_price=prices.get(row["ticker"], 0.0),
                 )
                 if order_info:
                     report.orders.append(order_info)
