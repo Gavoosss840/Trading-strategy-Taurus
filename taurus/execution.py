@@ -820,6 +820,14 @@ class IBKRExecutor:
                 nav, self.cfg, prices, universe_cfg=self.udef_cfg,
             )
 
+            # Normalise target tickers: strip Yahoo Finance exchange suffixes
+            # (.L, .PA, .T, .HK, .SR, etc.) so they match IBKR position symbols,
+            # which never carry exchange suffixes.  Without this, TSCO.L (target)
+            # and TSCO (live) are treated as different stocks → close + reopen
+            # instead of a simple adjustment.
+            target.index = pd.Index([t.split(".")[0] if "." in t else t for t in target.index])
+            prices        = {(t.split(".")[0] if "." in t else t): v for t, v in prices.items()}
+
             # 4. Delta vs live (filled positions + pending entry orders)
             live    = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
             pending = self.reconciler.get_pending_shares(self.conn)
