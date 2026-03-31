@@ -147,20 +147,35 @@ class PositionReconciler:
         lot = max(lot, ulot)
 
         def _round_lot(shares: int) -> int:
-            """Round down to nearest lot, minimum 1 lot."""
-            return max(lot, (shares // lot) * lot)
+            """Round DOWN to nearest lot. Returns 0 if below 1 lot (skip position)."""
+            return (shares // lot) * lot
 
+        skipped = []
         for ticker, w in long_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
                 dollars = w * nav_usd * half
-                target[ticker] = _round_lot(int(dollars / price))
+                rounded = _round_lot(int(dollars / price))
+                if rounded > 0:
+                    target[ticker] = rounded
+                else:
+                    skipped.append(ticker)
 
         for ticker, w in short_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
                 dollars = w * nav_usd * half
-                target[ticker] = -_round_lot(int(dollars / price))
+                rounded = _round_lot(int(dollars / price))
+                if rounded > 0:
+                    target[ticker] = -rounded
+                else:
+                    skipped.append(ticker)
+
+        if skipped:
+            logger.warning(
+                "Skipped %d positions below min lot size (%d): %s",
+                len(skipped), lot, skipped,
+            )
 
         return pd.Series(target, dtype=int)
 
