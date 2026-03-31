@@ -740,7 +740,8 @@ class IBKRExecutor:
             trail_pct = risk_cfg.stop_loss_pct
             tp_pct    = risk_cfg.take_profit_pct
 
-            for _, row in pd.concat([exits, entries]).iterrows():
+            for _, row in pd.concat([exits, entries]).reset_index(drop=True).iterrows():
+                ticker     = str(row["ticker"])
                 order_info = self.order_mgr.place_order(
                     self.conn, row["ticker"], float(row["delta"]),
                     self.udef_cfg, dry_run=self.cfg.dry_run,
