@@ -653,6 +653,100 @@ class IBKRExecutor:
         self.reconciler   = PositionReconciler()
         self.order_mgr    = OrderManager()
 
+    def _log_reconciliation(
+        self,
+        target:    pd.Series,
+        delta_df:  pd.DataFrame,
+        report:    "ExecutionReport",
+    ) -> None:
+        """
+        After orders are placed, log a full reconciliation summary:
+        - Submitted orders: ticker, action, qty, IBKR status
+        - Orders that were cancelled/errored
+        - Positions already at target (no rebalancing needed)
+        Stored in report.orders as 'reconciliation' entries.
+        """
+        try:
+            # Current open trades and fills from IBKR
+            open_trades = self.conn.ib.openTrades()
+            open_by_id  = {t.order.orderId: t for t in open_trades}
+
+            # Re-read live positions after fills
+            live_now = self.reconciler.get_live_positions(self.conn)
+
+            lines = [
+                f"\n{'='*60}",
+                f"RECONCILIATION — {self.udef_cfg.name.upper()} @ {datetime.now().strftime('%H:%M:%S')}",
+                f"{'='*60}",
+            ]
+
+            submitted_ok  = 0
+            cancelled_err = 0
+
+            for o in report.orders:
+                ticker  = o.get("ticker", "?")
+                action  = o.get("action", "?")
+                qty     = o.get("quantity", 0)
+                status  = o.get("status", "?")
+                oid     = o.get("ibkr_order_id")
+
+                # Check live IBKR status if we have an order ID
+                live_status = status
+                if oid and oid in open_by_id:
+                    live_status = open_by_id[oid].orderStatus.status
+                elif oid:
+                    # Not in open trades → likely filled or cancelled
+                    live_status = "Filled/Cancelled"
+
+                icon = "✓" if status not in ("error", "cancelled") else "✗"
+                if "cancel" in live_status.lower() or status == "error":
+                    cancelled_err += 1
+                    icon = "✗"
+                else:
+                    submitted_ok += 1
+
+                stp = o.get("stop_price")
+                lmt = o.get("tp_price")
+                line = (
+                    f"  {icon} {action:4s} {int(qty):5d} {ticker:<12s}"
+                    f"  STP={stp:.2f}  LMT={lmt:.2f}"
+                    f"  [{live_status}]"
+                ) if stp and lmt else (
+                    f"  {icon} {action:4s} {int(qty):5d} {ticker:<12s}  [{live_status}]"
+                )
+                lines.append(line)
+
+            # Positions already at target (no delta needed)
+            tickers_with_orders = set(delta_df["ticker"].tolist()) if not delta_df.empty else set()
+            positions_at_target = []
+            for ticker in target.index:
+                if ticker not in tickers_with_orders:
+                    qty_live = float(live_now.loc[ticker, "quantity"]) if ticker in live_now.index else 0
+                    positions_at_target.append(f"    {ticker:<12s}  qty={qty_live:.0f}  (no rebalancing needed)")
+
+            if positions_at_target:
+                lines.append(f"\n  Already at target ({len(positions_at_target)} positions):")
+                lines.extend(positions_at_target)
+
+            lines.append(f"\n  SUMMARY: {submitted_ok} submitted OK | {cancelled_err} cancelled/error")
+            lines.append(f"  Live positions after rebalance: {len(live_now)} total")
+            lines.append(f"{'='*60}")
+
+            summary = "\n".join(lines)
+            logger.info(summary)
+
+            # Store reconciliation in report
+            report.orders.append({
+                "type":           "reconciliation_summary",
+                "submitted_ok":   submitted_ok,
+                "cancelled_err":  cancelled_err,
+                "at_target_count": len(positions_at_target),
+                "live_positions": len(live_now),
+            })
+
+        except Exception as e:
+            logger.warning("Reconciliation failed: %s", e)
+
     def execute_rebalance(
         self,
         snapshot,
@@ -763,6 +857,10 @@ class IBKRExecutor:
             # 7. Wait for fills (skipped in dry run)
             if not self.cfg.dry_run:
                 self.order_mgr.wait_for_fills(self.conn)
+
+            # 7b. Reconciliation report — compare submitted orders vs live state
+            if not self.cfg.dry_run:
+                self._log_reconciliation(target, delta_df, report)
 
             # 8. Enregistrer les entry prices dans le RiskManager
             try:

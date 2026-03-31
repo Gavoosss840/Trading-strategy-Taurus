@@ -136,7 +136,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_url="https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
         wikipedia_table_id="constituents",
         min_market_cap_usd=2e9,
-        fractional_shares=True,             # IBKR supports fractional MKT orders for US stocks
+        fractional_shares=False,            # IBKR API rejects fractional quantities (Error 10243)
         n_longs=25,
         n_shorts=25,
     ),
@@ -155,7 +155,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_url="https://en.wikipedia.org/wiki/Nasdaq-100",
         wikipedia_table_id="constituents",
         min_market_cap_usd=5e9,
-        fractional_shares=True,             # IBKR supports fractional MKT orders for US stocks
+        fractional_shares=False,            # IBKR API rejects fractional quantities (Error 10243)
         n_longs=20,
         n_shorts=20,
     ),
