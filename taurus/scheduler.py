@@ -289,6 +289,69 @@ class RebalanceScheduler:
 
     # ── Daily risk check ────────────────────────────────────────────────── #
 
+    def _sync_risk_state_from_ibkr(self) -> None:
+        """
+        Sync risk state with live IBKR positions so every held position is monitored,
+        not just those recorded during the last rebalancing run.
+        - Adds positions present in IBKR but missing from risk state (uses avg_cost as entry price)
+        - Removes positions no longer held in IBKR
+        """
+        from .execution import PositionReconciler
+        from .risk import PositionState
+
+        rec = PositionReconciler()
+        try:
+            # Fetch all live positions (no currency filter — we want everything)
+            live = rec.get_live_positions(self.conn)
+            if live.empty:
+                return
+        except Exception as e:
+            logger.warning("_sync_risk_state: could not fetch live positions: %s", e)
+            return
+
+        # Build a currency→universe_name map from the configured universes
+        currency_to_universe: dict = {}
+        for uname in self.universes:
+            udef = REGISTRY.get(uname)
+            if udef:
+                currency_to_universe[udef.config.currency] = uname
+
+        live_tickers = set(live.index)
+
+        # Add positions not yet tracked
+        added = 0
+        for ticker, row in live.iterrows():
+            if ticker in self.risk_mgr.state.positions:
+                continue
+            qty = float(row["quantity"])
+            avg_cost = float(row["avg_cost"])
+            if avg_cost <= 0 or qty == 0:
+                continue
+            # Infer universe from existing state or fall back to first configured universe
+            universe = (
+                next((u for u in self.universes if REGISTRY.get(u)), self.universes[0])
+                if self.universes else "unknown"
+            )
+            self.risk_mgr.state.positions[ticker] = PositionState(
+                ticker=ticker,
+                side="LONG" if qty > 0 else "SHORT",
+                entry_price=avg_cost,
+                entry_date=date.today().isoformat(),
+                peak_price=avg_cost,
+                shares=abs(int(qty)),
+                universe=universe,
+            )
+            added += 1
+
+        # Remove positions no longer held
+        removed = [t for t in list(self.risk_mgr.state.positions) if t not in live_tickers]
+        for t in removed:
+            del self.risk_mgr.state.positions[t]
+
+        if added or removed:
+            logger.info("Risk state synced: +%d added, -%d removed", added, len(removed))
+            self.risk_mgr.state.save()
+
     def _daily_risk_check(self) -> None:
         """
         Vérifie chaque position quotidiennement contre :
@@ -297,6 +360,9 @@ class RebalanceScheduler:
           - Circuit breaker global (-15% portfolio)
         Coupe les positions qui franchissent les seuils.
         """
+        # First sync risk state from actual IBKR positions so all positions are monitored
+        self._sync_risk_state_from_ibkr()
+
         if not self.risk_mgr.state.positions:
             return   # aucune position à surveiller
 
@@ -305,7 +371,6 @@ class RebalanceScheduler:
         # Récupérer les prix actuels pour toutes les positions
         from .execution import OrderManager
         mgr = OrderManager()
-        all_tickers = list(self.risk_mgr.state.positions.keys())
 
         # Grouper par univers pour récupérer les prix avec le bon exchange
         by_universe: dict = {}
