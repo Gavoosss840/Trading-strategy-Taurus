@@ -200,9 +200,15 @@ class OrderManager:
     ) -> Dict[str, float]:
         """Request snapshot mid prices for position sizing."""
         from ib_insync import Stock
+        from datetime import datetime, time as dtime
+        from zoneinfo import ZoneInfo
 
-        from .test_utils import _market_is_open
-        market_open = _market_is_open()
+        # Use live data during market hours, delayed otherwise
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        market_open = (
+            now_et.weekday() < 5 and
+            dtime(9, 30) <= now_et.time() <= dtime(16, 0)
+        )
         conn.ib.reqMarketDataType(1 if market_open else 2)
 
         prices: Dict[str, float] = {}
