@@ -351,6 +351,7 @@ class OrderManager:
             trail           = Order()
             trail.action    = stop_action
             trail.orderType = "TRAIL"
+            trail.tif       = "GTC"   # explicit TIF to prevent TWS preset override (Error 10349)
             trail.totalQuantity   = qty
             trail.trailingPercent = trail_pct * 100   # IBKR expects integer %
             trail.parentId  = parent.orderId
