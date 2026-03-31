@@ -105,6 +105,11 @@ class RebalanceScheduler:
             "LIVE" if self.cfg.live_trading else "PAPER",
         )
 
+        # ── Seed NAV history on first startup ─────────────────────────────── #
+        # If no NAV history exists yet, record current NAV as the baseline so
+        # that the first rebalancing can compute a monthly return.
+        self._seed_initial_nav_if_needed()
+
         while True:
             try:
                 if not self.conn.ensure_connected():
@@ -354,6 +359,43 @@ class RebalanceScheduler:
         if added or removed:
             logger.info("Risk state synced: +%d added, -%d removed", added, len(removed))
             self.risk_mgr.state.save()
+
+    def _seed_initial_nav_if_needed(self) -> None:
+        """
+        If output/live/nav_history.csv does not exist yet, record current IBKR
+        NAV as the baseline starting point so the first rebalancing can produce
+        a monthly return.  Does nothing if history already exists.
+        """
+        from pathlib import Path as _P
+        from .live_reporting import load_nav_history, record_nav_snapshot
+
+        nav_path = _P(self.output_dir) / "live" / "nav_history.csv"
+        if nav_path.exists():
+            return   # already seeded
+
+        logger.info("No NAV history found — recording current NAV as baseline.")
+        try:
+            from .execution import PositionReconciler
+            rec = PositionReconciler()
+            nav = rec.get_account_nav(self.conn)
+            if nav and nav > 0:
+                try:
+                    summary = self.conn.ib.accountSummary(
+                        account=self.conn.cfg.ibkr_account or ""
+                    )
+                    currency = next(
+                        (v.currency for v in summary
+                         if v.tag == "NetLiquidation" and v.currency not in ("BASE", "")),
+                        "EUR",
+                    )
+                except Exception:
+                    currency = "EUR"
+                record_nav_snapshot(nav, currency, self.output_dir, note="initial baseline")
+                logger.info("Baseline NAV recorded: %s %.2f", currency, nav)
+            else:
+                logger.warning("Could not seed initial NAV: NAV=%.2f", nav or 0)
+        except Exception as e:
+            logger.warning("_seed_initial_nav_if_needed failed: %s", e)
 
     def _record_live_snapshot(self, as_of: pd.Timestamp) -> None:
         """
