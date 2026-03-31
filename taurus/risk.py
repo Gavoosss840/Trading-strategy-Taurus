@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RiskConfig:
-    stop_loss_pct:       float = 0.10   # -10% depuis entrée → coupe
-    trailing_stop_pct:   float = 0.10   # -10% depuis le pic → coupe
+    stop_loss_pct:       float = 0.10   # -10% depuis entrée → STP ordre
+    take_profit_pct:     float = 0.20   # +20% depuis entrée → LMT ordre (take profit)
+    trailing_stop_pct:   float = 0.10   # -10% depuis le pic → coupe (risk monitor)
     circuit_breaker_pct: float = 0.15   # -15% portfolio global → tout couper
     min_hold_days:       int   = 3      # ne pas couper avant 3 jours (évite faux signaux)
     state_file:          str   = ".cache/risk_state.json"

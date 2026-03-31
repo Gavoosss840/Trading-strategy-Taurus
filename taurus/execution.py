@@ -112,7 +112,7 @@ class PositionReconciler:
             records.append({
                 "ticker":   p.contract.symbol,
                 "quantity": p.position,
-                "avg_cost": p.averageCost,
+                "avg_cost": p.avgCost,
             })
         return pd.DataFrame(records).set_index("ticker")
 
@@ -326,51 +326,58 @@ class OrderManager:
 
     def place_order(
         self,
-        conn:         IBKRConnection,
-        ticker:       str,
-        delta:        int,              # positive=buy, negative=sell/short
-        universe_cfg: UniverseConfig,
-        dry_run:      bool = True,
-        trail_pct:    float = 0.10,     # stop loss % from entry price (10% par défaut)
-        entry_price:  float = 0.0,      # last known price for stop calculation
+        conn:             IBKRConnection,
+        ticker:           str,
+        delta:            int,              # positive=buy, negative=sell/short
+        universe_cfg:     UniverseConfig,
+        dry_run:          bool  = True,
+        trail_pct:        float = 0.10,     # stop loss % below/above entry (10%)
+        entry_price:      float = 0.0,      # last known price for STP/LMT calculation
+        take_profit_pct:  float = 0.20,     # take profit % above/below entry (20%)
     ) -> Optional[dict]:
         """
-        Place a MKT order with a fixed STP (stop loss) at -stop_pct% from entry price.
+        Place MKT + STP (stop loss) + LMT (take profit) bracket order.
 
-        US markets (bracket_mode=True): MKT + STP as bracket — both transmit together.
-        EU markets (bracket_mode=False): MKT transmits immediately; STP sent standalone
-        so a stop rejection never freezes the parent in PreSubmitted state.
+        US markets (bracket_mode=True): all three transmit together as IBKR bracket.
+          STP and LMT share the same parentId — IBKR auto-cancels one when the other fills.
+        EU markets (bracket_mode=False): MKT transmits immediately; STP and LMT sent
+          as standalone GTC orders (no parentId) so a rejection never freezes the MKT.
 
         trail_pct = 0.10 → stop follows the price, cuts if -10% from peak.
         """
-        from ib_insync import Stock, MarketOrder, Order
+        from ib_insync import Stock, MarketOrder, Order, LimitOrder
 
         action       = "BUY"  if delta > 0 else "SELL"
         stop_action  = "SELL" if delta > 0 else "BUY"
         qty          = abs(delta)
 
-        # Fixed stop loss: -stop_pct from entry for longs, +stop_pct for shorts
-        stop_pct    = trail_pct   # reuse the same risk parameter (default 10%)
-        stop_price  = (entry_price * (1 - stop_pct)) if delta > 0 else (entry_price * (1 + stop_pct))
+        # Fixed stop loss and take profit prices from entry
+        stop_pct   = trail_pct
+        stop_price = (entry_price * (1 - stop_pct)) if delta > 0 else (entry_price * (1 + stop_pct))
+        tp_price   = (entry_price * (1 + take_profit_pct)) if delta > 0 else (entry_price * (1 - take_profit_pct))
 
-        # For EU markets: MKT transmits independently; STP sent as standalone order after
+        # For EU markets: MKT transmits independently; STP/LMT sent as standalone orders
         bracket_mode = getattr(universe_cfg, "supports_trail_stop", True)
 
         order_info = {
-            "ticker":      ticker,
-            "action":      action,
-            "quantity":    qty,
-            "type":        "MKT+STP",
-            "stop_price":  round(stop_price, 4) if stop_price else None,
-            "stop_pct":    stop_pct,
-            "dry_run":     dry_run,
-            "status":      "pending",
+            "ticker":     ticker,
+            "action":     action,
+            "quantity":   qty,
+            "type":       "MKT+STP+LMT",
+            "stop_price": round(stop_price, 4) if stop_price else None,
+            "tp_price":   round(tp_price, 4)   if tp_price   else None,
+            "stop_pct":   stop_pct,
+            "tp_pct":     take_profit_pct,
+            "dry_run":    dry_run,
+            "status":     "pending",
         }
 
         if dry_run:
             logger.info(
-                "[DRY RUN] %s %d %s @ MKT + STP %.4f (%.0f%%)",
-                action, qty, ticker, stop_price, stop_pct * 100,
+                "[DRY RUN] %s %d %s @ MKT | STP %.4f (-%.0f%%) | LMT %.4f (+%.0f%%)",
+                action, qty, ticker,
+                stop_price, stop_pct * 100,
+                tp_price, take_profit_pct * 100,
             )
             order_info["status"] = "dry_run"
             return order_info
@@ -410,70 +417,81 @@ class OrderManager:
 
                 parent_trade = conn.ib.placeOrder(contract, parent)
 
-                stp                = Order()
-                stp.action         = stop_action
-                stp.orderType      = "STP"
-                stp.tif            = "GTC"
-                stp.totalQuantity  = qty
-                stp.auxPrice       = round(stop_price, 2)   # stop trigger price
-                stp.parentId       = parent_trade.order.orderId
-                stp.transmit       = True   # transmits both orders together
+                # STP (stop loss) — second child, hold transmission
+                stp               = Order()
+                stp.action        = stop_action
+                stp.orderType     = "STP"
+                stp.tif           = "GTC"
+                stp.totalQuantity = qty
+                stp.auxPrice      = round(stop_price, 2)
+                stp.parentId      = parent_trade.order.orderId
+                stp.transmit      = False   # LMT child will trigger final transmission
 
                 stp_trade = conn.ib.placeOrder(contract, stp)
 
+                # LMT (take profit) — third child, triggers transmission of all 3
+                lmt               = LimitOrder(stop_action, qty, round(tp_price, 2))
+                lmt.tif           = "GTC"
+                lmt.parentId      = parent_trade.order.orderId
+                lmt.transmit      = True    # transmits MKT + STP + LMT together
+
+                lmt_trade = conn.ib.placeOrder(contract, lmt)
+
                 order_info["ibkr_order_id"]     = parent_trade.order.orderId
                 order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
+                order_info["ibkr_lmt_order_id"] = lmt_trade.order.orderId
                 order_info["status"] = "submitted"
                 logger.info(
-                    "Bracket submitted: %s %d %s | parent=%d stp=%d (stop=%.2f)",
+                    "Bracket submitted: %s %d %s | mkt=%d stp=%.2f lmt=%.2f",
                     action, qty, ticker,
-                    parent_trade.order.orderId, stp_trade.order.orderId, stop_price,
+                    parent_trade.order.orderId, stop_price, tp_price,
                 )
             else:
-                # ── EU markets (Euronext/LSE): MKT transmits immediately ──
-                # STP sent as standalone GTC order (not a child — avoids PreSubmitted freeze
-                # if the exchange rejects the stop). If STP is rejected, MKT already went through.
+                # ── EU markets: MKT transmits immediately; STP + LMT as standalone GTC ──
+                # If exchange rejects stop/limit, MKT is already through — no PreSubmitted freeze.
                 parent          = MarketOrder(action, qty)
                 parent.tif      = "DAY"
-                parent.transmit = True   # transmit at once — never blocks on stop rejection
+                parent.transmit = True
 
                 parent_trade = conn.ib.placeOrder(contract, parent)
-
                 order_info["ibkr_order_id"] = parent_trade.order.orderId
                 order_info["status"] = "submitted"
 
-                if stop_price > 0:
+                def _try_order(o: Order, label: str) -> Optional[int]:
+                    try:
+                        t = conn.ib.placeOrder(contract, o)
+                        return t.order.orderId
+                    except Exception as err:
+                        logger.warning("Standalone %s failed for %s: %s", label, ticker, err)
+                        return None
+
+                if entry_price > 0:
                     stp               = Order()
                     stp.action        = stop_action
                     stp.orderType     = "STP"
                     stp.tif           = "GTC"
                     stp.totalQuantity = qty
                     stp.auxPrice      = round(stop_price, 2)
-                    # No parentId — standalone order so MKT fill isn't blocked
                     stp.transmit      = True
+                    stp_id = _try_order(stp, "STP")
+                    if stp_id:
+                        order_info["ibkr_stp_order_id"] = stp_id
 
-                    try:
-                        stp_trade = conn.ib.placeOrder(contract, stp)
-                        order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
-                        logger.info(
-                            "MKT+STP submitted: %s %d %s | mkt=%d stp=%d (stop=%.2f)",
-                            action, qty, ticker,
-                            parent_trade.order.orderId, stp_trade.order.orderId, stop_price,
-                        )
-                    except Exception as stp_err:
-                        logger.warning(
-                            "MKT submitted but standalone STP failed for %s: %s",
-                            ticker, stp_err,
-                        )
-                        logger.info(
-                            "MKT submitted (STP failed): %s %d %s | mkt=%d",
-                            action, qty, ticker, parent_trade.order.orderId,
-                        )
-                else:
+                    lmt = LimitOrder(stop_action, qty, round(tp_price, 2))
+                    lmt.tif = "GTC"
+                    lmt.transmit = True
+                    lmt_id = _try_order(lmt, "LMT")
+                    if lmt_id:
+                        order_info["ibkr_lmt_order_id"] = lmt_id
+
                     logger.info(
-                        "MKT submitted (no price for STP): %s %d %s | mkt=%d",
-                        action, qty, ticker, parent_trade.order.orderId,
+                        "MKT+STP+LMT submitted: %s %d %s | mkt=%d stp=%s(%.2f) lmt=%s(%.2f)",
+                        action, qty, ticker,
+                        parent_trade.order.orderId,
+                        stp_id, stop_price, lmt_id, tp_price,
                     )
+                else:
+                    logger.warning("No entry_price for %s — STP/LMT not placed", ticker)
 
             return order_info
         except Exception as e:
@@ -695,7 +713,9 @@ class IBKRExecutor:
             entries = delta_df[~delta_df.index.isin(exits.index)]
 
             from .risk import RiskConfig
-            trail_pct = RiskConfig().trailing_stop_pct
+            risk_cfg  = RiskConfig()
+            trail_pct = risk_cfg.stop_loss_pct
+            tp_pct    = risk_cfg.take_profit_pct
 
             for _, row in pd.concat([exits, entries]).iterrows():
                 order_info = self.order_mgr.place_order(
@@ -703,6 +723,7 @@ class IBKRExecutor:
                     self.udef_cfg, dry_run=self.cfg.dry_run,
                     trail_pct=trail_pct,
                     entry_price=prices.get(row["ticker"], 0.0),
+                    take_profit_pct=tp_pct,
                 )
                 if order_info:
                     report.orders.append(order_info)
