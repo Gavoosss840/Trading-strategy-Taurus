@@ -132,6 +132,7 @@ class PositionReconciler:
         nav_usd:         float,
         cfg:             TaurusConfig,
         prices:          Dict[str, float],
+        universe_cfg=None,
     ) -> pd.Series:
         """
         Convert fractional weights → integer share counts.
@@ -140,17 +141,26 @@ class PositionReconciler:
         half = cfg.gross_leverage / 2.0
         target: Dict[str, int] = {}
 
+        lot = getattr(cfg, "min_lot_size", 1) or 1  # fallback to 1 if not set
+        # Use universe min_lot_size if available (e.g. TSE = 100)
+        ulot = getattr(universe_cfg, "min_lot_size", 1) if universe_cfg else 1
+        lot = max(lot, ulot)
+
+        def _round_lot(shares: int) -> int:
+            """Round down to nearest lot, minimum 1 lot."""
+            return max(lot, (shares // lot) * lot)
+
         for ticker, w in long_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
                 dollars = w * nav_usd * half
-                target[ticker] = max(1, int(dollars / price))
+                target[ticker] = _round_lot(int(dollars / price))
 
         for ticker, w in short_weights.items():
             price = prices.get(ticker, 0.0)
             if price > 0:
                 dollars = w * nav_usd * half
-                target[ticker] = -max(1, int(dollars / price))
+                target[ticker] = -_round_lot(int(dollars / price))
 
         return pd.Series(target, dtype=int)
 
@@ -583,7 +593,7 @@ class IBKRExecutor:
             # 3. Target shares
             target = self.reconciler.compute_target_shares(
                 snapshot.long_weights, snapshot.short_weights,
-                nav, self.cfg, prices,
+                nav, self.cfg, prices, universe_cfg=self.udef_cfg,
             )
 
             # 4. Delta vs live (filled positions + pending entry orders)
