@@ -842,6 +842,28 @@ class IBKRExecutor:
             # 4. Delta vs live (filled positions + pending entry orders)
             live    = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
             pending = self.reconciler.get_pending_shares(self.conn)
+
+            # Universe isolation: restrict live positions to tickers this universe
+            # manages.  Without this, two same-currency universes (e.g. sp500 and
+            # nasdaq100, both USD) contaminate each other — nasdaq100 sees sp500
+            # positions not in its target and generates close orders for them.
+            # We manage: (a) tickers currently in the target, plus (b) any ticker
+            # previously opened by this universe (recorded in RiskState), so that
+            # positions removed from the target are still closed gracefully.
+            try:
+                from .risk import RiskManager, RiskConfig as _RC
+                _rm = RiskManager(_RC())
+                universe_owned = {
+                    t for t, p in _rm.state.positions.items()
+                    if p.universe == self.udef_cfg.name
+                }
+            except Exception:
+                universe_owned = set()
+
+            managed_tickers = set(target.index) | universe_owned
+            if not live.empty:
+                live = live[live.index.isin(managed_tickers)]
+
             delta_df = self.reconciler.compute_order_delta(target, live, pending)
 
             if delta_df.empty:
