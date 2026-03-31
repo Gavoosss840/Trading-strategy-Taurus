@@ -207,10 +207,13 @@ class RebalanceScheduler:
         """
         nav_weights = self._sharpe_weights()
 
+        # Order: Asia/Japan first (markets open earliest), then Europe, then US
+        asian    = [u for u in self.universes if REGISTRY.get(u).config.region in ("Japan", "Asia")]
         european = [u for u in self.universes if REGISTRY.get(u).config.region == "Europe"]
         american = [u for u in self.universes if REGISTRY.get(u).config.region == "US"]
+        others   = [u for u in self.universes if u not in asian + european + american]
 
-        for universe_name in european + american:
+        for universe_name in asian + european + american + others:
             try:
                 logger.info("--- Running universe: %s ---", universe_name)
                 self._run_single_universe(
