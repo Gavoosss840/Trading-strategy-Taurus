@@ -101,14 +101,22 @@ class PositionReconciler:
     Produces the delta (trades needed) as signed share counts.
     """
 
-    def get_live_positions(self, conn: IBKRConnection) -> pd.DataFrame:
-        """Returns DataFrame: ticker, quantity (+long / -short), avg_cost."""
+    def get_live_positions(self, conn: IBKRConnection, currency: str = None) -> pd.DataFrame:
+        """Returns DataFrame: ticker, quantity (+long / -short), avg_cost.
+
+        currency: if provided, only returns positions in that currency.
+        This prevents cross-universe contamination (e.g. SP500 seeing CAC40 EUR
+        positions) and fixes duplicate-ticker crashes when the same symbol exists
+        on multiple exchanges in different currencies (e.g. SU, MC, CRH, SW).
+        """
         positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
         if not positions:
             return pd.DataFrame(columns=["ticker", "quantity", "avg_cost"])
 
         records = []
         for p in positions:
+            if currency and p.contract.currency != currency:
+                continue
             records.append({
                 "ticker":   p.contract.symbol,
                 "quantity": p.position,
@@ -672,7 +680,7 @@ class IBKRExecutor:
             open_by_id  = {t.order.orderId: t for t in open_trades}
 
             # Re-read live positions after fills
-            live_now = self.reconciler.get_live_positions(self.conn)
+            live_now = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
 
             lines = [
                 f"\n{'='*60}",
@@ -813,7 +821,7 @@ class IBKRExecutor:
             )
 
             # 4. Delta vs live (filled positions + pending entry orders)
-            live    = self.reconciler.get_live_positions(self.conn)
+            live    = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
             pending = self.reconciler.get_pending_shares(self.conn)
             delta_df = self.reconciler.compute_order_delta(target, live, pending)
 
