@@ -355,6 +355,41 @@ class OrderManager:
 
         return prices
 
+    def cancel_protective_orders(
+        self,
+        conn:     IBKRConnection,
+        ticker:   str,
+        dry_run:  bool = False,
+    ) -> list:
+        """
+        Cancel all open STP/LMT protective orders for a ticker before rebalancing.
+        Called before placing an adjustment order so stale stop/limit orders
+        (sized for the old position) don't persist alongside the new ones.
+        """
+        PROTECTIVE = {"STP", "LMT"}
+        ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
+        ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
+        cancelled: list = []
+        try:
+            for trade in conn.ib.openTrades():
+                if trade.contract.symbol != ibkr_ticker:
+                    continue
+                if trade.order.orderType not in PROTECTIVE:
+                    continue
+                if trade.orderStatus.status not in ACTIVE:
+                    continue
+                if not dry_run:
+                    conn.ib.cancelOrder(trade.order)
+                cancelled.append(trade.order.orderId)
+        except Exception as e:
+            logger.warning("cancel_protective_orders failed for %s: %s", ticker, e)
+        if cancelled:
+            logger.info(
+                "Cancelled %d stale protective orders for %s before rebalance: %s",
+                len(cancelled), ticker, cancelled,
+            )
+        return cancelled
+
     def place_order(
         self,
         conn:             IBKRConnection,
@@ -365,6 +400,7 @@ class OrderManager:
         trail_pct:        float = 0.10,     # stop loss % below/above entry (10%)
         entry_price:      float = 0.0,      # last known price for STP/LMT calculation
         take_profit_pct:  float = 0.20,     # take profit % above/below entry (20%)
+        target_qty:       float = None,     # full target position size (unsigned); if None, uses abs(delta)
     ) -> Optional[dict]:
         """
         Place MKT + STP (stop loss) + LMT (take profit) bracket order.
@@ -379,13 +415,28 @@ class OrderManager:
         from ib_insync import Stock, MarketOrder, Order, LimitOrder
 
         action       = "BUY"  if delta > 0 else "SELL"
-        stop_action  = "SELL" if delta > 0 else "BUY"
         qty          = abs(delta)
+
+        # STP/LMT are sized to the FULL target position, not just the delta.
+        # On an adjustment (+10 on a 100-share long), we cancel the old STP/LMT
+        # (sized for 100) and place new ones sized for 110.
+        protective_qty = abs(target_qty) if target_qty is not None else qty
+
+        # Direction of protective orders depends on the final position direction
+        # (target sign), not the delta direction.
+        if target_qty is not None:
+            stop_action = "SELL" if target_qty > 0 else "BUY"
+        else:
+            stop_action = "SELL" if delta > 0 else "BUY"
+
+        # Cancel stale protective orders before placing new ones
+        if not dry_run:
+            self.cancel_protective_orders(conn, ticker, dry_run=False)
 
         # Fixed stop loss and take profit prices from entry
         stop_pct   = trail_pct
-        stop_price = (entry_price * (1 - stop_pct)) if delta > 0 else (entry_price * (1 + stop_pct))
-        tp_price   = (entry_price * (1 + take_profit_pct)) if delta > 0 else (entry_price * (1 - take_profit_pct))
+        stop_price = (entry_price * (1 - stop_pct)) if stop_action == "SELL" else (entry_price * (1 + stop_pct))
+        tp_price   = (entry_price * (1 + take_profit_pct)) if stop_action == "SELL" else (entry_price * (1 - take_profit_pct))
 
         # For EU markets: MKT transmits independently; STP/LMT sent as standalone orders
         bracket_mode = getattr(universe_cfg, "supports_trail_stop", True)
@@ -465,7 +516,7 @@ class OrderManager:
                     stp.action        = stop_action
                     stp.orderType     = "STP"
                     stp.tif           = "GTC"
-                    stp.totalQuantity = qty
+                    stp.totalQuantity = protective_qty   # full target position size
                     stp.auxPrice      = round(stop_price, 2)
                     stp.parentId      = parent_trade.order.orderId
                     stp.transmit      = False   # LMT child will trigger final transmission
@@ -473,7 +524,7 @@ class OrderManager:
                     stp_trade = conn.ib.placeOrder(contract, stp)
 
                     # LMT (take profit) — third child, triggers transmission of all 3
-                    lmt               = LimitOrder(stop_action, qty, round(tp_price, 2))
+                    lmt               = LimitOrder(stop_action, protective_qty, round(tp_price, 2))
                     lmt.tif           = "GTC"
                     lmt.parentId      = parent_trade.order.orderId
                     lmt.transmit      = True    # transmits MKT + STP + LMT together
@@ -516,7 +567,7 @@ class OrderManager:
                     stp.action        = stop_action
                     stp.orderType     = "STP"
                     stp.tif           = "GTC"
-                    stp.totalQuantity = qty
+                    stp.totalQuantity = protective_qty   # full target position size
                     stp.auxPrice      = round(stop_price, 2)
                     stp.ocaGroup      = oca_group
                     stp.ocaType       = 1   # cancel with block (most protective)
@@ -525,7 +576,7 @@ class OrderManager:
                     if stp_id:
                         order_info["ibkr_stp_order_id"] = stp_id
 
-                    lmt = LimitOrder(stop_action, qty, round(tp_price, 2))
+                    lmt = LimitOrder(stop_action, protective_qty, round(tp_price, 2))
                     lmt.tif      = "GTC"
                     lmt.ocaGroup = oca_group
                     lmt.ocaType  = 1
@@ -901,6 +952,7 @@ class IBKRExecutor:
                     trail_pct=trail_pct,
                     entry_price=prices.get(row["ticker"], 0.0),
                     take_profit_pct=tp_pct,
+                    target_qty=float(row["target"]),  # full position size for STP/LMT sizing
                 )
                 if order_info:
                     report.orders.append(order_info)
