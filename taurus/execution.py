@@ -226,7 +226,7 @@ class PositionReconciler:
             return pd.Series(dtype=float)
 
         ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
-        ENTRY_TYPES = {"MKT", "LMT", "MOC", "MKT ON CLOSE"}
+        ENTRY_TYPES = {"MKT"}  # Only MKT = entry orders; LMT/STP are always protective orders in this system
 
         pending: dict = {}
         for trade in trades:
