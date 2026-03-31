@@ -330,13 +330,26 @@ class OrderManager:
             contracts.append(c)
             ticker_map[ibkr_ticker] = ticker
 
-        try:
-            conn.ib.qualifyContracts(*contracts)
-        except Exception as e:
-            logger.warning("qualifyContracts failed: %s", e)
+        # Qualify individually so one failed contract (Error 200) doesn't block others.
+        # Suppress ib_insync's internal Error 200 warning during qualify — we handle failures ourselves.
+        _ib_wrapper_log = logging.getLogger("ib_insync.wrapper")
+        _prev_level = _ib_wrapper_log.level
+        _ib_wrapper_log.setLevel(logging.ERROR)
+        qualified_contracts = []
+        for c in contracts:
+            try:
+                conn.ib.qualifyContracts(c)
+                if c.conId:
+                    qualified_contracts.append(c)
+                else:
+                    logger.debug("Could not qualify %s (%s/%s) — skipping price fetch",
+                                 c.symbol, c.exchange, c.currency)
+            except Exception as e:
+                logger.debug("qualifyContracts skipped %s: %s", c.symbol, e)
+        _ib_wrapper_log.setLevel(_prev_level)
 
         tickers_data = []
-        for c in contracts:
+        for c in qualified_contracts:
             td = conn.ib.reqMktData(c, "", True, False)  # snapshot
             tickers_data.append((c.symbol, td))
 
@@ -776,12 +789,15 @@ class IBKRExecutor:
                     # Not in open trades → likely filled or cancelled
                     live_status = "Filled/Cancelled"
 
-                icon = "✓" if status not in ("error", "cancelled") else "✗"
-                if "cancel" in live_status.lower() or status == "error":
+                # "Filled/Cancelled" = internal label for orders no longer in openTrades (likely filled)
+                # Only treat as error if truly Cancelled (not Filled/Cancelled) or status is error/aborted
+                is_error = (live_status == "Cancelled") or (status in ("error", "aborted"))
+                if is_error:
                     cancelled_err += 1
                     icon = "✗"
                 else:
                     submitted_ok += 1
+                    icon = "✓"
 
                 stp = o.get("stop_price")
                 lmt = o.get("tp_price")
