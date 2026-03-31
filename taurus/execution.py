@@ -444,33 +444,44 @@ class OrderManager:
                 # Works on US exchanges (NYSE/NASDAQ). Stop is attached to the parent.
                 parent          = MarketOrder(action, qty)
                 parent.tif      = "DAY"
-                parent.transmit = False   # STP child triggers transmission
+
+                if entry_price > 0:
+                    parent.transmit = False   # STP+LMT children will trigger transmission
+                else:
+                    # No price available — transmit MKT immediately, skip STP/LMT
+                    # (avoids MKT stuck in PreSubmitted when LMT price=0 gets rejected)
+                    parent.transmit = True
+                    logger.warning(
+                        "No entry_price for %s — MKT transmitted immediately, STP/LMT skipped",
+                        ticker,
+                    )
 
                 parent_trade = conn.ib.placeOrder(contract, parent)
+                order_info["ibkr_order_id"] = parent_trade.order.orderId
 
-                # STP (stop loss) — second child, hold transmission
-                stp               = Order()
-                stp.action        = stop_action
-                stp.orderType     = "STP"
-                stp.tif           = "GTC"
-                stp.totalQuantity = qty
-                stp.auxPrice      = round(stop_price, 2)
-                stp.parentId      = parent_trade.order.orderId
-                stp.transmit      = False   # LMT child will trigger final transmission
+                if entry_price > 0:
+                    # STP (stop loss) — second child, hold transmission
+                    stp               = Order()
+                    stp.action        = stop_action
+                    stp.orderType     = "STP"
+                    stp.tif           = "GTC"
+                    stp.totalQuantity = qty
+                    stp.auxPrice      = round(stop_price, 2)
+                    stp.parentId      = parent_trade.order.orderId
+                    stp.transmit      = False   # LMT child will trigger final transmission
 
-                stp_trade = conn.ib.placeOrder(contract, stp)
+                    stp_trade = conn.ib.placeOrder(contract, stp)
 
-                # LMT (take profit) — third child, triggers transmission of all 3
-                lmt               = LimitOrder(stop_action, qty, round(tp_price, 2))
-                lmt.tif           = "GTC"
-                lmt.parentId      = parent_trade.order.orderId
-                lmt.transmit      = True    # transmits MKT + STP + LMT together
+                    # LMT (take profit) — third child, triggers transmission of all 3
+                    lmt               = LimitOrder(stop_action, qty, round(tp_price, 2))
+                    lmt.tif           = "GTC"
+                    lmt.parentId      = parent_trade.order.orderId
+                    lmt.transmit      = True    # transmits MKT + STP + LMT together
 
-                lmt_trade = conn.ib.placeOrder(contract, lmt)
+                    lmt_trade = conn.ib.placeOrder(contract, lmt)
 
-                order_info["ibkr_order_id"]     = parent_trade.order.orderId
-                order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
-                order_info["ibkr_lmt_order_id"] = lmt_trade.order.orderId
+                    order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
+                    order_info["ibkr_lmt_order_id"] = lmt_trade.order.orderId
                 order_info["status"] = "submitted"
                 logger.info(
                     "Bracket submitted: %s %d %s | mkt=%d stp=%.2f lmt=%.2f",
