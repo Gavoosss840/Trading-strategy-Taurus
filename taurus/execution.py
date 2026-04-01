@@ -50,7 +50,7 @@ class IBKRConnection:
             self.ib.connect(
                 self.cfg.ibkr_host,
                 self.cfg.ibkr_port,
-                clientId=self.cfg.ibkr_client_id + self._attempt % 90,
+                clientId=self.cfg.ibkr_client_id,   # fixed — never increment; same clientId every session
                 timeout=timeout,
                 readonly=False,
             )
@@ -479,6 +479,75 @@ class OrderManager:
             )
         return cancelled
 
+    def place_protective_only(
+        self,
+        conn:            IBKRConnection,
+        ticker:          str,
+        target_qty:      float,            # signed: positive=long, negative=short
+        entry_price:     float,
+        universe_cfg:    UniverseConfig,
+        stop_pct:        float = 0.10,
+        take_profit_pct: float = 0.20,
+        dry_run:         bool  = False,
+    ) -> None:
+        """
+        Place standalone STP + LMT protective orders for an EXISTING position.
+        No parent MKT — these are independent GTC orders used when restoring
+        protective orders after rebalancing adjustments or initial placement.
+        Works on all exchanges (no bracket/OCA group → no Euronext Error 328).
+        """
+        from ib_insync import Stock, Order, LimitOrder
+
+        ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
+        pos_qty     = abs(target_qty)
+        stop_action = "SELL" if target_qty > 0 else "BUY"
+
+        stop_price = (
+            entry_price * (1 - stop_pct) if stop_action == "SELL"
+            else entry_price * (1 + stop_pct)
+        )
+        tp_price = (
+            entry_price * (1 + take_profit_pct) if stop_action == "SELL"
+            else entry_price * (1 - take_profit_pct)
+        )
+
+        if dry_run:
+            logger.info(
+                "[DRY RUN] Restore STP/LMT %s %s qty=%.0f  STP=%.4f  LMT=%.4f",
+                stop_action, ibkr_ticker, pos_qty,
+                round(stop_price, 4), round(tp_price, 4),
+            )
+            return
+
+        contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
+        try:
+            conn.ib.qualifyContracts(contract)
+        except Exception:
+            pass
+
+        # Standalone STP (GTC, no parentId)
+        stp             = Order()
+        stp.action      = stop_action
+        stp.orderType   = "STP"
+        stp.tif         = "GTC"
+        stp.totalQuantity = pos_qty
+        stp.auxPrice    = round(stop_price, 2)
+        stp.transmit    = True
+        conn.ib.placeOrder(contract, stp)
+
+        # Standalone LMT (GTC, no parentId)
+        lmt             = LimitOrder(stop_action, pos_qty, round(tp_price, 2))
+        lmt.tif         = "GTC"
+        lmt.transmit    = True
+        conn.ib.placeOrder(contract, lmt)
+
+        logger.info(
+            "Restored STP+LMT for %s: qty=%.0f  STP=%.4f (-%.0f%%)  LMT=%.4f (+%.0f%%)",
+            ibkr_ticker, pos_qty,
+            round(stop_price, 2), stop_pct * 100,
+            round(tp_price, 2),   take_profit_pct * 100,
+        )
+
     def place_order(
         self,
         conn:             IBKRConnection,
@@ -820,6 +889,79 @@ class IBKRExecutor:
         self.reconciler   = PositionReconciler()
         self.order_mgr    = OrderManager()
 
+    def _restore_protective_orders(self, prices: dict) -> None:
+        """
+        Post-rebalancing pass: ensure every live position has correct STP + LMT.
+
+        For each live position in this universe's currency:
+          - If STP and LMT both exist with the exact right quantity → skip
+          - Otherwise: cancel stale protective orders + place fresh ones using
+            the current market price as reference for stop/limit levels
+
+        Called after wait_for_fills so new entries are already reflected in live
+        positions and their bracket STP/LMT have been placed by place_order().
+        """
+        from .risk import RiskConfig
+        risk_cfg = RiskConfig()
+
+        live = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
+        if live.empty:
+            return
+
+        # Build map: ibkr_symbol → {orderType: (qty, trade)}
+        prot: dict = {}
+        try:
+            for trade in self.conn.ib.openTrades():
+                if trade.order.orderType not in {"STP", "LMT"}:
+                    continue
+                sym = trade.contract.symbol
+                qty = abs(float(trade.order.totalQuantity))
+                prot.setdefault(sym, {})[trade.order.orderType] = (qty, trade)
+        except Exception as e:
+            logger.warning("_restore_protective_orders: could not read open trades: %s", e)
+            return
+
+        for sym, row in live.iterrows():
+            pos_qty = abs(float(row["quantity"]))
+
+            if pos_qty == 0:
+                # Closed position — cancel any leftover protective orders
+                for otype, (_, trade) in prot.get(sym, {}).items():
+                    if not self.cfg.dry_run:
+                        self.conn.ib.cancelOrder(trade.order)
+                    logger.info("[%s] Cancelled orphaned %s for closed %s",
+                                self.udef_cfg.name, otype, sym)
+                continue
+
+            sym_orders = prot.get(sym, {})
+            stp_entry  = sym_orders.get("STP")
+            lmt_entry  = sym_orders.get("LMT")
+            stp_ok     = stp_entry is not None and stp_entry[0] == pos_qty
+            lmt_ok     = lmt_entry is not None and lmt_entry[0] == pos_qty
+
+            if stp_ok and lmt_ok:
+                continue  # both present and correctly sized → nothing to do
+
+            # Reference price: use current market price (stripped ticker)
+            entry_price = prices.get(sym, 0.0)
+            if entry_price <= 0:
+                logger.warning("[%s] No price for %s — cannot restore STP/LMT",
+                               self.udef_cfg.name, sym)
+                continue
+
+            # Cancel any stale protective orders for this ticker
+            self.order_mgr.cancel_protective_orders(self.conn, sym, dry_run=self.cfg.dry_run)
+
+            # Place fresh standalone STP + LMT
+            target_qty = pos_qty if float(row["quantity"]) > 0 else -pos_qty
+            self.order_mgr.place_protective_only(
+                self.conn, sym, target_qty, entry_price,
+                self.udef_cfg,
+                stop_pct        = risk_cfg.stop_loss_pct,
+                take_profit_pct = risk_cfg.take_profit_pct,
+                dry_run         = self.cfg.dry_run,
+            )
+
     def _log_reconciliation(
         self,
         target:    pd.Series,
@@ -1021,6 +1163,7 @@ class IBKRExecutor:
                 logger.info("[%s] No trades needed — portfolio already at target.", self.udef_cfg.name)
                 if not self.cfg.dry_run:
                     self._log_reconciliation(target, delta_df, report)
+                    self._restore_protective_orders(prices)
                 report.save(self.output_dir)
                 return report
 
@@ -1061,7 +1204,11 @@ class IBKRExecutor:
             if not self.cfg.dry_run:
                 self.order_mgr.wait_for_fills(self.conn)
 
-            # 7b. Reconciliation report — compare submitted orders vs live state
+            # 7b. Restore / refresh protective orders for all live positions
+            if not self.cfg.dry_run:
+                self._restore_protective_orders(prices)
+
+            # 7c. Reconciliation report — compare submitted orders vs live state
             if not self.cfg.dry_run:
                 self._log_reconciliation(target, delta_df, report)
 

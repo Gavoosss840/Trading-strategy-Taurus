@@ -317,9 +317,9 @@ _FALLBACKS: Dict[str, List[str]] = {
     ],
 
     # Nikkei 225 — Yahoo Finance tickers (.T suffix)
-    # Extended fallback used when Wikipedia scraping fails (~80 stocks)
+    # ~150-stock fallback used when Wikipedia scraping fails
     "nikkei225": [
-        # ── Top-cap tech / electronics ───────────────────────────────────── #
+        # ── Technology / electronics ─────────────────────────────────────── #
         "7203.T",  # Toyota Motor
         "6758.T",  # Sony Group
         "9984.T",  # SoftBank Group
@@ -335,19 +335,35 @@ _FALLBACKS: Dict[str, List[str]] = {
         "6702.T",  # Fujitsu
         "6503.T",  # Mitsubishi Electric
         "6902.T",  # DENSO
-        "6594.T",  # Nidec (Nidec Corp)
+        "6594.T",  # Nidec
         "6752.T",  # Panasonic Holdings
         "7751.T",  # Canon
         "6645.T",  # OMRON
-        # ── Autos ──────────────────────────────────────────────────────────  #
+        "6762.T",  # TDK Corp
+        "6723.T",  # Renesas Electronics
+        "6724.T",  # Seiko Epson
+        "6988.T",  # Nitto Denko
+        "6976.T",  # Murata Manufacturing
+        "6971.T",  # Kyocera
+        "6506.T",  # Yaskawa Electric
+        "4704.T",  # Trend Micro
+        # ── Autos / machinery ────────────────────────────────────────────── #
         "7267.T",  # Honda Motor
         "7269.T",  # Suzuki Motor
         "7270.T",  # Subaru
         "7201.T",  # Nissan Motor
+        "7261.T",  # Mazda Motor
         "6301.T",  # Komatsu
         "6326.T",  # Kubota
         "5108.T",  # Bridgestone
-        # ── Financials ─────────────────────────────────────────────────────  #
+        "7013.T",  # IHI Corp
+        "7012.T",  # Kawasaki Heavy Industries
+        "7731.T",  # Nikon
+        "6103.T",  # Okuma Corp
+        "6113.T",  # Amada Holdings
+        "6471.T",  # NSK Ltd
+        "6481.T",  # THK Co
+        # ── Financials ───────────────────────────────────────────────────── #
         "8316.T",  # Sumitomo Mitsui Financial
         "8411.T",  # Mizuho Financial
         "8306.T",  # Mitsubishi UFJ Financial (MUFG)
@@ -355,7 +371,13 @@ _FALLBACKS: Dict[str, List[str]] = {
         "8750.T",  # Dai-ichi Life Insurance
         "8604.T",  # Nomura Holdings
         "8801.T",  # Mitsui Fudosan
-        # ── Consumer / retail ──────────────────────────────────────────────  #
+        "8053.T",  # Sumitomo Corp
+        "8001.T",  # ITOCHU Corp
+        "8015.T",  # Toyota Tsusho
+        "8309.T",  # Sumitomo Mitsui Trust Holdings
+        "8830.T",  # Sumitomo Realty & Development
+        "8697.T",  # Japan Exchange Group
+        # ── Consumer / retail ────────────────────────────────────────────── #
         "9983.T",  # Fast Retailing (Uniqlo)
         "3382.T",  # Seven & i Holdings
         "8267.T",  # AEON
@@ -364,7 +386,9 @@ _FALLBACKS: Dict[str, List[str]] = {
         "4911.T",  # Shiseido
         "4452.T",  # Kao
         "2802.T",  # Ajinomoto
-        # ── Healthcare / pharma ────────────────────────────────────────────  #
+        "2914.T",  # Japan Tobacco
+        "3086.T",  # J Front Retailing
+        # ── Healthcare / pharma ──────────────────────────────────────────── #
         "4519.T",  # Chugai Pharmaceutical
         "4543.T",  # Terumo
         "4502.T",  # Takeda Pharmaceutical
@@ -372,38 +396,71 @@ _FALLBACKS: Dict[str, List[str]] = {
         "4523.T",  # Eisai
         "4578.T",  # Otsuka Holdings
         "7733.T",  # Olympus
-        # ── Telecom / media ─────────────────────────────────────────────── #
+        "4503.T",  # Astellas Pharma
+        "4507.T",  # Shionogi
+        "4151.T",  # Kyowa Kirin
+        "4091.T",  # Nippon Sanso Holdings
+        # ── Telecom / media / IT services ────────────────────────────────── #
         "9433.T",  # KDDI
-        "9432.T",  # NTT (Nippon Telegraph)
+        "9432.T",  # NTT
         "6098.T",  # Recruit Holdings
         "4307.T",  # Nomura Research Institute
-        # ── Industrials / conglomerates ─────────────────────────────────── #
+        "9613.T",  # NTT Data
+        "6701.T",  # NEC Corp
+        "2413.T",  # M3 Inc
+        # ── Industrials / conglomerates ──────────────────────────────────── #
         "7011.T",  # Mitsubishi Heavy Industries
         "5401.T",  # Nippon Steel
+        "5411.T",  # JFE Holdings
         "8058.T",  # Mitsubishi Corp
         "8031.T",  # Mitsui & Co.
         "8002.T",  # Marubeni
         "9022.T",  # Central Japan Railway
+        "9020.T",  # East Japan Railway
+        "9021.T",  # West Japan Railway
         "1925.T",  # Daiwa House Industry
+        "1928.T",  # Sekisui House
+        "1801.T",  # Taisei Corp
+        "1802.T",  # Obayashi Corp
+        "1803.T",  # Shimizu Corp
+        "1812.T",  # Kajima Corp
         "3407.T",  # Asahi Kasei
         "3402.T",  # Toray Industries
         "4901.T",  # Fujifilm Holdings
-        # ── Energy / chemicals ──────────────────────────────────────────── #
+        "3401.T",  # Teijin
+        "5333.T",  # NGK Insulators
+        "5631.T",  # Japan Steel Works
+        # ── Energy / chemicals ───────────────────────────────────────────── #
         "5020.T",  # ENEOS Holdings
+        "1605.T",  # Inpex Corp
+        "9531.T",  # Tokyo Gas
+        "9532.T",  # Osaka Gas
         "4021.T",  # Nissan Chemical
         "3436.T",  # SUMCO (silicon wafers)
-        # ── Shipping ─────────────────────────────────────────────────────  #
+        "4005.T",  # Sumitomo Chemical
+        "4042.T",  # Tosoh Corp
+        "4061.T",  # Denka Co
+        "4004.T",  # Resonac Holdings
+        "4188.T",  # Mitsubishi Chemical Group
+        # ── Metals / mining ──────────────────────────────────────────────── #
+        "5713.T",  # Sumitomo Metal Mining
+        "5714.T",  # DOWA Holdings
+        "5711.T",  # Mitsubishi Materials
+        "5801.T",  # Furukawa Electric
+        "5802.T",  # Sumitomo Electric Industries
+        # ── Shipping / transport ─────────────────────────────────────────── #
         "9101.T",  # Nippon Yusen (NYK Line)
         "9104.T",  # Mitsui O.S.K. Lines
         "9107.T",  # Kawasaki Kisen
-        # ── Food & beverage ──────────────────────────────────────────────  #
+        "9202.T",  # ANA Holdings
+        # ── Food & beverage ──────────────────────────────────────────────── #
         "2502.T",  # Asahi Group Holdings
         "2503.T",  # Kirin Holdings
         "2501.T",  # Sapporo Holdings
-        # ── Misc ─────────────────────────────────────────────────────────  #
-        "4151.T",  # Kyowa Kirin
+        # ── Misc / diversified ───────────────────────────────────────────── #
         "3861.T",  # Oji Holdings
         "7762.T",  # Citizen Watch
+        "3289.T",  # Tokyu Fudosan Holdings
     ],
 
     # Hang Seng Index — Yahoo Finance tickers (.HK suffix)
@@ -497,7 +554,8 @@ class UniverseDef:
         pages for European/Asian indices have company names in the ticker
         column and require manual mapping.
         """
-        cache_key = f"tickers_{self.config.name}"
+        _fb_len = len(_FALLBACKS.get(self.config.name, []))
+        cache_key = f"tickers_{self.config.name}_v{_fb_len}"
         cached = _cache_load(cache_key, cfg)
         if cached is not None:
             return cached
@@ -532,7 +590,9 @@ class UniverseDef:
             soup = BeautifulSoup(resp.text, "html.parser")
             table = soup.find("table", {"id": cfg.wikipedia_table_id})
             if table is None:
-                table = soup.find("table", {"class": "wikitable"})
+                # Find the largest wikitable (most rows) — the constituents list is usually the biggest
+                all_wt = soup.find_all("table", {"class": "wikitable"})
+                table = max(all_wt, key=lambda t: len(t.find_all("tr"))) if all_wt else None
             if table is None:
                 return []
             rows  = table.find_all("tr")[1:]

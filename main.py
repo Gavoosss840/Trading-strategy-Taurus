@@ -610,34 +610,19 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
     except Exception as e:
         logger.warning("cleanup_orphaned_protective_orders failed: %s", e)
 
-    # Cancel using clientId=0 (IBKR "master" client).
-    # Orders can only be cancelled by the clientId that placed them OR by clientId=0.
-    # After reconnect attempts the current clientId may differ from the one that
-    # placed the orders → use a dedicated master connection to guarantee cancellation.
+    # Cancel directly via conn.ib (same clientId that placed the orders).
+    # IBKR cancelOrder(orderId) requires the SAME clientId — clientId=0 does NOT
+    # bypass this (Error 10147).  With the clientId increment bug fixed, conn uses
+    # the same clientId=10 as the scheduler → direct cancel works.
     if not dry_run and orders_to_cancel:
-        from ib_insync import IB as _IB
-        master = _IB()
         try:
-            master.connect(
-                conn.cfg.ibkr_host,
-                conn.cfg.ibkr_port,
-                clientId=0,
-                timeout=10,
-                readonly=False,
-            )
-            master.sleep(1)   # let open-orders download complete
             for trade, ticker, reason in orders_to_cancel:
-                master.cancelOrder(trade.order)
+                conn.ib.cancelOrder(trade.order)
                 logger.debug("Cancel sent for %s %s #%s",
                              trade.order.orderType, ticker, trade.order.orderId)
-            master.sleep(2)   # wait for TWS to process
+            conn.ib.sleep(2)   # wait for TWS to process cancellations
         except Exception as e:
-            logger.warning("Master-client cancel failed: %s", e)
-        finally:
-            try:
-                master.disconnect()
-            except Exception:
-                pass
+            logger.warning("Cancel failed: %s", e)
 
     logger.info(
         "Protective orders audit: %d kept (correct size)  |  %d cancelled (%s)",
