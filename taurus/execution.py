@@ -125,18 +125,92 @@ class PositionReconciler:
         return pd.DataFrame(records).set_index("ticker")
 
     def get_account_nav(self, conn: IBKRConnection, currency: str = None) -> float:
-        """Returns NAV in the requested currency (falls back to account base currency)."""
+        """
+        Returns NAV in the requested currency.
+
+        Strategy:
+        1. If IBKR account summary already contains NetLiquidation in the target
+           currency, return it directly (rare for non-base currencies).
+        2. Otherwise get base-currency NAV and convert via a live FX quote from IBKR.
+        3. Final fallback: return base-currency NAV unchanged (logs a warning).
+
+        This correctly handles EUR-base accounts trading JPY (Nikkei), USD (SP500),
+        GBP (FTSE 100), etc.
+        """
         summary = conn.ib.accountSummary(account=conn.cfg.ibkr_account or "")
-        # IBKR reports NetLiquidation in multiple currencies — prefer the universe's currency
+
+        # 1. Try direct match in requested currency
         if currency:
             for item in summary:
                 if item.tag == "NetLiquidation" and item.currency == currency:
                     return float(item.value)
-        # Fallback: account base currency
+
+        # 2. Get base-currency NAV (first non-BASE entry)
+        base_nav = None
+        base_currency = None
         for item in summary:
-            if item.tag == "NetLiquidation":
-                return float(item.value)
-        return conn.cfg.nav_usd
+            if item.tag == "NetLiquidation" and item.currency not in ("BASE", ""):
+                base_nav = float(item.value)
+                base_currency = item.currency
+                break
+
+        if base_nav is None:
+            return conn.cfg.nav_usd
+
+        if currency is None or currency == base_currency:
+            return base_nav
+
+        # 3. FX conversion: base_currency → requested currency
+        rate = self._fetch_fx_rate(conn, base_currency, currency)
+        if rate and rate > 0:
+            converted = base_nav * rate
+            logger.info(
+                "NAV: %.2f %s × %.4f (%s%s) = %.2f %s",
+                base_nav, base_currency, rate, base_currency, currency, converted, currency,
+            )
+            return converted
+
+        logger.warning(
+            "Could not fetch FX %s→%s — using %s NAV; position sizes for %s will be wrong",
+            base_currency, currency, base_currency, currency,
+        )
+        return base_nav
+
+    @staticmethod
+    def _fetch_fx_rate(conn: IBKRConnection, from_ccy: str, to_ccy: str) -> Optional[float]:
+        """
+        Fetch live spot rate from_ccy → to_ccy from IBKR.
+        Tries the direct pair first (e.g. EURJPY), then the inverse (JPYEUR → 1/rate).
+        Returns None if both fail.
+        """
+        if from_ccy == to_ccy:
+            return 1.0
+        from ib_insync import Forex
+        import logging as _log
+        _ib_log = _log.getLogger("ib_insync.wrapper")
+        _prev = _ib_log.level
+        _ib_log.setLevel(_log.ERROR)   # suppress Error 200 spam during Forex qualify
+        try:
+            for symbol, inverse in [(f"{from_ccy}{to_ccy}", False),
+                                     (f"{to_ccy}{from_ccy}", True)]:
+                try:
+                    contract = Forex(symbol)
+                    conn.ib.qualifyContracts(contract)
+                    if not contract.conId:
+                        continue
+                    td = conn.ib.reqMktData(contract, "", True, False)
+                    conn.ib.sleep(2)
+                    bid  = td.bid  if td.bid  and td.bid  > 0 else None
+                    ask  = td.ask  if td.ask  and td.ask  > 0 else None
+                    last = td.last if td.last and td.last > 0 else None
+                    mid  = (bid + ask) / 2 if bid and ask else last
+                    if mid and mid > 0:
+                        return (1.0 / mid) if inverse else mid
+                except Exception as e:
+                    logger.debug("FX pair %s failed: %s", symbol, e)
+        finally:
+            _ib_log.setLevel(_prev)
+        return None
 
     def compute_target_shares(
         self,
