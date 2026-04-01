@@ -557,18 +557,32 @@ def run_live_report(args, cfg) -> None:
 
 def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
     """
-    Cancel STP/LMT orders that have no matching live position.
-    These are orphaned orders left over from closed positions or failed runs.
-    Returns list of (ticker, order_type, order_id) that were cancelled.
+    Cancel STP/LMT orders that are stale or inconsistent with live positions.
+
+    An order is cancelled when:
+      (a) No live position exists for that ticker  →  orphaned (position closed)
+      (b) Live position exists but order qty ≠ position qty  →  wrong size
+              (position was adjusted; old protective order is for old size)
+
+    An order is KEPT when:
+      live position exists  AND  abs(order.totalQuantity) == abs(position qty)
+
+    Returns list of (ticker, order_type, order_id, reason) cancelled.
     """
     from taurus.execution import PositionReconciler
-    rec = PositionReconciler()
+    rec  = PositionReconciler()
     live = rec.get_live_positions(conn)   # all positions, all currencies
-    live_tickers = set(live.index) if not live.empty else set()
+
+    # Build {ticker: abs(quantity)} from live positions
+    live_qty: dict = {}
+    if not live.empty:
+        for ticker, row in live.iterrows():
+            live_qty[ticker] = abs(float(row["quantity"]))
 
     PROTECTIVE = {"STP", "LMT"}
     ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
 
+    kept      = []
     cancelled = []
     try:
         for trade in conn.ib.openTrades():
@@ -576,22 +590,34 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
                 continue
             if trade.orderStatus.status not in ACTIVE:
                 continue
-            ticker = trade.contract.symbol
-            if ticker not in live_tickers:
-                if not dry_run:
-                    conn.ib.cancelOrder(trade.order)
-                cancelled.append((ticker, trade.order.orderType, trade.order.orderId))
+
+            ticker    = trade.contract.symbol
+            order_qty = abs(float(trade.order.totalQuantity))
+
+            if ticker not in live_qty:
+                reason = "no_position"
+            elif order_qty != live_qty[ticker]:
+                reason = f"qty_mismatch(order={order_qty:.0f} vs pos={live_qty[ticker]:.0f})"
+            else:
+                kept.append((ticker, trade.order.orderType, trade.order.orderId))
+                continue   # ← correct size, keep it
+
+            if not dry_run:
+                conn.ib.cancelOrder(trade.order)
+            cancelled.append((ticker, trade.order.orderType, trade.order.orderId, reason))
+
     except Exception as e:
         logger.warning("cleanup_orphaned_protective_orders failed: %s", e)
 
-    if cancelled:
-        logger.info(
-            "Orphaned protective orders cancelled (%d): %s",
-            len(cancelled),
-            [(t, ot) for t, ot, _ in cancelled],
-        )
-    else:
-        logger.info("No orphaned protective orders found.")
+    logger.info(
+        "Protective orders audit: %d kept (correct size)  |  %d cancelled (%s)",
+        len(kept), len(cancelled), "dry-run" if dry_run else "live",
+    )
+    for ticker, otype, oid, reason in cancelled:
+        logger.info("  ✗ cancelled %s %s #%s  [%s]", otype, ticker, oid, reason)
+    for ticker, otype, oid in kept:
+        logger.info("  ✓ kept      %s %s #%s", otype, ticker, oid)
+
     return cancelled
 
 
