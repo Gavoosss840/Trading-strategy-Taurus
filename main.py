@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -555,6 +555,119 @@ def run_live_report(args, cfg) -> None:
     )
 
 
+def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
+    """
+    Cancel STP/LMT orders that have no matching live position.
+    These are orphaned orders left over from closed positions or failed runs.
+    Returns list of (ticker, order_type, order_id) that were cancelled.
+    """
+    from taurus.execution import PositionReconciler
+    rec = PositionReconciler()
+    live = rec.get_live_positions(conn)   # all positions, all currencies
+    live_tickers = set(live.index) if not live.empty else set()
+
+    PROTECTIVE = {"STP", "LMT"}
+    ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
+
+    cancelled = []
+    try:
+        for trade in conn.ib.openTrades():
+            if trade.order.orderType not in PROTECTIVE:
+                continue
+            if trade.orderStatus.status not in ACTIVE:
+                continue
+            ticker = trade.contract.symbol
+            if ticker not in live_tickers:
+                if not dry_run:
+                    conn.ib.cancelOrder(trade.order)
+                cancelled.append((ticker, trade.order.orderType, trade.order.orderId))
+    except Exception as e:
+        logger.warning("cleanup_orphaned_protective_orders failed: %s", e)
+
+    if cancelled:
+        logger.info(
+            "Orphaned protective orders cancelled (%d): %s",
+            len(cancelled),
+            [(t, ot) for t, ot, _ in cancelled],
+        )
+    else:
+        logger.info("No orphaned protective orders found.")
+    return cancelled
+
+
+def run_force_rebalance(args, cfg) -> None:
+    """
+    Force-rebalance specific universe(s) NOW, bypassing the end-of-month check.
+
+    Use cases:
+      - Deploy a new/fixed universe (e.g. nikkei225 after FX fix) without
+        waiting for month-end
+      - Re-run a single universe after a bug fix
+
+    Safety guarantees:
+      - Only touches the specified --universes; all others are untouched
+      - scheduler_state.json is NOT updated → April 30 rebalancing is unaffected
+      - Reconciliation ensures adjust (not close+reopen) for existing positions
+      - Orphaned STP/LMT (no matching position) are cancelled before the run
+      - Run with --no-dry-run to submit real orders (default: dry-run)
+
+    Usage:
+      python main.py --mode force-rebalance --universes nikkei225 --no-dry-run --live
+    """
+    import pandas as pd
+    from taurus.execution import IBKRConnection
+    from taurus.scheduler import RebalanceScheduler
+
+    universes = args.universes
+    dry_run   = cfg.dry_run
+
+    logger.info(
+        "=== FORCE-REBALANCE | universes=%s | %s | dry_run=%s ===",
+        universes, "LIVE" if args.live else "PAPER", dry_run,
+    )
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot connect to IBKR TWS/Gateway. Is TWS/IB Gateway running?")
+        return
+
+    try:
+        # ── Step 1: Clean up orphaned STP/LMT (no matching live position) ── #
+        logger.info("Step 1/2 — Cleaning up orphaned protective orders …")
+        _cleanup_orphaned_protective_orders(conn, dry_run=dry_run)
+
+        # ── Step 2: Rebalance specified universe(s) ──────────────────────── #
+        logger.info("Step 2/2 — Running rebalance for: %s", universes)
+
+        # Reuse scheduler logic (Sharpe weights, execution pipeline, reports)
+        # but skip _save_state() so the monthly cycle is unaffected.
+        scheduler = RebalanceScheduler(
+            cfg=cfg,
+            universes=universes,
+            output_dir=args.output,
+        )
+        scheduler.conn = conn   # reuse already-connected instance
+
+        nav_weights = scheduler._sharpe_weights()
+        as_of       = pd.Timestamp.today().normalize()
+
+        for universe_name in universes:
+            try:
+                logger.info("--- Force-rebalancing: %s ---", universe_name)
+                scheduler._run_single_universe(
+                    universe_name,
+                    as_of,
+                    nav_fraction=nav_weights.get(universe_name, 1.0 / len(universes)),
+                )
+            except Exception as e:
+                logger.error("Force-rebalance failed for %s: %s", universe_name, e, exc_info=True)
+
+        logger.info("=== Force-rebalance complete — scheduler_state.json NOT modified ===")
+
+    finally:
+        conn.disconnect()
+
+
 def run_live(args, cfg) -> None:
     from taurus.scheduler import RebalanceScheduler
     logger.info(
@@ -591,6 +704,8 @@ def main() -> None:
         run_report(args, cfg)
     elif args.mode == "live-report":
         run_live_report(args, cfg)
+    elif args.mode == "force-rebalance":
+        run_force_rebalance(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)
