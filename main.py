@@ -675,7 +675,15 @@ def run_force_rebalance(args, cfg) -> None:
         scheduler.conn = conn   # reuse already-connected instance
 
         nav_weights = scheduler._sharpe_weights()
-        as_of       = pd.Timestamp.today().normalize()
+
+        # as_of must be the last business day of the most recently completed month
+        # so the date exists in the monthly price data.
+        # (The normal scheduler only runs on month-end so it never hits this issue.)
+        from taurus.scheduler import _last_business_day_of_month
+        today_d = pd.Timestamp.today().date()
+        prev_month = (pd.Timestamp.today() - pd.offsets.MonthBegin(1)).date()
+        as_of     = pd.Timestamp(_last_business_day_of_month(prev_month))
+        logger.info("Force-rebalance as_of = %s (last completed month-end)", as_of.date())
 
         for universe_name in universes:
             try:
