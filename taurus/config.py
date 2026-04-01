@@ -32,6 +32,7 @@ class UniverseConfig:
     nav_scale:            float = 1.0     # multiply NAV to match price units (LSE=100: GBP→GBp pence)
     fractional_shares:    bool  = False   # True for US markets (IBKR supports MKT fractions)
     supports_trail_stop:  bool  = True     # False for Euronext/LSE: MKT transmits alone, STP sent separately
+    use_wikipedia_scrape: bool  = False   # True for non-US universes whose Wikipedia tables have numeric codes
     n_longs:              int   = 25
     n_shorts:             int   = 25
 

@@ -216,6 +216,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_table_id="constituents",
         ticker_suffix=".T",               # Yahoo Finance: 7203.T
         ticker_col_index=1,               # Code column in Wikipedia table
+        use_wikipedia_scrape=True,        # Nikkei table has numeric codes → Wikipedia scraping works
         min_market_cap_usd=1e9,
         min_lot_size=100,                 # TSE requires orders in multiples of 100 shares
         n_longs=20,
@@ -316,47 +317,93 @@ _FALLBACKS: Dict[str, List[str]] = {
     ],
 
     # Nikkei 225 — Yahoo Finance tickers (.T suffix)
+    # Extended fallback used when Wikipedia scraping fails (~80 stocks)
     "nikkei225": [
+        # ── Top-cap tech / electronics ───────────────────────────────────── #
         "7203.T",  # Toyota Motor
         "6758.T",  # Sony Group
         "9984.T",  # SoftBank Group
         "7974.T",  # Nintendo
         "6861.T",  # Keyence
-        "4063.T",  # Shin-Etsu Chemical
-        "8316.T",  # Sumitomo Mitsui Financial
-        "7267.T",  # Honda Motor
-        "6098.T",  # Recruit Holdings
-        "9983.T",  # Fast Retailing (Uniqlo)
-        "6954.T",  # Fanuc
-        "7751.T",  # Canon
-        "4519.T",  # Chugai Pharmaceutical
-        "9433.T",  # KDDI
         "8035.T",  # Tokyo Electron
-        "4543.T",  # Terumo
-        "6367.T",  # Daikin Industries
-        "4502.T",  # Takeda Pharmaceutical
-        "7741.T",  # HOYA
-        "8411.T",  # Mizuho Financial
-        "2914.T",  # Japan Tobacco
-        "9432.T",  # NTT (Nippon Telegraph)
-        "6594.T",  # Nidec
-        "4661.T",  # Oriental Land (Tokyo Disney)
-        "7269.T",  # Suzuki Motor
-        "3382.T",  # Seven & i Holdings
         "6857.T",  # Advantest
-        "4911.T",  # Shiseido
-        "8766.T",  # Tokio Marine Holdings
-        "8801.T",  # Mitsui Fudosan
+        "6954.T",  # Fanuc
+        "4063.T",  # Shin-Etsu Chemical
+        "6367.T",  # Daikin Industries
+        "7741.T",  # HOYA
         "6501.T",  # Hitachi
-        "7832.T",  # Bandai Namco
-        "4568.T",  # Daiichi Sankyo
-        "1925.T",  # Daiwa House Industry
-        "5108.T",  # Bridgestone
-        "8031.T",  # Mitsui & Co.
-        "6503.T",  # Mitsubishi Electric
-        "9022.T",  # Central Japan Railway
-        "3407.T",  # Asahi Kasei
         "6702.T",  # Fujitsu
+        "6503.T",  # Mitsubishi Electric
+        "6902.T",  # DENSO
+        "6594.T",  # Nidec (Nidec Corp)
+        "6752.T",  # Panasonic Holdings
+        "7751.T",  # Canon
+        "6645.T",  # OMRON
+        # ── Autos ──────────────────────────────────────────────────────────  #
+        "7267.T",  # Honda Motor
+        "7269.T",  # Suzuki Motor
+        "7270.T",  # Subaru
+        "7201.T",  # Nissan Motor
+        "6301.T",  # Komatsu
+        "6326.T",  # Kubota
+        "5108.T",  # Bridgestone
+        # ── Financials ─────────────────────────────────────────────────────  #
+        "8316.T",  # Sumitomo Mitsui Financial
+        "8411.T",  # Mizuho Financial
+        "8306.T",  # Mitsubishi UFJ Financial (MUFG)
+        "8766.T",  # Tokio Marine Holdings
+        "8750.T",  # Dai-ichi Life Insurance
+        "8604.T",  # Nomura Holdings
+        "8801.T",  # Mitsui Fudosan
+        # ── Consumer / retail ──────────────────────────────────────────────  #
+        "9983.T",  # Fast Retailing (Uniqlo)
+        "3382.T",  # Seven & i Holdings
+        "8267.T",  # AEON
+        "4661.T",  # Oriental Land (Tokyo Disney)
+        "7832.T",  # Bandai Namco
+        "4911.T",  # Shiseido
+        "4452.T",  # Kao
+        "2802.T",  # Ajinomoto
+        # ── Healthcare / pharma ────────────────────────────────────────────  #
+        "4519.T",  # Chugai Pharmaceutical
+        "4543.T",  # Terumo
+        "4502.T",  # Takeda Pharmaceutical
+        "4568.T",  # Daiichi Sankyo
+        "4523.T",  # Eisai
+        "4578.T",  # Otsuka Holdings
+        "7733.T",  # Olympus
+        # ── Telecom / media ─────────────────────────────────────────────── #
+        "9433.T",  # KDDI
+        "9432.T",  # NTT (Nippon Telegraph)
+        "6098.T",  # Recruit Holdings
+        "4307.T",  # Nomura Research Institute
+        # ── Industrials / conglomerates ─────────────────────────────────── #
+        "7011.T",  # Mitsubishi Heavy Industries
+        "5401.T",  # Nippon Steel
+        "8058.T",  # Mitsubishi Corp
+        "8031.T",  # Mitsui & Co.
+        "8002.T",  # Marubeni
+        "9022.T",  # Central Japan Railway
+        "1925.T",  # Daiwa House Industry
+        "3407.T",  # Asahi Kasei
+        "3402.T",  # Toray Industries
+        "4901.T",  # Fujifilm Holdings
+        # ── Energy / chemicals ──────────────────────────────────────────── #
+        "5020.T",  # ENEOS Holdings
+        "4021.T",  # Nissan Chemical
+        "3436.T",  # SUMCO (silicon wafers)
+        # ── Shipping ─────────────────────────────────────────────────────  #
+        "9101.T",  # Nippon Yusen (NYK Line)
+        "9104.T",  # Mitsui O.S.K. Lines
+        "9107.T",  # Kawasaki Kisen
+        # ── Food & beverage ──────────────────────────────────────────────  #
+        "2502.T",  # Asahi Group Holdings
+        "2503.T",  # Kirin Holdings
+        "2501.T",  # Sapporo Holdings
+        # ── Misc ─────────────────────────────────────────────────────────  #
+        "4151.T",  # Kyowa Kirin
+        "3861.T",  # Oji Holdings
+        "7762.T",  # Citizen Watch
     ],
 
     # Hang Seng Index — Yahoo Finance tickers (.HK suffix)
@@ -455,7 +502,7 @@ class UniverseDef:
         if cached is not None:
             return cached
 
-        if self.config.region == "US":
+        if self.config.region == "US" or self.config.use_wikipedia_scrape:
             tickers = self._scrape_wikipedia()
             if not tickers:
                 logger.warning(
@@ -464,7 +511,7 @@ class UniverseDef:
                 )
                 tickers = _FALLBACKS.get(self.config.name, [])
         else:
-            # Non-US: skip Wikipedia scraping, use curated fallback lists
+            # Non-US without Wikipedia scraping: use curated fallback lists
             # that already have correct Yahoo Finance suffixes (.PA, .L, .T, .HK, .SR)
             tickers = _FALLBACKS.get(self.config.name, [])
             if not tickers:
