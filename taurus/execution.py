@@ -122,6 +122,8 @@ class PositionReconciler:
                 "quantity": p.position,
                 "avg_cost": p.avgCost,
             })
+        if not records:
+            return pd.DataFrame(columns=["ticker", "quantity", "avg_cost"])
         return pd.DataFrame(records).set_index("ticker")
 
     def get_account_nav(self, conn: IBKRConnection, currency: str = None) -> float:
