@@ -582,8 +582,10 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
     PROTECTIVE = {"STP", "LMT"}
     ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
 
-    kept      = []
-    cancelled = []
+    kept           = []
+    cancelled      = []
+    orders_to_cancel = []   # (trade, reason) — collected first, cancelled after
+
     try:
         for trade in conn.ib.openTrades():
             if trade.order.orderType not in PROTECTIVE:
@@ -602,12 +604,40 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
                 kept.append((ticker, trade.order.orderType, trade.order.orderId))
                 continue   # ← correct size, keep it
 
-            if not dry_run:
-                conn.ib.cancelOrder(trade.order)
+            orders_to_cancel.append((trade, ticker, reason))
             cancelled.append((ticker, trade.order.orderType, trade.order.orderId, reason))
 
     except Exception as e:
         logger.warning("cleanup_orphaned_protective_orders failed: %s", e)
+
+    # Cancel using clientId=0 (IBKR "master" client).
+    # Orders can only be cancelled by the clientId that placed them OR by clientId=0.
+    # After reconnect attempts the current clientId may differ from the one that
+    # placed the orders → use a dedicated master connection to guarantee cancellation.
+    if not dry_run and orders_to_cancel:
+        from ib_insync import IB as _IB
+        master = _IB()
+        try:
+            master.connect(
+                conn.cfg.ibkr_host,
+                conn.cfg.ibkr_port,
+                clientId=0,
+                timeout=10,
+                readonly=False,
+            )
+            master.sleep(1)   # let open-orders download complete
+            for trade, ticker, reason in orders_to_cancel:
+                master.cancelOrder(trade.order)
+                logger.debug("Cancel sent for %s %s #%s",
+                             trade.order.orderType, ticker, trade.order.orderId)
+            master.sleep(2)   # wait for TWS to process
+        except Exception as e:
+            logger.warning("Master-client cancel failed: %s", e)
+        finally:
+            try:
+                master.disconnect()
+            except Exception:
+                pass
 
     logger.info(
         "Protective orders audit: %d kept (correct size)  |  %d cancelled (%s)",
