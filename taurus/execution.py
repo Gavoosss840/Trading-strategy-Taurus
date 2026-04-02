@@ -374,6 +374,37 @@ class PositionReconciler:
 #  Order manager                                                               #
 # --------------------------------------------------------------------------- #
 
+def _tse_tick(price: float) -> float:
+    """Return the TSE Prime Market minimum tick size for a given price level."""
+    if price <  1_000:  return 0.1
+    if price <  3_000:  return 0.5
+    if price <  5_000:  return 1.0
+    if price < 10_000:  return 5.0
+    if price < 30_000:  return 10.0
+    if price < 50_000:  return 50.0
+    if price < 100_000: return 100.0
+    return 1_000.0
+
+
+def _round_price(price: float, currency: str) -> float:
+    """
+    Round a STP/LMT price to the minimum tick size for the given currency.
+
+    JPY (TSE): tick depends on price range — avoids Warning 110
+      "Le prix n'est pas conforme à la variation minimum autorisée".
+    All others: two decimal places (cents / pence).
+    """
+    if not price:
+        return price
+    if currency == "JPY":
+        tick = _tse_tick(price)
+        # round to nearest tick, then strip floating-point noise
+        return round(round(price / tick) * tick, 10)
+    return round(price, 2)
+
+
+# --------------------------------------------------------------------------- #
+
 class OrderManager:
     """Places and monitors orders via ib_insync."""
 
@@ -531,18 +562,18 @@ class OrderManager:
         stp.orderType   = "STP"
         stp.tif         = "GTC"
         stp.totalQuantity = pos_qty
-        stp.auxPrice    = round(stop_price, 2)
+        stp.auxPrice    = _round_price(stop_price, universe_cfg.currency)
         stp.transmit    = True
         conn.ib.placeOrder(contract, stp)
 
         # Standalone LMT (GTC, no parentId)
-        lmt             = LimitOrder(stop_action, pos_qty, round(tp_price, 2))
+        lmt             = LimitOrder(stop_action, pos_qty, _round_price(tp_price, universe_cfg.currency))
         lmt.tif         = "GTC"
         lmt.transmit    = True
         conn.ib.placeOrder(contract, lmt)
 
         logger.info(
-            "Restored STP+LMT for %s: qty=%.0f  STP=%.4f (-%.0f%%)  LMT=%.4f (+%.0f%%)",
+            "Restored STP+LMT for %s: qty=%.0f  STP=%g (-%.0f%%)  LMT=%g (+%.0f%%)",
             ibkr_ticker, pos_qty,
             round(stop_price, 2), stop_pct * 100,
             round(tp_price, 2),   take_profit_pct * 100,
@@ -675,14 +706,14 @@ class OrderManager:
                     stp.orderType     = "STP"
                     stp.tif           = "GTC"
                     stp.totalQuantity = protective_qty   # full target position size
-                    stp.auxPrice      = round(stop_price, 2)
+                    stp.auxPrice      = _round_price(stop_price, universe_cfg.currency)
                     stp.parentId      = parent_trade.order.orderId
                     stp.transmit      = False   # LMT child will trigger final transmission
 
                     stp_trade = conn.ib.placeOrder(contract, stp)
 
                     # LMT (take profit) — third child, triggers transmission of all 3
-                    lmt               = LimitOrder(stop_action, protective_qty, round(tp_price, 2))
+                    lmt               = LimitOrder(stop_action, protective_qty, _round_price(tp_price, universe_cfg.currency))
                     lmt.tif           = "GTC"
                     lmt.parentId      = parent_trade.order.orderId
                     lmt.transmit      = True    # transmits MKT + STP + LMT together
@@ -726,7 +757,7 @@ class OrderManager:
                     stp.orderType     = "STP"
                     stp.tif           = "GTC"
                     stp.totalQuantity = protective_qty   # full target position size
-                    stp.auxPrice      = round(stop_price, 2)
+                    stp.auxPrice      = _round_price(stop_price, universe_cfg.currency)
                     stp.ocaGroup      = oca_group
                     stp.ocaType       = 1   # cancel with block (most protective)
                     stp.transmit      = True
@@ -734,7 +765,7 @@ class OrderManager:
                     if stp_id:
                         order_info["ibkr_stp_order_id"] = stp_id
 
-                    lmt = LimitOrder(stop_action, protective_qty, round(tp_price, 2))
+                    lmt = LimitOrder(stop_action, protective_qty, _round_price(tp_price, universe_cfg.currency))
                     lmt.tif      = "GTC"
                     lmt.ocaGroup = oca_group
                     lmt.ocaType  = 1
