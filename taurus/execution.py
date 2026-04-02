@@ -1181,10 +1181,24 @@ class IBKRExecutor:
                     t for t, p in _rm.state.positions.items()
                     if p.universe == self.udef_cfg.name
                 }
+                # Tickers positively attributed to a DIFFERENT universe — exclude these
+                # so we don't accidentally close another universe's positions.
+                other_universe_tickers = {
+                    t for t, p in _rm.state.positions.items()
+                    if p.universe != self.udef_cfg.name
+                }
             except Exception:
                 universe_owned = set()
+                other_universe_tickers = set()
 
-            managed_tickers = set(target.index) | universe_owned
+            # Include:
+            #  (a) tickers in the new target
+            #  (b) tickers previously opened by this universe (from RiskState)
+            #  (c) live tickers in the right currency that are NOT owned by another
+            #      universe — catches positions opened before RiskState tracking or
+            #      after a rebalance that reset the state (e.g. the 100%-NAV run).
+            untracked_live = set() if live.empty else (set(live.index) - other_universe_tickers)
+            managed_tickers = set(target.index) | universe_owned | untracked_live
             if not live.empty:
                 live = live[live.index.isin(managed_tickers)]
 
