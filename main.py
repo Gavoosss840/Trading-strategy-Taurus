@@ -689,7 +689,17 @@ def run_force_rebalance(args, cfg) -> None:
         )
         scheduler.conn = conn   # reuse already-connected instance
 
-        nav_weights = scheduler._sharpe_weights()
+        # Compute Sharpe weights over ALL known universes so that running a
+        # single universe (e.g. --universes nikkei225) still gets its proper
+        # fraction of NAV (e.g. ~20%) instead of 100%.
+        from taurus.universe import REGISTRY as _UREG
+        all_universe_names = list(_UREG.keys())
+        full_scheduler = RebalanceScheduler(
+            cfg=cfg,
+            universes=all_universe_names,
+            output_dir=args.output,
+        )
+        nav_weights = full_scheduler._sharpe_weights()
 
         # as_of must be the last business day of the most recently completed month
         # so the date exists in the monthly price data.
