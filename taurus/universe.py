@@ -696,9 +696,32 @@ class UniverseDef:
                     "total_assets", "market_cap", "sector", "tax_rate", "cash", "fcf",
                 ]
                 return pd.DataFrame(columns=_empty_cols)
+
+            import hashlib as _hl
+            _fb_key = f"fundamentals_{self.config.name}_v1"
+            cached = _cache_load(_fb_key, cfg)
+            if cached is not None:
+                return cached
+
             from .data import _fetch_single_fundamental
-            records = [_fetch_single_fundamental(t) for t in tickers]
-            return pd.DataFrame(records).set_index("ticker")
+            from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+
+            records = []
+            logger.info("[%s] Downloading fundamentals for %d tickers (parallel)…",
+                        self.config.name, len(tickers))
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(_fetch_single_fundamental, t): t for t in tickers}
+                for fut in as_completed(futures):
+                    ticker = futures[fut]
+                    try:
+                        records.append(fut.result(timeout=30))
+                    except (FuturesTimeout, Exception) as e:
+                        logger.debug("Fundamentals timeout/error for %s: %s", ticker, e)
+                        records.append({"ticker": ticker})   # empty row — NaN filled downstream
+
+            df = pd.DataFrame(records).set_index("ticker")
+            _cache_save(_fb_key, df, cfg)
+            return df
 
     # ── IBKR Futures Contract ────────────────────────────────────────────── #
 
