@@ -693,7 +693,7 @@ def run_force_rebalance(args, cfg) -> None:
         # single universe (e.g. --universes nikkei225) still gets its proper
         # fraction of NAV (e.g. ~20%) instead of 100%.
         from taurus.universe import REGISTRY as _UREG
-        all_universe_names = list(_UREG.keys())
+        all_universe_names = _UREG.all_names()
         full_scheduler = RebalanceScheduler(
             cfg=cfg,
             universes=all_universe_names,
