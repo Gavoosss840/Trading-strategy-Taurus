@@ -706,7 +706,10 @@ def run_force_rebalance(args, cfg) -> None:
         # (The normal scheduler only runs on month-end so it never hits this issue.)
         from taurus.scheduler import _last_business_day_of_month
         today_d = pd.Timestamp.today().date()
-        prev_month = (pd.Timestamp.today() - pd.offsets.MonthBegin(1)).date()
+        # Always use the PREVIOUS completed calendar month (never the current month).
+        # Example: on April 2 → March 1; on March 31 → February 1.
+        first_of_current_month = pd.Timestamp(today_d.replace(day=1))
+        prev_month = (first_of_current_month - pd.Timedelta(days=1)).replace(day=1).date()
         as_of     = pd.Timestamp(_last_business_day_of_month(prev_month))
         logger.info("Force-rebalance as_of = %s (last completed month-end)", as_of.date())
 
