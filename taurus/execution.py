@@ -510,6 +510,42 @@ class OrderManager:
             )
         return cancelled
 
+    def cancel_all_orders_for_tickers(
+        self,
+        conn:     IBKRConnection,
+        tickers:  set,
+        dry_run:  bool = False,
+    ) -> int:
+        """
+        Cancel ALL open orders (entry MKT + protective STP/LMT) for a set of tickers.
+
+        Called at the start of every rebalance pass to guarantee a clean slate.
+        DAY entry orders from a previous run expire overnight but successive intra-day
+        runs can also accumulate duplicates when pending_shares misses cancelled/filled
+        orders.  Wiping every open order for managed tickers and recomputing delta
+        purely from filled positions is the only reliable way to avoid duplicates.
+        """
+        ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
+        ibkr_tickers = {t.split(".")[0] if "." in t else t for t in tickers}
+        n_cancelled = 0
+        try:
+            for trade in conn.ib.openTrades():
+                if trade.contract.symbol not in ibkr_tickers:
+                    continue
+                if trade.orderStatus.status not in ACTIVE:
+                    continue
+                if not dry_run:
+                    conn.ib.cancelOrder(trade.order)
+                n_cancelled += 1
+        except Exception as e:
+            logger.warning("cancel_all_orders_for_tickers: %s", e)
+        if n_cancelled:
+            logger.info(
+                "Cancelled %d stale orders for %d managed tickers (clean-slate before rebalance)",
+                n_cancelled, len(ibkr_tickers),
+            )
+        return n_cancelled
+
     def place_protective_only(
         self,
         conn:            IBKRConnection,
@@ -1202,7 +1238,25 @@ class IBKRExecutor:
             if not live.empty:
                 live = live[live.index.isin(managed_tickers)]
 
-            delta_df = self.reconciler.compute_order_delta(target, live, pending)
+            # Cancel ALL open orders for managed tickers before computing delta.
+            # This guarantees a clean slate on every run: DAY entry orders from a
+            # previous session have expired so pending_shares won't see them, leading
+            # to duplicate orders on a re-run.  By wiping stale orders first and
+            # computing delta purely from FILLED positions we can never double-order.
+            if not self.cfg.dry_run:
+                self.order_mgr.cancel_all_orders_for_tickers(
+                    self.conn, managed_tickers, dry_run=False
+                )
+                # Brief pause so cancellations propagate before we place new orders
+                self.conn.ib.sleep(1.5)
+            # After cancelling, pending_shares is empty for managed tickers —
+            # pass an empty Series so delta = target - filled_positions only.
+            pending_clean = pending.drop(
+                index=[t for t in pending.index if t in managed_tickers],
+                errors="ignore",
+            )
+
+            delta_df = self.reconciler.compute_order_delta(target, live, pending_clean)
 
             if delta_df.empty:
                 logger.info("[%s] No trades needed — portfolio already at target.", self.udef_cfg.name)
