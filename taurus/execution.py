@@ -956,6 +956,159 @@ class IBKRExecutor:
         self.reconciler   = PositionReconciler()
         self.order_mgr    = OrderManager()
 
+
+    def _get_available_cash(self) -> float:
+        """Return available funds in this universe's currency from IBKR account summary."""
+        currency = self.udef_cfg.currency
+        try:
+            summary = self.conn.ib.accountSummary()
+        except Exception:
+            return 0.0
+        for item in summary:
+            if item.tag == "AvailableFunds" and item.currency == currency:
+                return float(item.value)
+        # Fallback: base-currency available funds
+        for item in summary:
+            if item.tag == "AvailableFunds" and item.currency not in ("BASE", ""):
+                return float(item.value)
+        return 0.0
+
+    def _handle_sub_lot(
+        self,
+        target:   "pd.Series",
+        snapshot,
+        prices:   dict,
+    ) -> "tuple[pd.Series, list]":
+        """
+        Handle positions where the strategy weight converts to < 1 share.
+
+        Rules:
+          1. If (1 lot × price) ≤ available cash → round up to 1 lot and execute.
+          2. Otherwise → add to manual-orders list (report saved separately).
+
+        Returns (updated_target, manual_rows).
+        """
+        import pandas as pd
+        from .risk import RiskConfig as _RC
+        risk_cfg = _RC()
+
+        def norm(t: str) -> str:
+            return t.split(".")[0] if "." in t else t
+
+        # Build {normalised_ticker: (weight, is_long)} for all weighted tickers
+        all_weighted: dict = {}
+        for t, w in snapshot.long_weights.items():
+            all_weighted.setdefault(norm(t), (w, True))
+        for t, w in snapshot.short_weights.items():
+            all_weighted.setdefault(norm(t), (w, False))
+
+        # Sub-lot = in weights but not in target (rounded to 0 by _round_lot)
+        sub_lot = {
+            ticker: info
+            for ticker, info in all_weighted.items()
+            if ticker not in target.index and prices.get(ticker, 0) > 0
+        }
+
+        if not sub_lot:
+            return target, []
+
+        lot           = getattr(self.udef_cfg, "min_lot_size", 1) or 1
+        avail_cash    = self._get_available_cash()
+        remaining     = avail_cash
+        roundup: dict = {}
+        manual: list  = []
+
+        for ticker, (w, is_long) in sub_lot.items():
+            price         = prices[ticker]
+            order_value   = price * lot
+
+            if order_value <= remaining:
+                # Affordable — round up to 1 lot
+                roundup[ticker] = float(lot) if is_long else float(-lot)
+                remaining -= order_value
+                logger.info(
+                    "[%s] Sub-lot %s: rounded up to %d share(s) (%.2f %s; cash left %.2f)",
+                    self.udef_cfg.name, ticker, lot, order_value,
+                    self.udef_cfg.currency, remaining,
+                )
+            else:
+                # Not affordable — flag for manual report
+                if is_long:
+                    stp = _round_price(price * (1 - risk_cfg.stop_loss_pct),  self.udef_cfg.currency)
+                    lmt = _round_price(price * (1 + risk_cfg.take_profit_pct), self.udef_cfg.currency)
+                    action = "BUY"
+                else:
+                    stp = _round_price(price * (1 + risk_cfg.stop_loss_pct),  self.udef_cfg.currency)
+                    lmt = _round_price(price * (1 - risk_cfg.take_profit_pct), self.udef_cfg.currency)
+                    action = "SELL"
+                manual.append({
+                    "ticker":      ticker,
+                    "action":      action,
+                    "qty":         lot,
+                    "price":       round(price, 4),
+                    "stop_loss":   stp,
+                    "take_profit": lmt,
+                    "currency":    self.udef_cfg.currency,
+                    "universe":    self.udef_cfg.name,
+                    "reason":      (
+                        f"Fractional: need {order_value:.2f} {self.udef_cfg.currency}, "
+                        f"only {remaining:.2f} available"
+                    ),
+                })
+                logger.warning(
+                    "[%s] Sub-lot %s: MANUAL ORDER NEEDED — %.2f %s required, %.2f available",
+                    self.udef_cfg.name, ticker, order_value, self.udef_cfg.currency, remaining,
+                )
+
+        if roundup:
+            target = pd.concat([target, pd.Series(roundup, dtype=float)])
+
+        return target, manual
+
+    def _save_fractional_report(self, rows: list, as_of) -> None:
+        """Write a human-readable + JSON report of orders that need manual execution."""
+        import json, os
+        date_str = as_of.strftime("%Y-%m-%d") if hasattr(as_of, "strftime") else str(as_of)[:10]
+        base = os.path.join(
+            self.output_dir,
+            f"manual_orders_{self.udef_cfg.name}_{date_str}",
+        )
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # ── Human-readable text ──────────────────────────────────────────────
+        lines = [
+            f"MANUAL FRACTIONAL ORDERS — {self.udef_cfg.name.upper()} @ {date_str}",
+            "=" * 60,
+            "These positions could not be placed automatically:",
+            "  • allocation < 1 share at current prices AND",
+            "  • insufficient cash to round up to 1 share",
+            "",
+            f"  {'ACTION':<5}  {'QTY':>4}  {'TICKER':<10}  {'PRIX':>10}  {'STOP':>10}  {'LIMIT':>10}  {'CCY'}",
+            "  " + "-" * 58,
+        ]
+        for r in rows:
+            lines.append(
+                f"  {r['action']:<5}  {r['qty']:>4}  {r['ticker']:<10}"
+                f"  {r['price']:>10.4f}  {r['stop_loss']:>10.4f}  {r['take_profit']:>10.4f}"
+                f"  {r['currency']}"
+            )
+            lines.append(f"         ↳ {r['reason']}")
+            lines.append("")
+
+        txt_path = base + ".txt"
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        # ── JSON (machine-readable) ──────────────────────────────────────────
+        json_path = base + ".json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=2, default=str)
+
+        logger.info(
+            "[%s] %d manual order(s) saved → %s (.txt / .json)",
+            self.udef_cfg.name, len(rows), base,
+        )
+
     def _restore_protective_orders(self, prices: dict) -> None:
         """
         Post-rebalancing pass: ensure every live position has correct STP + LMT.
@@ -1198,6 +1351,12 @@ class IBKRExecutor:
             # instead of a simple adjustment.
             target.index = pd.Index([t.split(".")[0] if "." in t else t for t in target.index])
             prices        = {(t.split(".")[0] if "." in t else t): v for t, v in prices.items()}
+
+            # 3b. Handle sub-lot positions (strategy weight → < 1 share)
+            #     Round up to 1 lot if cash permits; otherwise write manual-orders report.
+            target, manual_rows = self._handle_sub_lot(target, snapshot, prices)
+            if manual_rows and not self.cfg.dry_run:
+                self._save_fractional_report(manual_rows, snapshot.date)
 
             # 4. Delta vs live (filled positions + pending entry orders)
             live    = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
