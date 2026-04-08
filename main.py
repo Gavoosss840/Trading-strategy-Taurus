@@ -646,7 +646,8 @@ def run_check_protective(args, cfg) -> None:
         output/protective_adjustment_<date_time>.json  (machine-readable)
 
     Usage:
-        python main.py --mode check-protective --live
+        python main.py --mode check-protective           # paper account (port 7497)
+        python main.py --mode check-protective --live    # real account  (port 7496)
     """
     import os, json
     from datetime import datetime
