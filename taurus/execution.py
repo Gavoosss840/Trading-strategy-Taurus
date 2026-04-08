@@ -1109,7 +1109,7 @@ class IBKRExecutor:
             self.udef_cfg.name, len(rows), base,
         )
 
-    def _restore_protective_orders(self, prices: dict) -> None:
+    def _restore_protective_orders(self, prices: dict, mm_tp_pcts: dict = None) -> None:
         """
         Post-rebalancing pass: ensure every live position has correct STP + LMT.
 
@@ -1118,11 +1118,16 @@ class IBKRExecutor:
           - Otherwise: cancel stale protective orders + place fresh ones using
             the current market price as reference for stop/limit levels
 
+        mm_tp_pcts: per-ticker take-profit fractions from MM fair-value divergence.
+                    Falls back to flat RiskConfig.take_profit_pct when absent.
+
         Called after wait_for_fills so new entries are already reflected in live
         positions and their bracket STP/LMT have been placed by place_order().
         """
         from .risk import RiskConfig
         risk_cfg = RiskConfig()
+        if mm_tp_pcts is None:
+            mm_tp_pcts = {}
 
         live = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
         if live.empty:
@@ -1173,12 +1178,13 @@ class IBKRExecutor:
             self.order_mgr.cancel_protective_orders(self.conn, sym, dry_run=self.cfg.dry_run)
 
             # Place fresh standalone STP + LMT
-            target_qty = pos_qty if float(row["quantity"]) > 0 else -pos_qty
+            target_qty    = pos_qty if float(row["quantity"]) > 0 else -pos_qty
+            ticker_tp_pct = mm_tp_pcts.get(sym, risk_cfg.take_profit_pct)
             self.order_mgr.place_protective_only(
                 self.conn, sym, target_qty, entry_price,
                 self.udef_cfg,
                 stop_pct        = risk_cfg.stop_loss_pct,
-                take_profit_pct = risk_cfg.take_profit_pct,
+                take_profit_pct = ticker_tp_pct,
                 dry_run         = self.cfg.dry_run,
             )
 
@@ -1421,7 +1427,7 @@ class IBKRExecutor:
                 logger.info("[%s] No trades needed — portfolio already at target.", self.udef_cfg.name)
                 if not self.cfg.dry_run:
                     self._log_reconciliation(target, delta_df, report)
-                    self._restore_protective_orders(prices)
+                    self._restore_protective_orders(prices, mm_tp_pcts)
                 report.save(self.output_dir)
                 return report
 
@@ -1437,14 +1443,45 @@ class IBKRExecutor:
             trail_pct = risk_cfg.stop_loss_pct
             tp_pct    = risk_cfg.take_profit_pct
 
+            # Build per-ticker take-profit from MM fair-value divergence.
+            # divergence_pct = (VL_theoretical - MarketCap) / MarketCap × 100
+            # Long  (+div): stock is undervalued → fair price is div% above current → LMT there
+            # Short (-div): stock is overvalued  → fair price is |div|% below → LMT there
+            # Fallback to flat tp_pct when MM data is missing or divergence ≈ 0.
+            MIN_TP = 0.05   # floor: always at least 5% upside required
+            MAX_TP = 0.80   # cap: discard outlier MM values > 80%
+            mm_tp_pcts: dict = {}
+            try:
+                mm_df = getattr(snapshot, "mm_df", None)
+                if mm_df is not None and not mm_df.empty and "divergence_pct" in mm_df.columns:
+                    for raw_t, mm_row in mm_df.iterrows():
+                        t   = raw_t.split(".")[0] if "." in str(raw_t) else str(raw_t)
+                        div = mm_row.get("divergence_pct", None)
+                        if div is None or pd.isna(div):
+                            continue
+                        tp = abs(float(div)) / 100.0        # always positive; direction handled by place_order
+                        tp = max(MIN_TP, min(tp, MAX_TP))   # clamp
+                        mm_tp_pcts[t] = tp
+                if mm_tp_pcts:
+                    logger.info(
+                        "[%s] MM fair-value take-profits: %d tickers (range %.0f%%–%.0f%%)",
+                        self.udef_cfg.name, len(mm_tp_pcts),
+                        min(mm_tp_pcts.values()) * 100,
+                        max(mm_tp_pcts.values()) * 100,
+                    )
+            except Exception as e:
+                logger.warning("[%s] Could not build MM take-profits: %s — using flat %.0f%%",
+                               self.udef_cfg.name, e, tp_pct * 100)
+
             for _, row in pd.concat([exits, entries]).reset_index(drop=True).iterrows():
-                ticker     = str(row["ticker"])
+                ticker        = str(row["ticker"])
+                ticker_tp_pct = mm_tp_pcts.get(ticker, tp_pct)   # MM-derived or flat fallback
                 order_info = self.order_mgr.place_order(
                     self.conn, row["ticker"], float(row["delta"]),
                     self.udef_cfg, dry_run=self.cfg.dry_run,
                     trail_pct=trail_pct,
                     entry_price=prices.get(row["ticker"], 0.0),
-                    take_profit_pct=tp_pct,
+                    take_profit_pct=ticker_tp_pct,
                     target_qty=float(row["target"]),  # full position size for STP/LMT sizing
                 )
                 if order_info:
@@ -1464,7 +1501,7 @@ class IBKRExecutor:
 
             # 7b. Restore / refresh protective orders for all live positions
             if not self.cfg.dry_run:
-                self._restore_protective_orders(prices)
+                self._restore_protective_orders(prices, mm_tp_pcts)
 
             # 7c. Reconciliation report — compare submitted orders vs live state
             if not self.cfg.dry_run:

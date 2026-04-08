@@ -649,7 +649,7 @@ def run_check_protective(args, cfg) -> None:
         python main.py --mode check-protective           # paper account (port 7497)
         python main.py --mode check-protective --live    # real account  (port 7496)
     """
-    import os, json
+    import os, json, glob as _glob
     from datetime import datetime
     from taurus.execution import IBKRConnection, _round_price
     from taurus.risk import RiskConfig
@@ -660,6 +660,27 @@ def run_check_protective(args, cfg) -> None:
         return
 
     risk = RiskConfig()
+
+    # ── 0. Load MM take-profit pcts from last execution reports (if any) ────
+    # execution_<universe>_<date>.json stores per-order take_profit_pct
+    MIN_TP, MAX_TP = 0.05, 0.80
+    mm_tp_pcts: dict = {}   # {ticker: tp_fraction}
+    for report_path in _glob.glob(os.path.join(args.output, "execution_*.json")):
+        try:
+            with open(report_path) as f:
+                rep = json.load(f)
+            for order in rep.get("orders", []):
+                t   = order.get("ticker", "")
+                tp  = order.get("tp_pct", None)
+                if t and tp is not None:
+                    mm_tp_pcts[t] = max(MIN_TP, min(float(tp), MAX_TP))
+        except Exception:
+            pass
+    if mm_tp_pcts:
+        logger.info(
+            "Loaded MM take-profit levels for %d tickers from execution reports",
+            len(mm_tp_pcts),
+        )
 
     # ── 1. Live positions ────────────────────────────────────────────────────
     raw_positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
@@ -706,14 +727,17 @@ def run_check_protective(args, cfg) -> None:
             rows_ok.append(sym)
             continue
 
-        # Compute correct prices from avg_cost + configured risk params
-        entry = avg_cost
+        # Compute correct prices from avg_cost + risk params
+        # Take-profit: use MM fair-value divergence from last execution report if
+        # available, otherwise fall back to flat RiskConfig.take_profit_pct
+        entry     = avg_cost
+        tp_frac   = mm_tp_pcts.get(sym, risk.take_profit_pct)
         if is_long:
-            stp_price = _round_price(entry * (1 - risk.stop_loss_pct),  currency)
-            lmt_price = _round_price(entry * (1 + risk.take_profit_pct), currency)
+            stp_price = _round_price(entry * (1 - risk.stop_loss_pct), currency)
+            lmt_price = _round_price(entry * (1 + tp_frac),            currency)
         else:
-            stp_price = _round_price(entry * (1 + risk.stop_loss_pct),  currency)
-            lmt_price = _round_price(entry * (1 - risk.take_profit_pct), currency)
+            stp_price = _round_price(entry * (1 + risk.stop_loss_pct), currency)
+            lmt_price = _round_price(entry * (1 - tp_frac),            currency)
 
         missing_tags = (["STP"] if not has_stp else []) + (["LMT"] if not has_lmt else [])
         rows_missing.append({
