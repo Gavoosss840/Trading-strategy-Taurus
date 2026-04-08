@@ -690,9 +690,10 @@ def run_refresh_protective(args, cfg) -> None:
         logger.info("MM take-profit levels loaded for %d tickers", len(mm_tp_pcts))
 
     # ── 0b. Build currency → universe_cfg for exchange lookup ───────────────
+    # REGISTRY.get() returns UniverseDef (wrapper); the UniverseConfig is in .config
     currency_to_ucfg: dict = {}
     for uname in REGISTRY.all_names():
-        ucfg = REGISTRY.get(uname)
+        ucfg = REGISTRY.get(uname).config   # UniverseConfig has .currency / .ibkr_exchange
         currency_to_ucfg.setdefault(ucfg.currency, ucfg)
 
     # ── 1. Live positions ────────────────────────────────────────────────────
