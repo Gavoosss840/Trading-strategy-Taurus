@@ -701,6 +701,7 @@ class OrderManager:
             "tp_price":   round(tp_price, 4)   if tp_price   else None,
             "stop_pct":   stop_pct,
             "tp_pct":     take_profit_pct,
+            "tp_source":  "flat" if abs(take_profit_pct - 0.20) < 0.001 else "MM",
             "dry_run":    dry_run,
             "status":     "pending",
         }

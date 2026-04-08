@@ -673,21 +673,30 @@ def run_refresh_protective(args, cfg) -> None:
     order_mgr = OrderManager()
 
     # ── 0. Load MM take-profit pcts from last execution reports ─────────────
-    MIN_TP, MAX_TP = 0.05, 0.80
-    mm_tp_pcts: dict = {}
+    MIN_TP, MAX_TP  = 0.05, 0.80
+    FLAT_DEFAULT    = 0.20          # RiskConfig default — not MM-derived
+    mm_tp_pcts: dict = {}           # {ticker: tp_fraction}  — only truly MM-derived values
     for report_path in _glob.glob(os.path.join(args.output, "execution_*.json")):
         try:
             with open(report_path) as f:
                 rep = json.load(f)
             for order in rep.get("orders", []):
-                t  = order.get("ticker", "")
-                tp = order.get("tp_pct", None)
-                if t and tp is not None:
-                    mm_tp_pcts[t] = max(MIN_TP, min(float(tp), MAX_TP))
+                t      = order.get("ticker", "")
+                tp     = order.get("tp_pct", None)
+                src    = order.get("tp_source", "flat")   # "MM" or "flat"
+                if not t or tp is None:
+                    continue
+                tp_val = float(tp)
+                # Only use if flagged as MM-derived AND meaningfully different from flat default
+                if src == "MM" and abs(tp_val - FLAT_DEFAULT) > 0.005:
+                    mm_tp_pcts[t] = max(MIN_TP, min(tp_val, MAX_TP))
         except Exception:
             pass
     if mm_tp_pcts:
-        logger.info("MM take-profit levels loaded for %d tickers", len(mm_tp_pcts))
+        logger.info("MM take-profit levels loaded for %d tickers (non-flat)", len(mm_tp_pcts))
+    else:
+        logger.info("No MM take-profit data in execution reports yet — using flat %.0f%% for all",
+                    FLAT_DEFAULT * 100)
 
     # ── 0b. Build currency → universe_cfg for exchange lookup ───────────────
     # REGISTRY.get() returns UniverseDef (wrapper); the UniverseConfig is in .config
@@ -995,9 +1004,10 @@ def run_check_protective(args, cfg) -> None:
     risk = RiskConfig()
 
     # ── 0. Load MM take-profit pcts from last execution reports (if any) ────
-    # execution_<universe>_<date>.json stores per-order take_profit_pct
+    # execution_<universe>_<date>.json stores per-order take_profit_pct + tp_source
     MIN_TP, MAX_TP = 0.05, 0.80
-    mm_tp_pcts: dict = {}   # {ticker: tp_fraction}
+    FLAT_DEFAULT   = 0.20
+    mm_tp_pcts: dict = {}   # only truly MM-derived (tp_source=="MM" and != flat default)
     for report_path in _glob.glob(os.path.join(args.output, "execution_*.json")):
         try:
             with open(report_path) as f:
@@ -1005,7 +1015,8 @@ def run_check_protective(args, cfg) -> None:
             for order in rep.get("orders", []):
                 t   = order.get("ticker", "")
                 tp  = order.get("tp_pct", None)
-                if t and tp is not None:
+                src = order.get("tp_source", "flat")
+                if t and tp is not None and src == "MM" and abs(float(tp) - FLAT_DEFAULT) > 0.005:
                     mm_tp_pcts[t] = max(MIN_TP, min(float(tp), MAX_TP))
         except Exception:
             pass
