@@ -811,32 +811,39 @@ def run_refresh_protective(args, cfg) -> None:
 
     conn.ib.disconnect()
 
-    # ── 4. Report ────────────────────────────────────────────────────────────
-    total = len(rows_ok) + len(rows_changed)
-    if not rows_changed:
-        logger.info("All %d positions already have correct STP + LMT. Nothing to do.", total)
-        return
-
-    now      = datetime.now()
-    date_str = now.strftime("%Y-%m-%d_%H%M")
+    # ── 4. Report (always written — shows full scan result) ──────────────────
+    total      = len(rows_ok) + len(rows_changed)
+    now        = datetime.now()
+    date_str   = now.strftime("%Y-%m-%d_%H%M")
     os.makedirs(args.output, exist_ok=True)
-    base = os.path.join(args.output, f"protective_adjustment_{date_str}")
+    base       = os.path.join(args.output, f"protective_adjustment_{date_str}")
+    mode_label = "DRY RUN — no orders submitted" if dry_run else "APPLIED — orders updated in TWS"
 
-    mode_label = "DRY RUN — no orders submitted" if dry_run else "APPLIED — orders updated"
     lines = [
         f"PROTECTIVE ORDER REFRESH — {now.strftime('%Y-%m-%d %H:%M')}  [{mode_label}]",
         "=" * 72,
         f"Scanned: {total}  |  Already correct: {len(rows_ok)}  |  {'Would update' if dry_run else 'Updated'}: {len(rows_changed)}",
         "",
-        f"  {'TICKER':<10}  {'DIR':<6}  {'QTY':>7}  {'AVG COST':>10}  {'STP':>10}  {'LMT':>10}  {'TP SRC':<8}  CHANGES",
-        "  " + "-" * 75,
     ]
-    for r in rows_changed:
-        lines.append(
-            f"  {r['ticker']:<10}  {r['direction']:<6}  {r['quantity']:>7}"
-            f"  {r['avg_cost']:>10.4f}  {r['correct_stp']:>10.4f}  {r['correct_lmt']:>10.4f}"
-            f"  {r['tp_source']+' '+str(r['tp_pct'])+'%':<8}  {' | '.join(r['changes'])}"
-        )
+
+    if rows_changed:
+        lines += [
+            f"  {'TICKER':<10}  {'DIR':<6}  {'QTY':>7}  {'AVG COST':>10}  {'STP':>10}  {'LMT':>10}  {'TP SRC':<8}  CHANGES",
+            "  " + "-" * 75,
+        ]
+        for r in rows_changed:
+            lines.append(
+                f"  {r['ticker']:<10}  {r['direction']:<6}  {r['quantity']:>7}"
+                f"  {r['avg_cost']:>10.4f}  {r['correct_stp']:>10.4f}  {r['correct_lmt']:>10.4f}"
+                f"  {r['tp_source']+' '+str(r['tp_pct'])+'%':<8}  {' | '.join(r['changes'])}"
+            )
+    else:
+        lines.append("  All positions already have correct STP + LMT prices. Nothing changed.")
+
+    if rows_ok:
+        lines += ["", "  Positions already OK (no changes):"]
+        for sym in rows_ok:
+            lines.append(f"    ✓ {sym}")
     lines += [
         "",
         f"Stop-loss  : {risk.stop_loss_pct * 100:.0f}% from avg cost (fixed)",
