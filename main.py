@@ -1244,6 +1244,18 @@ def run_force_rebalance(args, cfg) -> None:
 
         logger.info("=== Force-rebalance complete — scheduler_state.json NOT modified ===")
 
+        # Record NAV snapshot for live-report tracking
+        if not cfg.dry_run:
+            try:
+                from taurus.live_reporting import record_nav_snapshot
+                from taurus.execution import IBKRConnection, PositionReconciler
+                _rec = PositionReconciler()
+                _nav = _rec.get_account_nav(conn, currency=None)
+                record_nav_snapshot(_nav, "USD", args.output, note="force-rebalance")
+                logger.info("NAV snapshot recorded: %.2f USD", _nav)
+            except Exception as _e:
+                logger.warning("Could not record NAV snapshot: %s", _e)
+
     finally:
         conn.disconnect()
 
