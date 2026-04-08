@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance", "check-protective"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -636,6 +636,155 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
     return cancelled
 
 
+def run_check_protective(args, cfg) -> None:
+    """
+    Check that every live position has both a stop-loss (STP) and a
+    take-profit (LMT) order.  Does NOT place or modify any orders.
+
+    Positions with missing protective orders are written to:
+        output/protective_adjustment_<date_time>.txt   (human-readable)
+        output/protective_adjustment_<date_time>.json  (machine-readable)
+
+    Usage:
+        python main.py --mode check-protective --live
+    """
+    import os, json
+    from datetime import datetime
+    from taurus.execution import IBKRConnection, _round_price
+    from taurus.risk import RiskConfig
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot connect to IBKR — is TWS/Gateway running?")
+        return
+
+    risk = RiskConfig()
+
+    # ── 1. Live positions ────────────────────────────────────────────────────
+    raw_positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
+    live = [p for p in raw_positions if p.position != 0]
+    if not live:
+        logger.info("No live positions found.")
+        conn.ib.disconnect()
+        return
+
+    # ── 2. Open protective orders indexed by symbol ──────────────────────────
+    PROTECTIVE = {"STP", "LMT"}
+    ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
+    open_prot: dict = {}   # {symbol: {"STP": [trade, ...], "LMT": [trade, ...]}}
+    try:
+        for trade in conn.ib.openTrades():
+            if trade.order.orderType not in PROTECTIVE:
+                continue
+            if trade.orderStatus.status not in ACTIVE:
+                continue
+            sym = trade.contract.symbol
+            ot  = trade.order.orderType
+            open_prot.setdefault(sym, {}).setdefault(ot, []).append(trade)
+    except Exception as e:
+        logger.warning("Could not read open trades: %s", e)
+
+    conn.ib.disconnect()
+
+    # ── 3. Compare ───────────────────────────────────────────────────────────
+    rows_ok:      list = []
+    rows_missing: list = []
+
+    for p in live:
+        sym      = p.contract.symbol
+        qty      = p.position
+        avg_cost = p.avgCost
+        currency = p.contract.currency
+        is_long  = qty > 0
+
+        orders = open_prot.get(sym, {})
+        has_stp = bool(orders.get("STP"))
+        has_lmt = bool(orders.get("LMT"))
+
+        if has_stp and has_lmt:
+            rows_ok.append(sym)
+            continue
+
+        # Compute correct prices from avg_cost + configured risk params
+        entry = avg_cost
+        if is_long:
+            stp_price = _round_price(entry * (1 - risk.stop_loss_pct),  currency)
+            lmt_price = _round_price(entry * (1 + risk.take_profit_pct), currency)
+        else:
+            stp_price = _round_price(entry * (1 + risk.stop_loss_pct),  currency)
+            lmt_price = _round_price(entry * (1 - risk.take_profit_pct), currency)
+
+        missing_tags = (["STP"] if not has_stp else []) + (["LMT"] if not has_lmt else [])
+        rows_missing.append({
+            "ticker":      sym,
+            "quantity":    int(qty),
+            "direction":   "LONG" if is_long else "SHORT",
+            "avg_cost":    round(avg_cost, 4),
+            "currency":    currency,
+            "action":      "SELL" if is_long else "BUY",
+            "missing":     missing_tags,
+            "stp_price":   stp_price,
+            "lmt_price":   lmt_price,
+            "stp_tif":     "GTC",
+            "lmt_tif":     "GTC",
+        })
+
+    # ── 4. Console summary ───────────────────────────────────────────────────
+    total = len(rows_ok) + len(rows_missing)
+    if not rows_missing:
+        logger.info(
+            "All %d positions have STP + LMT orders. Nothing to do.", total
+        )
+        return
+
+    logger.warning(
+        "%d/%d positions are missing protective orders — see report in %s/",
+        len(rows_missing), total, args.output,
+    )
+
+    # ── 5. Write report ──────────────────────────────────────────────────────
+    now      = datetime.now()
+    date_str = now.strftime("%Y-%m-%d_%H%M")
+    os.makedirs(args.output, exist_ok=True)
+    base = os.path.join(args.output, f"protective_adjustment_{date_str}")
+
+    col = f"  {'TICKER':<10}  {'DIR':<6}  {'QTY':>7}  {'AVG COST':>12}  {'STP':>12}  {'LMT':>12}  {'CCY':<5}  MISSING"
+    lines = [
+        f"PROTECTIVE ORDER ADJUSTMENT — {now.strftime('%Y-%m-%d %H:%M')}",
+        "=" * 72,
+        f"Total positions: {total}  |  OK: {len(rows_ok)}  |  Missing: {len(rows_missing)}",
+        "",
+        "Enter these orders manually in TWS (order type GTC):",
+        "",
+        col,
+        "  " + "-" * 72,
+    ]
+    for r in rows_missing:
+        lines.append(
+            f"  {r['ticker']:<10}  {r['direction']:<6}  {r['quantity']:>7}"
+            f"  {r['avg_cost']:>12.4f}  {r['stp_price']:>12.4f}  {r['lmt_price']:>12.4f}"
+            f"  {r['currency']:<5}  {'+'.join(r['missing'])}"
+        )
+    lines += [
+        "",
+        f"Stop-loss  : {risk.stop_loss_pct * 100:.0f}% from average cost",
+        f"Take-profit: {risk.take_profit_pct * 100:.0f}% from average cost",
+        "All prices rounded to exchange tick size (TSE rules for JPY).",
+    ]
+
+    txt_path = base + ".txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    json_path = base + ".json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows_missing, f, indent=2, default=str)
+
+    # Also print to terminal
+    print("\n".join(lines))
+    logger.info("Report saved → %s (.txt / .json)", base)
+
+
 def run_force_rebalance(args, cfg) -> None:
     """
     Force-rebalance specific universe(s) NOW, bypassing the end-of-month check.
@@ -768,6 +917,8 @@ def main() -> None:
         run_live_report(args, cfg)
     elif args.mode == "force-rebalance":
         run_force_rebalance(args, cfg)
+    elif args.mode == "check-protective":
+        run_check_protective(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)
