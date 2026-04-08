@@ -595,13 +595,19 @@ class OrderManager:
         stp_price_rounded = _round_price(stop_price, universe_cfg.currency)
         lmt_price_rounded = _round_price(tp_price,   universe_cfg.currency)
 
-        # Standalone STP (GTC, no parentId)
+        # OCA group: when STP fills IBKR auto-cancels LMT and vice-versa.
+        # Prevents zombie orders after the position is closed by one of them.
+        oca_group = f"TRS_{ibkr_ticker}_{id(conn)}"
+
+        # Standalone STP (GTC, OCA)
         stp               = Order()
         stp.action        = stop_action
         stp.orderType     = "STP"
         stp.tif           = "GTC"
         stp.totalQuantity = pos_qty
         stp.auxPrice      = stp_price_rounded
+        stp.ocaGroup      = oca_group
+        stp.ocaType       = 1   # cancel with block
         stp.transmit      = True
         try:
             stp_trade = conn.ib.placeOrder(contract, stp)
@@ -620,9 +626,11 @@ class OrderManager:
         except Exception as e:
             logger.error("Failed to place STP for %s: %s", ibkr_ticker, e)
 
-        # Standalone LMT (GTC, no parentId)
+        # Standalone LMT (GTC, same OCA group)
         lmt           = LimitOrder(stop_action, pos_qty, lmt_price_rounded)
         lmt.tif       = "GTC"
+        lmt.ocaGroup  = oca_group
+        lmt.ocaType   = 1
         lmt.transmit  = True
         try:
             lmt_trade = conn.ib.placeOrder(contract, lmt)
