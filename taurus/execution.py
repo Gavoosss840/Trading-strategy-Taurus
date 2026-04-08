@@ -589,31 +589,57 @@ class OrderManager:
         contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
         try:
             conn.ib.qualifyContracts(contract)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("qualifyContracts failed for %s: %s — using unqualified contract", ibkr_ticker, e)
+
+        stp_price_rounded = _round_price(stop_price, universe_cfg.currency)
+        lmt_price_rounded = _round_price(tp_price,   universe_cfg.currency)
 
         # Standalone STP (GTC, no parentId)
-        stp             = Order()
-        stp.action      = stop_action
-        stp.orderType   = "STP"
-        stp.tif         = "GTC"
+        stp               = Order()
+        stp.action        = stop_action
+        stp.orderType     = "STP"
+        stp.tif           = "GTC"
         stp.totalQuantity = pos_qty
-        stp.auxPrice    = _round_price(stop_price, universe_cfg.currency)
-        stp.transmit    = True
-        conn.ib.placeOrder(contract, stp)
+        stp.auxPrice      = stp_price_rounded
+        stp.transmit      = True
+        try:
+            stp_trade = conn.ib.placeOrder(contract, stp)
+            conn.ib.sleep(0.5)   # let IBKR process before placing the second order
+            if stp_trade.orderStatus.status == "Inactive":
+                logger.error(
+                    "STP order for %s was REJECTED by IBKR (Inactive) — price=%g",
+                    ibkr_ticker, stp_price_rounded,
+                )
+            else:
+                logger.info(
+                    "STP placed for %s: qty=%.0f  price=%g (-%.0f%%)  status=%s",
+                    ibkr_ticker, pos_qty, stp_price_rounded,
+                    stop_pct * 100, stp_trade.orderStatus.status,
+                )
+        except Exception as e:
+            logger.error("Failed to place STP for %s: %s", ibkr_ticker, e)
 
         # Standalone LMT (GTC, no parentId)
-        lmt             = LimitOrder(stop_action, pos_qty, _round_price(tp_price, universe_cfg.currency))
-        lmt.tif         = "GTC"
-        lmt.transmit    = True
-        conn.ib.placeOrder(contract, lmt)
-
-        logger.info(
-            "Restored STP+LMT for %s: qty=%.0f  STP=%g (-%.0f%%)  LMT=%g (+%.0f%%)",
-            ibkr_ticker, pos_qty,
-            round(stop_price, 2), stop_pct * 100,
-            round(tp_price, 2),   take_profit_pct * 100,
-        )
+        lmt           = LimitOrder(stop_action, pos_qty, lmt_price_rounded)
+        lmt.tif       = "GTC"
+        lmt.transmit  = True
+        try:
+            lmt_trade = conn.ib.placeOrder(contract, lmt)
+            conn.ib.sleep(0.3)
+            if lmt_trade.orderStatus.status == "Inactive":
+                logger.error(
+                    "LMT order for %s was REJECTED by IBKR (Inactive) — price=%g",
+                    ibkr_ticker, lmt_price_rounded,
+                )
+            else:
+                logger.info(
+                    "LMT placed for %s: qty=%.0f  price=%g (+%.0f%%)  status=%s",
+                    ibkr_ticker, pos_qty, lmt_price_rounded,
+                    take_profit_pct * 100, lmt_trade.orderStatus.status,
+                )
+        except Exception as e:
+            logger.error("Failed to place LMT for %s: %s", ibkr_ticker, e)
 
     def place_order(
         self,

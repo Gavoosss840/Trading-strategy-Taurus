@@ -807,14 +807,62 @@ def run_refresh_protective(args, cfg) -> None:
             if ucfg is None:
                 logger.warning("  No universe config for currency %s — skipping %s", currency, sym)
                 continue
-            order_mgr.cancel_protective_orders(conn, sym, dry_run=False)
-            conn.ib.sleep(0.3)
-            order_mgr.place_protective_only(
-                conn, sym, abs(qty), avg_cost, ucfg,
-                stop_pct        = risk.stop_loss_pct,
-                take_profit_pct = tp_frac,
-                dry_run         = False,
-            )
+
+            from ib_insync import Stock, Order, LimitOrder
+            ibkr_sym  = sym.split(".")[0] if "." in sym else sym
+            contract  = Stock(ibkr_sym, ucfg.ibkr_exchange, ucfg.currency)
+            try:
+                conn.ib.qualifyContracts(contract)
+            except Exception:
+                pass
+
+            pos_qty       = abs(qty)
+            protect_action = "SELL" if qty > 0 else "BUY"
+
+            # Surgical cancel + replace — only touch the order type that is wrong
+            # so a correct STP is never needlessly cancelled when only LMT is wrong
+
+            if not stp_ok:
+                # Cancel existing STP orders for this ticker
+                ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
+                for trade in conn.ib.openTrades():
+                    if (trade.contract.symbol == ibkr_sym
+                            and trade.order.orderType == "STP"
+                            and trade.orderStatus.status in ACTIVE):
+                        conn.ib.cancelOrder(trade.order)
+                conn.ib.sleep(1.0)
+                stp_o               = Order()
+                stp_o.action        = protect_action
+                stp_o.orderType     = "STP"
+                stp_o.tif           = "GTC"
+                stp_o.totalQuantity = pos_qty
+                stp_o.auxPrice      = correct_stp
+                stp_o.transmit      = True
+                try:
+                    t = conn.ib.placeOrder(contract, stp_o)
+                    conn.ib.sleep(0.5)
+                    logger.info("  STP placed %s: %g  [%s]", sym, correct_stp, t.orderStatus.status)
+                except Exception as e:
+                    logger.error("  STP FAILED %s: %s", sym, e)
+
+            if not lmt_ok:
+                # Cancel existing LMT orders for this ticker
+                ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
+                for trade in conn.ib.openTrades():
+                    if (trade.contract.symbol == ibkr_sym
+                            and trade.order.orderType == "LMT"
+                            and trade.orderStatus.status in ACTIVE):
+                        conn.ib.cancelOrder(trade.order)
+                conn.ib.sleep(1.0)
+                lmt_o           = LimitOrder(protect_action, pos_qty, correct_lmt)
+                lmt_o.tif       = "GTC"
+                lmt_o.transmit  = True
+                try:
+                    t = conn.ib.placeOrder(contract, lmt_o)
+                    conn.ib.sleep(0.5)
+                    logger.info("  LMT placed %s: %g  [%s]", sym, correct_lmt, t.orderStatus.status)
+                except Exception as e:
+                    logger.error("  LMT FAILED %s: %s", sym, e)
 
     conn.ib.disconnect()
 
