@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance", "check-protective"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance", "check-protective", "refresh-protective"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -636,6 +636,227 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
     return cancelled
 
 
+def run_refresh_protective(args, cfg) -> None:
+    """
+    Scan ALL live positions and refresh STP/LMT orders to the correct prices.
+
+    Rules:
+      - STP = avg_cost × (1 ± stop_loss_pct)
+      - LMT = avg_cost × (1 ± mm_tp_pct)   [from last execution report, else flat 20%]
+      - If existing order price is within 0.5% of correct → leave it alone
+      - If wrong price OR missing → cancel stale order + place fresh GTC order
+      - MKT/entry orders are NEVER touched (no rebalancing)
+
+    Dry-run by default (shows what would change).
+    Use --no-dry-run to actually submit the corrected orders.
+
+    Writes a report to output/protective_adjustment_<date>.txt / .json
+
+    Usage:
+        python main.py --mode refresh-protective              # dry-run preview
+        python main.py --mode refresh-protective --no-dry-run # apply corrections
+    """
+    import os, json, glob as _glob
+    from datetime import datetime
+    from taurus.execution import IBKRConnection, OrderManager, _round_price
+    from taurus.risk import RiskConfig
+    from taurus.universe import REGISTRY
+
+    dry_run = not args.no_dry_run
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot connect to IBKR — is TWS/Gateway running?")
+        return
+
+    risk      = RiskConfig()
+    order_mgr = OrderManager()
+
+    # ── 0. Load MM take-profit pcts from last execution reports ─────────────
+    MIN_TP, MAX_TP = 0.05, 0.80
+    mm_tp_pcts: dict = {}
+    for report_path in _glob.glob(os.path.join(args.output, "execution_*.json")):
+        try:
+            with open(report_path) as f:
+                rep = json.load(f)
+            for order in rep.get("orders", []):
+                t  = order.get("ticker", "")
+                tp = order.get("tp_pct", None)
+                if t and tp is not None:
+                    mm_tp_pcts[t] = max(MIN_TP, min(float(tp), MAX_TP))
+        except Exception:
+            pass
+    if mm_tp_pcts:
+        logger.info("MM take-profit levels loaded for %d tickers", len(mm_tp_pcts))
+
+    # ── 0b. Build currency → universe_cfg for exchange lookup ───────────────
+    currency_to_ucfg: dict = {}
+    for uname in REGISTRY.all_names():
+        ucfg = REGISTRY.get(uname)
+        currency_to_ucfg.setdefault(ucfg.currency, ucfg)
+
+    # ── 1. Live positions ────────────────────────────────────────────────────
+    raw_positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
+    live = [p for p in raw_positions if p.position != 0]
+    if not live:
+        logger.info("No live positions found.")
+        conn.ib.disconnect()
+        return
+
+    # ── 2. Open protective orders by symbol ─────────────────────────────────
+    PROTECTIVE = {"STP", "LMT"}
+    ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
+    open_prot: dict = {}
+    try:
+        for trade in conn.ib.openTrades():
+            if trade.order.orderType not in PROTECTIVE:
+                continue
+            if trade.orderStatus.status not in ACTIVE:
+                continue
+            sym = trade.contract.symbol
+            ot  = trade.order.orderType
+            open_prot.setdefault(sym, {}).setdefault(ot, []).append(trade)
+    except Exception as e:
+        logger.warning("Could not read open trades: %s", e)
+
+    # ── 3. Scan every position ───────────────────────────────────────────────
+    TOLERANCE    = 0.005   # 0.5% — don't replace if price is already close enough
+    rows_ok:     list = []
+    rows_changed: list = []
+
+    for p in live:
+        sym      = p.contract.symbol
+        qty      = p.position
+        avg_cost = p.avgCost
+        currency = p.contract.currency
+        is_long  = qty > 0
+
+        tp_frac = mm_tp_pcts.get(sym, risk.take_profit_pct)
+
+        if is_long:
+            correct_stp = _round_price(avg_cost * (1 - risk.stop_loss_pct), currency)
+            correct_lmt = _round_price(avg_cost * (1 + tp_frac),            currency)
+            protect_action = "SELL"
+        else:
+            correct_stp = _round_price(avg_cost * (1 + risk.stop_loss_pct), currency)
+            correct_lmt = _round_price(avg_cost * (1 - tp_frac),            currency)
+            protect_action = "BUY"
+
+        orders       = open_prot.get(sym, {})
+        exist_stps   = orders.get("STP", [])
+        exist_lmts   = orders.get("LMT", [])
+
+        # Check STP price
+        stp_ok = False
+        if exist_stps:
+            cur_stp = exist_stps[0].order.auxPrice
+            stp_ok  = (cur_stp > 0 and abs(cur_stp - correct_stp) / correct_stp < TOLERANCE)
+
+        # Check LMT price
+        lmt_ok = False
+        if exist_lmts:
+            cur_lmt = exist_lmts[0].order.lmtPrice
+            lmt_ok  = (cur_lmt > 0 and abs(cur_lmt - correct_lmt) / correct_lmt < TOLERANCE)
+
+        if stp_ok and lmt_ok:
+            rows_ok.append(sym)
+            logger.info("  ✓ %-10s  STP=%-10.4f  LMT=%-10.4f  [OK]", sym, correct_stp, correct_lmt)
+            continue
+
+        # Something needs fixing
+        change_tags = []
+        if not stp_ok:
+            old = exist_stps[0].order.auxPrice if exist_stps else None
+            change_tags.append(f"STP {old:.4f}→{correct_stp:.4f}" if old else f"STP missing→{correct_stp:.4f}")
+        if not lmt_ok:
+            old = exist_lmts[0].order.lmtPrice if exist_lmts else None
+            change_tags.append(f"LMT {old:.4f}→{correct_lmt:.4f}" if old else f"LMT missing→{correct_lmt:.4f}")
+
+        rows_changed.append({
+            "ticker":       sym,
+            "quantity":     int(qty),
+            "direction":    "LONG" if is_long else "SHORT",
+            "avg_cost":     round(avg_cost, 4),
+            "currency":     currency,
+            "action":       protect_action,
+            "correct_stp":  correct_stp,
+            "correct_lmt":  correct_lmt,
+            "tp_source":    "MM" if sym in mm_tp_pcts else "flat",
+            "tp_pct":       round(tp_frac * 100, 1),
+            "changes":      change_tags,
+            "applied":      not dry_run,
+        })
+
+        icon = "[DRY RUN]" if dry_run else "  ✗"
+        logger.info(
+            "%s %-10s  %s  →  STP=%.4f  LMT=%.4f  (tp_src=%s %.1f%%)",
+            icon, sym, " | ".join(change_tags),
+            correct_stp, correct_lmt,
+            "MM" if sym in mm_tp_pcts else "flat", tp_frac * 100,
+        )
+
+        if not dry_run:
+            ucfg = currency_to_ucfg.get(currency)
+            if ucfg is None:
+                logger.warning("  No universe config for currency %s — skipping %s", currency, sym)
+                continue
+            order_mgr.cancel_protective_orders(conn, sym, dry_run=False)
+            conn.ib.sleep(0.3)
+            order_mgr.place_protective_only(
+                conn, sym, abs(qty), avg_cost, ucfg,
+                stop_pct        = risk.stop_loss_pct,
+                take_profit_pct = tp_frac,
+                dry_run         = False,
+            )
+
+    conn.ib.disconnect()
+
+    # ── 4. Report ────────────────────────────────────────────────────────────
+    total = len(rows_ok) + len(rows_changed)
+    if not rows_changed:
+        logger.info("All %d positions already have correct STP + LMT. Nothing to do.", total)
+        return
+
+    now      = datetime.now()
+    date_str = now.strftime("%Y-%m-%d_%H%M")
+    os.makedirs(args.output, exist_ok=True)
+    base = os.path.join(args.output, f"protective_adjustment_{date_str}")
+
+    mode_label = "DRY RUN — no orders submitted" if dry_run else "APPLIED — orders updated"
+    lines = [
+        f"PROTECTIVE ORDER REFRESH — {now.strftime('%Y-%m-%d %H:%M')}  [{mode_label}]",
+        "=" * 72,
+        f"Scanned: {total}  |  Already correct: {len(rows_ok)}  |  {'Would update' if dry_run else 'Updated'}: {len(rows_changed)}",
+        "",
+        f"  {'TICKER':<10}  {'DIR':<6}  {'QTY':>7}  {'AVG COST':>10}  {'STP':>10}  {'LMT':>10}  {'TP SRC':<8}  CHANGES",
+        "  " + "-" * 75,
+    ]
+    for r in rows_changed:
+        lines.append(
+            f"  {r['ticker']:<10}  {r['direction']:<6}  {r['quantity']:>7}"
+            f"  {r['avg_cost']:>10.4f}  {r['correct_stp']:>10.4f}  {r['correct_lmt']:>10.4f}"
+            f"  {r['tp_source']+' '+str(r['tp_pct'])+'%':<8}  {' | '.join(r['changes'])}"
+        )
+    lines += [
+        "",
+        f"Stop-loss  : {risk.stop_loss_pct * 100:.0f}% from avg cost (fixed)",
+        f"Take-profit: MM fair-value divergence where available, else flat {risk.take_profit_pct*100:.0f}%",
+        "",
+        "Note: only STP/LMT orders were touched. Entry (MKT) orders and positions unchanged.",
+    ]
+
+    txt_path = base + ".txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    json_path = base + ".json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows_changed, f, indent=2, default=str)
+
+    print("\n".join(lines))
+    logger.info("Report saved → %s (.txt / .json)", base)
+
+
 def run_check_protective(args, cfg) -> None:
     """
     Check that every live position has both a stop-loss (STP) and a
@@ -944,6 +1165,8 @@ def main() -> None:
         run_force_rebalance(args, cfg)
     elif args.mode == "check-protective":
         run_check_protective(args, cfg)
+    elif args.mode == "refresh-protective":
+        run_refresh_protective(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)
