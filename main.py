@@ -701,14 +701,34 @@ def run_refresh_protective(args, cfg) -> None:
     live = [p for p in raw_positions if p.position != 0]
     logger.info("Live positions fetched: %d total (%d non-zero)",
                 len(raw_positions), len(live))
-    for p in live:
-        logger.debug("  position: %s  qty=%s  currency=%s  avgCost=%s",
-                     p.contract.symbol, p.position,
-                     p.contract.currency, p.avgCost)
     if not live:
         logger.info("No live positions found.")
         conn.ib.disconnect()
         return
+
+    # ── 1b. Current market prices — used to guard against immediate LMT fills
+    # A BUY LMT for a short executes immediately if market <= lmt_price.
+    # A SELL LMT for a long executes immediately if market >= lmt_price.
+    # We fetch prices here so we can skip placing an LMT that would fill at once.
+    live_prices: dict = {}   # {symbol: last_price}
+    try:
+        from ib_insync import Stock
+        from taurus.execution import OrderManager
+        _om = OrderManager()
+        all_syms = [p.contract.symbol for p in live]
+        for p in live:
+            ibkr_sym = p.contract.symbol.split(".")[0] if "." in p.contract.symbol else p.contract.symbol
+            currency = p.contract.currency
+            ucfg_tmp = currency_to_ucfg.get(currency)
+            if ucfg_tmp is None:
+                continue
+            price_map = _om.get_live_prices(conn, [ibkr_sym], ucfg_tmp)
+            if ibkr_sym in price_map and price_map[ibkr_sym] > 0:
+                live_prices[ibkr_sym] = price_map[ibkr_sym]
+        if live_prices:
+            logger.info("Live prices fetched for %d/%d positions", len(live_prices), len(live))
+    except Exception as e:
+        logger.warning("Could not fetch live prices (will skip LMT safety check): %s", e)
 
     # ── 2. Open protective orders by symbol ─────────────────────────────────
     PROTECTIVE = {"STP", "LMT"}
@@ -846,23 +866,46 @@ def run_refresh_protective(args, cfg) -> None:
                     logger.error("  STP FAILED %s: %s", sym, e)
 
             if not lmt_ok:
-                # Cancel existing LMT orders for this ticker
-                ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
-                for trade in conn.ib.openTrades():
-                    if (trade.contract.symbol == ibkr_sym
-                            and trade.order.orderType == "LMT"
-                            and trade.orderStatus.status in ACTIVE):
-                        conn.ib.cancelOrder(trade.order)
-                conn.ib.sleep(1.0)
-                lmt_o           = LimitOrder(protect_action, pos_qty, correct_lmt)
-                lmt_o.tif       = "GTC"
-                lmt_o.transmit  = True
-                try:
-                    t = conn.ib.placeOrder(contract, lmt_o)
-                    conn.ib.sleep(0.5)
-                    logger.info("  LMT placed %s: %g  [%s]", sym, correct_lmt, t.orderStatus.status)
-                except Exception as e:
-                    logger.error("  LMT FAILED %s: %s", sym, e)
+                # Safety check: would this LMT execute immediately?
+                # BUY LMT (short take profit) executes if current_price <= lmt_price
+                # SELL LMT (long take profit) executes if current_price >= lmt_price
+                current_price = live_prices.get(ibkr_sym, 0.0)
+                would_execute_immediately = False
+                if current_price > 0:
+                    if protect_action == "BUY"  and current_price <= correct_lmt:
+                        would_execute_immediately = True
+                    if protect_action == "SELL" and current_price >= correct_lmt:
+                        would_execute_immediately = True
+
+                if would_execute_immediately:
+                    logger.warning(
+                        "  SKIPPED LMT %s: price %.4f already at/past take-profit %.4f "
+                        "— position is in profit, close manually or wait for next rebalancing.",
+                        sym, current_price, correct_lmt,
+                    )
+                    # Mark in report
+                    for r in rows_changed:
+                        if r["ticker"] == sym:
+                            r["changes"] = [c for c in r["changes"] if "LMT" not in c]
+                            r["changes"].append(f"LMT SKIPPED (mkt {current_price:.4f} already past {correct_lmt:.4f})")
+                else:
+                    # Cancel existing LMT orders for this ticker
+                    ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
+                    for trade in conn.ib.openTrades():
+                        if (trade.contract.symbol == ibkr_sym
+                                and trade.order.orderType == "LMT"
+                                and trade.orderStatus.status in ACTIVE):
+                            conn.ib.cancelOrder(trade.order)
+                    conn.ib.sleep(1.0)
+                    lmt_o           = LimitOrder(protect_action, pos_qty, correct_lmt)
+                    lmt_o.tif       = "GTC"
+                    lmt_o.transmit  = True
+                    try:
+                        t = conn.ib.placeOrder(contract, lmt_o)
+                        conn.ib.sleep(0.5)
+                        logger.info("  LMT placed %s: %g  [%s]", sym, correct_lmt, t.orderStatus.status)
+                    except Exception as e:
+                        logger.error("  LMT FAILED %s: %s", sym, e)
 
     conn.ib.disconnect()
 
