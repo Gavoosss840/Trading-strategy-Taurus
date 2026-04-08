@@ -699,6 +699,12 @@ def run_refresh_protective(args, cfg) -> None:
     # ── 1. Live positions ────────────────────────────────────────────────────
     raw_positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
     live = [p for p in raw_positions if p.position != 0]
+    logger.info("Live positions fetched: %d total (%d non-zero)",
+                len(raw_positions), len(live))
+    for p in live:
+        logger.debug("  position: %s  qty=%s  currency=%s  avgCost=%s",
+                     p.contract.symbol, p.position,
+                     p.contract.currency, p.avgCost)
     if not live:
         logger.info("No live positions found.")
         conn.ib.disconnect()
@@ -817,6 +823,13 @@ def run_refresh_protective(args, cfg) -> None:
     now        = datetime.now()
     date_str   = now.strftime("%Y-%m-%d_%H%M")
     os.makedirs(args.output, exist_ok=True)
+
+    # Delete previous protective_adjustment reports before writing the new one
+    for old in _glob.glob(os.path.join(args.output, "protective_adjustment_*")):
+        try:
+            os.remove(old)
+        except Exception:
+            pass
     base       = os.path.join(args.output, f"protective_adjustment_{date_str}")
     mode_label = "DRY RUN — no orders submitted" if dry_run else "APPLIED — orders updated in TWS"
 
