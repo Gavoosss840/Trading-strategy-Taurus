@@ -27,7 +27,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import norm, t as _t_dist
 
 from .config import TaurusConfig, DEFAULT_CONFIG
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 #  Single-stock MM valuation                                                   #
 # --------------------------------------------------------------------------- #
 
-def _mm_valuation(row: pd.Series, rf: float = 0.045) -> Dict:
+def _mm_valuation(row: pd.Series, rf: float = 0.045, return_df: Optional[float] = None) -> Dict:
     """
     Compute MM theoretical value for one stock from a fundamentals row.
 
@@ -95,7 +95,11 @@ def _mm_valuation(row: pd.Series, rf: float = 0.045) -> Dict:
     try:
         d2 = (np.log(V_firm / D) + (mu - 0.5 * sigma_assets**2) * T) \
              / (sigma_assets * np.sqrt(T))
-        prob_default = float(norm.cdf(-d2))
+        # Use Student-t for fat-tail default probability when return_df is set
+        if return_df is not None and return_df > 2:
+            prob_default = float(_t_dist.cdf(-d2, df=return_df))
+        else:
+            prob_default = float(norm.cdf(-d2))
     except Exception:
         prob_default = 0.0
 
@@ -182,6 +186,7 @@ def mm_capital_structure_screen(
     """
     rf = cfg.risk_free_rate_annual
     threshold = cfg.leverage_gap_threshold * 100   # convert to %
+    return_df = getattr(cfg, "return_df", None)
 
     # Attach historical vol if returns provided
     df = fundamentals.copy()
@@ -191,7 +196,7 @@ def mm_capital_structure_screen(
     # Run MM valuation row-by-row (fast enough for 500 stocks)
     rows = []
     for ticker, row in df.iterrows():
-        result = _mm_valuation(row, rf=rf)
+        result = _mm_valuation(row, rf=rf, return_df=return_df)
         result["ticker"] = ticker
         rows.append(result)
 

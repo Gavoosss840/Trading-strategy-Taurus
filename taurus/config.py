@@ -50,7 +50,23 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     lookback_months: int = 60            # Rolling OLS window
     min_obs: int = 36                    # Minimum observations for fit
-    alpha_tstat_threshold: float = 2.0   # |t| > 2 to keep stock
+    alpha_tstat_threshold: float = 2.0   # |t| > threshold to keep stock
+                                         # (interpreted as Student-t quantile
+                                         #  when return_df is set)
+
+    # ------------------------------------------------------------------ #
+    #  Return distribution                                                #
+    # ------------------------------------------------------------------ #
+    # Degrees of freedom for Student-t model of equity returns.
+    # Empirical studies find ν ≈ 3–7 for daily/monthly equity returns.
+    # ν = 5 is a common conservative choice (fatter tails than normal,
+    # but finite variance).  Set to None to use Normal (ν → ∞).
+    #
+    # Effects:
+    #   • factors.py   — t-stat threshold uses t.ppf(0.975, df=ν) per stock
+    #   • capital_structure.py — Merton default prob uses t.cdf(-d2, df=ν)
+    #   • portfolio.py — covariance inflated by ν/(ν-2) for fat-tail variance
+    return_df: float = 5.0              # Student-t degrees of freedom
 
     # ------------------------------------------------------------------ #
     #  Capital structure  (MM screen)                                     #

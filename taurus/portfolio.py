@@ -79,6 +79,14 @@ def estimate_covariance(
     eigvals = np.maximum(eigvals, cfg.cov_min_eigenvalue)
     cov_psd = (eigvecs * eigvals) @ eigvecs.T
 
+    # Fat-tail variance inflation: for Student-t(ν), Var = σ² × ν/(ν-2)
+    # This produces more conservative (larger) position sizes for volatile stocks.
+    return_df = getattr(cfg, "return_df", None)
+    if return_df is not None and return_df > 2:
+        inflation = return_df / (return_df - 2.0)
+        cov_psd = cov_psd * inflation
+        logger.debug("Covariance inflated by ν/(ν-2)=%.4f (Student-t, ν=%.1f).", inflation, return_df)
+
     return cov_psd
 
 

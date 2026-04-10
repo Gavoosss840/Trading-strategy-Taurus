@@ -186,14 +186,36 @@ def compute_ff5_alpha(
         index=tickers,
     )
 
-    result["signal"] = result["alpha_tstat"].abs() >= cfg.alpha_tstat_threshold
+    # ── Signal: |t| ≥ threshold ──────────────────────────────────────────── #
+    # With a Student-t distribution (ν degrees of freedom), the correct
+    # two-sided 5% critical value is t.ppf(0.975, df=ν), not 1.96.
+    # For finite samples: df_resid = T - K (T obs, K=6 regressors).
+    # When return_df is set we also account for fat tails in the residuals
+    # by using the configured ν as an upper bound on the effective df.
+    K = X.shape[1]          # number of regressors (6: intercept + 5 factors)
+    df_resid = T - K        # residual degrees of freedom
+
+    return_df = getattr(cfg, "return_df", None)
+    if return_df is not None and return_df > 2:
+        from scipy.stats import t as _t
+        # Effective df = min(sample residual df, configured ν)
+        # → conservative (lower df = fatter tails = higher critical value)
+        eff_df   = min(df_resid, return_df)
+        t_crit   = float(_t.ppf(0.975, df=eff_df))
+        dist_label = f"Student-t(ν={eff_df:.0f})"
+    else:
+        t_crit     = cfg.alpha_tstat_threshold
+        dist_label = "Normal (ν→∞)"
+
+    result["signal"] = result["alpha_tstat"].abs() >= t_crit
     result["alpha_sign"] = np.sign(result["alpha_monthly"])   # +1 / -1
 
     logger.info(
-        "FF5 regression: %d stocks, %d with |t|≥%.1f (%.0f%%).",
+        "FF5 regression: %d stocks, %d with |t|≥%.3f [%s, p<5%% two-sided] (%.0f%%).",
         len(tickers),
         result["signal"].sum(),
-        cfg.alpha_tstat_threshold,
+        t_crit,
+        dist_label,
         100 * result["signal"].mean(),
     )
     return result
