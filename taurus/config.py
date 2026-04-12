@@ -46,87 +46,99 @@ class TaurusConfig:
     min_market_cap_usd: float = 2e9      # Drop micro-caps (<$2 B)
 
     # ------------------------------------------------------------------ #
-    #  Factor model  (FF5 + SML alpha)                                    #
+    #  Factor model  (FF5/FF6 + SML alpha)                                #
     # ------------------------------------------------------------------ #
     lookback_months: int = 60            # Rolling OLS window
     min_obs: int = 36                    # Minimum observations for fit
-    alpha_tstat_threshold: float = 2.0   # |t| > threshold to keep stock
-                                         # (interpreted as Student-t quantile
-                                         #  when return_df is set)
+    alpha_tstat_threshold: float = 2.0   # |t| > threshold (Student-t when return_df set)
+    use_umd_factor: bool = True          # FF6: include UMD momentum factor in regression
+                                         # Removes momentum from alpha → purer signal
 
     # ------------------------------------------------------------------ #
-    #  Return distribution                                                #
+    #  Return distribution  (Student-t fat tails)                         #
     # ------------------------------------------------------------------ #
-    # Degrees of freedom for Student-t model of equity returns.
-    # Empirical studies find ν ≈ 3–7 for daily/monthly equity returns.
-    # ν = 5 is a common conservative choice (fatter tails than normal,
-    # but finite variance).  Set to None to use Normal (ν → ∞).
-    #
+    # ν = 5: common conservative choice for monthly equity returns.
     # Effects:
-    #   • factors.py   — t-stat threshold uses t.ppf(0.975, df=ν) per stock
-    #   • capital_structure.py — Merton default prob uses t.cdf(-d2, df=ν)
-    #   • portfolio.py — covariance inflated by ν/(ν-2) for fat-tail variance
-    return_df: float = 5.0              # Student-t degrees of freedom
+    #   • factors.py          — t_crit = t.ppf(0.975, ν) instead of 1.96
+    #   • capital_structure   — Merton P(default) uses t.cdf(-d2, ν)
+    #   • portfolio.py        — covariance inflated by ν/(ν-2)
+    return_df: float = 5.0              # Student-t degrees of freedom (None → Normal)
 
     # ------------------------------------------------------------------ #
     #  Capital structure  (MM screen)                                     #
     # ------------------------------------------------------------------ #
-    # Deviation of actual vs target leverage required to flag a stock.
-    # >+threshold → overleveraged  |  <-threshold → underleveraged
-    leverage_gap_threshold: float = 0.25     # 25 %
-    # Interest-coverage guard: ratio below this always flags overleveraged
-    min_interest_coverage: float = 1.5
+    leverage_gap_threshold: float = 0.25     # 25 % divergence to flag
+    min_interest_coverage:  float = 1.5      # IC below → always flag overleveraged
+    industry_distress_costs: bool = True     # Sector-specific distress rates (vs flat 20%)
+    variable_credit_spread:  bool = True     # Leverage-based spread (vs flat +2%)
 
     # ------------------------------------------------------------------ #
     #  Momentum filter                                                    #
     # ------------------------------------------------------------------ #
     momentum_months: int = 12            # Lookback (includes skip)
-    momentum_skip: int = 1               # Skip most-recent N months
+    momentum_skip:   int = 1             # Skip most-recent N months
+    vol_adjust_momentum:   bool = True   # Sharpe momentum: raw / trailing_vol
+                                         # Reduces momentum crashes (Barroso & Santa-Clara 2015)
+    momentum_crash_dampen: bool = True   # Halve momentum weight when mkt vol > 2× avg
+
+    # ------------------------------------------------------------------ #
+    #  Signal combination                                                 #
+    # ------------------------------------------------------------------ #
+    # "composite": continuous z-score blend — all information used.
+    # "binary": legacy AND-filter cascade (lower Sharpe, kept for comparison).
+    signal_method: str  = "composite"
+    w_alpha:       float = 0.40          # Weight for FF alpha t-stat z-score
+    w_mm:          float = 0.30          # Weight for MM divergence z-score
+    w_momentum:    float = 0.30          # Weight for momentum z-score
 
     # ------------------------------------------------------------------ #
     #  Portfolio construction                                             #
     # ------------------------------------------------------------------ #
-    n_longs: int = 25
-    n_shorts: int = 25
+    n_longs:  int   = 25
+    n_shorts: int   = 25
     max_position_weight: float = 0.08    # 8 % cap per leg
     min_position_weight: float = 0.005   # 0.5 % floor
-    max_sector_weight: float = 0.30      # 30 % sector cap per leg
+    max_sector_weight:   float = 0.30    # 30 % sector cap per leg
+
+    # Optimizer:
+    #   "min_variance" — minimises portfolio variance with alpha tilt (AQR-style).
+    #                    Stable out-of-sample; outperforms max-Sharpe in practice.
+    #   "max_sharpe"   — classical tangency portfolio (input-sensitive, legacy).
+    optimizer_method:  str   = "min_variance"
+    alpha_tilt_strength: float = 0.30   # Fraction of weight driven by composite score
+    turnover_penalty:  float = 0.002    # λ penalising |w_new - w_old|₁ in optimizer
 
     # ------------------------------------------------------------------ #
     #  Risk / optimisation                                                #
     # ------------------------------------------------------------------ #
     risk_free_rate_annual: float = 0.045
     target_net_beta: float = 0.0         # Beta-neutral by default
-    beta_tolerance: float = 0.05         # Acceptable residual beta
-    cov_shrinkage: bool = True           # Ledoit-Wolf shrinkage
+    beta_tolerance:  float = 0.05        # Acceptable residual beta
+    blume_shrinkage: bool  = True        # Shrink OLS betas: 0.67×β_raw + 0.33×1.0
+    cov_shrinkage:   bool  = True        # Ledoit-Wolf shrinkage (when EWMA off)
+    cov_halflife:    int   = 36          # EWMA half-life months (0 → flat/LW)
     cov_min_eigenvalue: float = 1e-6     # Floor eigenvalue (PSD fix)
     optimizer_max_iter: int = 1_000
 
     # ------------------------------------------------------------------ #
     #  Leverage                                                           #
     # ------------------------------------------------------------------ #
-    # gross_leverage: 1.0 = no leverage, 1.5 = 150% gross (75L/75S)
-    # margin_cost_annual: annual cost of borrowed capital (IBKR ~5.8%)
-    # borrow_cost_annual: stock borrow fee for short positions (~0.5-2%)
-    gross_leverage: float = 1.0
-    margin_cost_annual: float = 0.058    # 5.8%/an (fed funds + spread)
-    borrow_cost_annual: float = 0.010    # 1.0%/an avg stock borrow fee
+    gross_leverage:       float = 1.0
+    margin_cost_annual:   float = 0.058  # 5.8%/an (fed funds + spread)
+    borrow_cost_annual:   float = 0.010  # 1.0%/an avg stock borrow fee
 
     # ------------------------------------------------------------------ #
     #  Futures beta hedge (Phase 2)                                       #
     # ------------------------------------------------------------------ #
-    # When True, replaces weight-rescaling beta neutralisation with a
-    # clean futures overlay (ES/SPY) that leaves alpha weights intact.
-    # futures_roll_cost: quarterly roll cost as fraction of notional (~0.15%)
-    use_futures_hedge: bool = False
-    futures_roll_cost_quarterly: float = 0.0015   # 0.15%/quarter = 0.6%/an
+    use_futures_hedge:            bool  = False
+    futures_roll_cost_quarterly:  float = 0.0015   # 0.15%/quarter = 0.6%/an
 
     # ------------------------------------------------------------------ #
     #  Execution / back-test                                              #
     # ------------------------------------------------------------------ #
-    rebalance_freq: str = "ME"           # pandas offset alias
-    transaction_cost_bps: float = 10.0   # One-way cost in basis points
-    slippage_bps: float = 5.0
+    rebalance_freq:        str   = "ME"    # pandas offset alias
+    transaction_cost_bps:  float = 10.0   # One-way cost in basis points
+    slippage_bps:          float = 5.0
 
     # ------------------------------------------------------------------ #
     #  IBKR live trading                                                  #
@@ -142,7 +154,7 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     #  Cache                                                              #
     # ------------------------------------------------------------------ #
-    cache_dir: str = ".cache"
+    cache_dir:       str   = ".cache"
     cache_ttl_hours: float = 12.0        # Re-fetch after N hours
 
     # ------------------------------------------------------------------ #

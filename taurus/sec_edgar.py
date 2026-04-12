@@ -161,6 +161,26 @@ def get_fundamentals(ticker: str) -> dict:
         "NetIncomeLoss",
         "ProfitLoss",
     )
+    # Free Cash Flow = Operating Cash Flow − CapEx (proper FCF, not net income proxy)
+    op_cf = _latest_value(
+        us_gaap,
+        "NetCashProvidedByUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    )
+    capex = abs(_latest_value(
+        us_gaap,
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "CapitalExpendituresContinuingOperations",
+        "PaymentsForCapitalImprovements",
+    ))
+    import math
+    if not math.isnan(op_cf) and not math.isnan(capex):
+        result["free_cash_flow"] = op_cf - capex
+    elif not math.isnan(op_cf):
+        result["free_cash_flow"] = op_cf          # best proxy when capex unavailable
+    else:
+        result["free_cash_flow"] = result["net_income"]  # last resort
+
     result["shares_outstanding"] = _latest_value(
         us_gaap,
         "CommonStockSharesOutstanding",

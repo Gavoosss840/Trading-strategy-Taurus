@@ -222,12 +222,16 @@ def get_ff5_factors(
     cfg: TaurusConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
     """
-    Return monthly Fama-French 5-factor data (decimal returns).
+    Return monthly Fama-French factor data (decimal returns).
 
-    Columns: Mkt-RF, SMB, HML, RMW, CMA, RF
+    Columns: Mkt-RF, SMB, HML, RMW, CMA, RF  [+ UMD when use_umd_factor=True]
     Index:   month-end DatetimeIndex
+
+    When cfg.use_umd_factor=True the UMD (momentum) factor is appended so that
+    factors.py can orthogonalise alpha against it (FF6 instead of FF5).
     """
-    key = f"ff5_{start}_{end}"
+    include_umd = getattr(cfg, "use_umd_factor", False)
+    key = f"ff{'6' if include_umd else '5'}_{start}_{end}"
     cached = _cache_load(key, cfg)
     if cached is not None:
         return cached
@@ -254,13 +258,80 @@ def get_ff5_factors(
 
     if ff5 is None:
         raise RuntimeError(
-            "Could not retrieve Fama-French 5-factor data.\n"
+            "Could not retrieve Fama-French factor data.\n"
             "Try: pip install pandas-datareader\n"
             "Or check your internet connection."
         )
 
+    # Optionally append UMD (FF5 → FF6)
+    if include_umd:
+        umd = get_umd_factor(start, end, cfg)
+        if umd is not None:
+            ff5 = ff5.join(umd.rename("UMD"), how="left")
+            ff5["UMD"] = ff5["UMD"].fillna(0.0)   # fill gaps (rare) with zero
+            logger.info("UMD factor merged → FF6 dataset (%d rows).", len(ff5))
+        else:
+            logger.warning("UMD unavailable — running FF5 without momentum factor.")
+
     _cache_save(key, ff5, cfg)
     return ff5
+
+
+def get_umd_factor(
+    start: str,
+    end: str,
+    cfg: TaurusConfig = DEFAULT_CONFIG,
+) -> Optional[pd.Series]:
+    """
+    Download the Fama-French momentum factor (UMD = Up Minus Down).
+
+    Returns a monthly Series indexed by month-end dates, or None if unavailable.
+    """
+    key = f"umd_{start}_{end}"
+    cached = _cache_load(key, cfg)
+    if cached is not None:
+        return cached
+
+    umd: Optional[pd.Series] = None
+
+    # Try pandas_datareader first
+    try:
+        import pandas_datareader.data as web
+        raw = web.DataReader("F-F_Momentum_Factor", "famafrench", start=start, end=end)[0]
+        raw.index = raw.index.to_timestamp("M")
+        raw = raw / 100.0
+        umd = raw.iloc[:, 0].rename("UMD")   # single column (Mom or WML)
+        logger.info("UMD factor loaded via pandas_datareader.")
+    except Exception as exc:
+        logger.warning("pandas_datareader UMD failed: %s. Trying direct download.", exc)
+
+    # Direct download fallback
+    if umd is None:
+        try:
+            import io, zipfile, requests
+            url = (
+                "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+                "F-F_Momentum_Factor_CSV.zip"
+            )
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            zf   = zipfile.ZipFile(io.BytesIO(resp.content))
+            name = [n for n in zf.namelist() if n.upper().endswith(".CSV")][0]
+            raw  = pd.read_csv(io.StringIO(zf.read(name).decode()), skiprows=13)
+            raw  = raw[raw.iloc[:, 0].astype(str).str.match(r"^\d{6}$")]
+            raw.columns = [c.strip() for c in raw.columns]
+            raw.index = pd.to_datetime(raw.iloc[:, 0].astype(str), format="%Y%m")
+            raw.index = raw.index.to_period("M").to_timestamp("M")
+            raw = raw.astype(float, errors="ignore") / 100.0
+            mom_col = [c for c in raw.columns if c not in ("", "Date")][0]
+            umd = raw[mom_col].rename("UMD").loc[start:end]
+            logger.info("UMD factor downloaded directly from Kenneth French's website.")
+        except Exception as exc2:
+            logger.warning("Direct UMD download failed: %s. Running without UMD.", exc2)
+            return None
+
+    _cache_save(key, umd, cfg)
+    return umd
 
 
 def _download_ff5_directly(start: str, end: str) -> Optional[pd.DataFrame]:
@@ -341,7 +412,7 @@ def get_fundamentals(
             rec["market_cap"]       = row.get("market_cap",       np.nan)
             rec["sector"]           = row.get("sector",           "Unknown")
             rec["tax_rate"]         = 0.21   # taux standard US
-            rec["fcf"]              = row.get("net_income",       np.nan)  # proxy FCF
+            rec["fcf"]              = row.get("free_cash_flow", row.get("net_income", np.nan))  # OpCF-CapEx
             records.append(rec)
         df = pd.DataFrame(records).set_index("ticker")
 
@@ -430,7 +501,15 @@ def _fetch_single_fundamental(ticker: str) -> dict:
                                 vals = cf.loc[col].dropna()
                                 return float(vals.iloc[0]) if len(vals) else np.nan
                     return np.nan
-                rec["fcf"] = _cf_row(["Free Cash Flow", "Capital Expenditure"])
+                # FCF = Operating Cash Flow – CapEx (proper definition)
+                op_cf  = _cf_row(["Operating Cash Flow", "Cash Flow From Operations"])
+                capex  = _cf_row(["Capital Expenditure"])
+                if not np.isnan(op_cf) and not np.isnan(capex):
+                    rec["fcf"] = op_cf - abs(capex)
+                elif not np.isnan(op_cf):
+                    rec["fcf"] = op_cf
+                else:
+                    rec["fcf"] = _cf_row(["Free Cash Flow"])
             else:
                 rec["fcf"] = np.nan
         else:

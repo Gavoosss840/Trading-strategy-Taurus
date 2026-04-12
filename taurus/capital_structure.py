@@ -1,23 +1,25 @@
 """
 Taurus – Modigliani-Miller capital structure screen.
 
-Upgraded MM Valuation Engine (adapted from user's MMOptionsBot):
-────────────────────────────────────────────────────────────────
+Upgraded MM Valuation Engine
+─────────────────────────────
 VL (levered firm value) = VU + PV(Tax Shield) - PV(Distress) - Agency Costs
 
 Where:
   VU             = Unlevered value  = (Market Cap + Net Debt) - Tax Shield
-  Tax Shield     = τ × Interest / (rf + spread)
-  Distress Costs = Merton-model P(default) × 20% × EV
+  Tax Shield     = τ × Interest / (rf + credit_spread)
+  Distress Costs = Merton-model P(default) × distress_rate × EV
   Agency Costs   = f(leverage, FCF yield)
+
+Improvements over baseline:
+  • Industry-specific distress cost rates (intangible-heavy firms lose more in default)
+  • Leverage-based credit spread (instead of flat +200 bps for all firms)
+  • Student-t Merton default probability (fat-tail correction)
 
 Signal:
   divergence = (VL_theoretical - Market Cap) / Market Cap
   > +threshold  → undervalued  → underleveraged flag  → LONG candidate
   < -threshold  → overvalued   → overleveraged flag   → SHORT candidate
-
-This replaces the simpler sector-median leverage approach and naturally
-produces both LONG and SHORT candidates in any market regime.
 """
 
 from __future__ import annotations
@@ -35,35 +37,91 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
+#  Industry-specific distress cost rates                                       #
+# --------------------------------------------------------------------------- #
+# Distress costs = fraction of firm value destroyed in bankruptcy.
+# Intangible-heavy firms (tech, pharma) lose customer relationships, IP;
+# asset-heavy firms (utilities, real estate) recover more via liquidation.
+#
+# Sources: Altman (1984), Andrade & Kaplan (1998), Bris et al. (2006).
+
+_SECTOR_DISTRESS_RATE: Dict[str, float] = {
+    "Information Technology":  0.40,   # high intangibles (IP, talent, SaaS contracts)
+    "Communication Services":  0.35,   # brand value, content rights at risk
+    "Health Care":             0.35,   # regulatory risk, IP / pipeline destruction
+    "Consumer Discretionary":  0.25,   # brand + inventory write-downs
+    "Consumer Staples":        0.20,   # moderate — physical assets + brands
+    "Industrials":             0.18,   # machinery, equipment retain value
+    "Materials":               0.15,   # physical commodities / land
+    "Energy":                  0.15,   # reserves, equipment recoverable
+    "Financials":              0.10,   # regulated; liquid assets, recoverable
+    "Real Estate":             0.08,   # tangible land/buildings: high recovery
+    "Utilities":               0.10,   # regulated; essential assets stay intact
+    "Unknown":                 0.20,   # default
+}
+
+
+def _distress_rate(sector: str, cfg: TaurusConfig) -> float:
+    """Return distress cost rate for a given sector."""
+    if not getattr(cfg, "industry_distress_costs", True):
+        return 0.20   # flat legacy value
+    return _SECTOR_DISTRESS_RATE.get(sector, _SECTOR_DISTRESS_RATE["Unknown"])
+
+
+def _credit_spread(leverage_ratio: float, cfg: TaurusConfig) -> float:
+    """
+    Estimate the credit spread on debt as a function of leverage (D/E).
+
+    Calibrated roughly to US investment-grade / high-yield spreads:
+      D/E < 0.5  → spread ≈ 0.01 (100 bps, AAA/AA)
+      D/E = 1.0  → spread ≈ 0.02 (200 bps, A/BBB)
+      D/E = 2.0  → spread ≈ 0.04 (400 bps, BB)
+      D/E > 5.0  → capped at 0.10 (1000 bps, deep distress)
+    """
+    if not getattr(cfg, "variable_credit_spread", True):
+        return 0.02   # flat legacy value
+    spread = 0.005 + 0.03 * min(leverage_ratio, 5.0)
+    return float(np.clip(spread, 0.005, 0.10))
+
+
+# --------------------------------------------------------------------------- #
 #  Single-stock MM valuation                                                   #
 # --------------------------------------------------------------------------- #
 
-def _mm_valuation(row: pd.Series, rf: float = 0.045, return_df: Optional[float] = None) -> Dict:
+def _mm_valuation(
+    row: pd.Series,
+    rf: float = 0.045,
+    return_df: Optional[float] = None,
+    cfg: TaurusConfig = DEFAULT_CONFIG,
+) -> Dict:
     """
     Compute MM theoretical value for one stock from a fundamentals row.
 
     Parameters
     ----------
-    row : Series with keys: market_cap, total_debt, total_equity, ebit,
-          interest_expense, total_assets, tax_rate, fcf (optional),
-          beta (optional), price_hist_vol (optional)
-    rf  : annual risk-free rate
+    row       : Series with keys: market_cap, total_debt, total_equity, ebit,
+                interest_expense, total_assets, tax_rate, fcf, sector,
+                price_vol_annual (optional)
+    rf        : annual risk-free rate
+    return_df : Student-t degrees of freedom for Merton (None → Normal)
+    cfg       : TaurusConfig for sector distress + spread settings
 
     Returns
     -------
-    dict with: VU, tax_shield, distress_costs, agency_costs,
-               VL_theoretical, divergence_pct, signal
+    dict with: VU, pv_tax_shield, pv_distress, pv_agency,
+               VL_theoretical, divergence_pct, prob_default
     """
-    market_cap        = float(row.get("market_cap",        0) or 0)
-    total_debt        = float(row.get("total_debt",        0) or 0)
-    cash              = float(row.get("cash",              0) or 0)
-    total_equity      = float(row.get("total_equity",      0) or 1)
-    ebit              = float(row.get("ebit",              0) or 0)
-    interest_expense  = float(row.get("interest_expense",  0) or 0)
-    total_assets      = float(row.get("total_assets",      0) or 1)
-    tax_rate          = float(row.get("tax_rate",         0.21) or 0.21)
-    fcf               = float(row.get("fcf",               0) or 0)
-    sigma_equity      = float(row.get("price_vol_annual",  0.30) or 0.30)
+    market_cap       = float(row.get("market_cap",        0) or 0)
+    total_debt       = float(row.get("total_debt",        0) or 0)
+    cash             = float(row.get("cash",              0) or 0)
+    total_equity     = float(row.get("total_equity",      0) or 1)
+    ebit             = float(row.get("ebit",              0) or 0)
+    interest_expense = float(row.get("interest_expense",  0) or 0)
+    total_assets     = float(row.get("total_assets",      0) or 1)
+    tax_rate         = float(row.get("tax_rate",        0.21) or 0.21)
+    fcf              = float(row.get("fcf",               0) or 0)
+    sigma_equity     = float(row.get("price_vol_annual",  0.30) or 0.30)
+    sector           = str(row.get("sector", "Unknown") or "Unknown")
 
     if market_cap <= 0:
         return _empty_mm(market_cap)
@@ -77,25 +135,29 @@ def _mm_valuation(row: pd.Series, rf: float = 0.045, return_df: Optional[float] 
         interest_expense = total_debt * 0.05   # impute 5% coupon
 
     annual_tax_shield = tax_rate * interest_expense
-    shield_discount   = rf + 0.02               # slight credit spread
-    pv_tax_shield     = annual_tax_shield / shield_discount if shield_discount > 0 else 0
+
+    # Leverage-based credit spread instead of flat +200 bps
+    leverage_ratio = total_debt / max(total_equity, 1)
+    spread         = _credit_spread(leverage_ratio, cfg)
+    shield_discount = rf + spread
+    pv_tax_shield   = annual_tax_shield / shield_discount if shield_discount > 0 else 0
 
     # ── 2. Unlevered value ────────────────────────────────────────────────── #
     VU = market_cap + net_debt - pv_tax_shield
 
     # ── 3. Financial distress costs (Merton model) ──────────────────────── #
-    E          = max(market_cap, 1)
-    D          = max(total_debt, 1)
-    V_firm     = max(ev, 1)
+    E       = max(market_cap, 1)
+    D       = max(total_debt, 1)
+    V_firm  = max(ev, 1)
 
     sigma_assets = sigma_equity * (E / (E + D))   # de-lever equity vol
     mu = rf
     T  = 1.0
 
     try:
-        d2 = (np.log(V_firm / D) + (mu - 0.5 * sigma_assets**2) * T) \
+        d2 = (np.log(V_firm / D) + (mu - 0.5 * sigma_assets ** 2) * T) \
              / (sigma_assets * np.sqrt(T))
-        # Use Student-t for fat-tail default probability when return_df is set
+        # Student-t for fat-tail default probability
         if return_df is not None and return_df > 2:
             prob_default = float(_t_dist.cdf(-d2, df=return_df))
         else:
@@ -103,14 +165,14 @@ def _mm_valuation(row: pd.Series, rf: float = 0.045, return_df: Optional[float] 
     except Exception:
         prob_default = 0.0
 
-    distress_cost_rate = 0.20
-    pv_distress = prob_default * distress_cost_rate * V_firm
+    # Industry-specific distress cost rate
+    distress_rate = _distress_rate(sector, cfg)
+    pv_distress   = prob_default * distress_rate * V_firm
 
     # ── 4. Agency costs ───────────────────────────────────────────────────── #
-    leverage = total_debt / total_equity if total_equity > 0 else 0
     agency_score = 0.0
-    if leverage > 2.0:
-        agency_score += (leverage - 2.0) * 0.05
+    if leverage_ratio > 2.0:
+        agency_score += (leverage_ratio - 2.0) * 0.05
     fcf_yield = abs(fcf) / market_cap if market_cap > 0 else 0
     if fcf_yield > 0.10:
         agency_score += (fcf_yield - 0.10) * 0.5
@@ -119,7 +181,7 @@ def _mm_valuation(row: pd.Series, rf: float = 0.045, return_df: Optional[float] 
     # ── 5. Levered theoretical value ──────────────────────────────────────── #
     VL = VU + pv_tax_shield - pv_distress - pv_agency
 
-    divergence = (VL - market_cap) / market_cap if market_cap > 0 else 0.0
+    divergence     = (VL - market_cap) / market_cap if market_cap > 0 else 0.0
     divergence_pct = divergence * 100.0
 
     return {
@@ -130,6 +192,8 @@ def _mm_valuation(row: pd.Series, rf: float = 0.045, return_df: Optional[float] 
         "VL_theoretical": VL,
         "divergence_pct": divergence_pct,
         "prob_default":   prob_default,
+        "credit_spread":  spread,
+        "distress_rate":  distress_rate,
     }
 
 
@@ -138,11 +202,12 @@ def _empty_mm(market_cap: float) -> Dict:
         "VU": 0.0, "pv_tax_shield": 0.0, "pv_distress": 0.0,
         "pv_agency": 0.0, "VL_theoretical": 0.0,
         "divergence_pct": 0.0, "prob_default": 0.0,
+        "credit_spread": 0.02, "distress_rate": 0.20,
     }
 
 
 # --------------------------------------------------------------------------- #
-#  Historical volatility helper (called from data layer if available)         #
+#  Historical volatility helper                                                 #
 # --------------------------------------------------------------------------- #
 
 def add_price_vol(
@@ -182,21 +247,20 @@ def mm_capital_structure_screen(
     DataFrame indexed by ticker with columns:
         VL_theoretical, divergence_pct, prob_default,
         underleveraged (bool), overleveraged (bool),
-        pv_tax_shield, pv_distress, pv_agency
+        pv_tax_shield, pv_distress, pv_agency,
+        credit_spread, distress_rate
     """
-    rf = cfg.risk_free_rate_annual
-    threshold = cfg.leverage_gap_threshold * 100   # convert to %
+    rf        = cfg.risk_free_rate_annual
+    threshold = cfg.leverage_gap_threshold * 100
     return_df = getattr(cfg, "return_df", None)
 
-    # Attach historical vol if returns provided
     df = fundamentals.copy()
     if returns is not None:
         df = add_price_vol(df, returns)
 
-    # Run MM valuation row-by-row (fast enough for 500 stocks)
     rows = []
     for ticker, row in df.iterrows():
-        result = _mm_valuation(row, rf=rf, return_df=return_df)
+        result = _mm_valuation(row, rf=rf, return_df=return_df, cfg=cfg)
         result["ticker"] = ticker
         rows.append(result)
 
@@ -206,19 +270,22 @@ def mm_capital_structure_screen(
     result_df = pd.DataFrame(rows).set_index("ticker")
 
     # ── Flags ─────────────────────────────────────────────────────────────── #
-    result_df["underleveraged"] = result_df["divergence_pct"] >  threshold   # undervalued → LONG
-    result_df["overleveraged"]  = result_df["divergence_pct"] < -threshold   # overvalued  → SHORT
+    result_df["underleveraged"] = result_df["divergence_pct"] >  threshold
+    result_df["overleveraged"]  = result_df["divergence_pct"] < -threshold
 
-    # Interest coverage guard (still useful)
+    # Interest coverage guard
     ic = (df["ebit"] / df["interest_expense"].where(df["interest_expense"] > 0)
           ).reindex(result_df.index).fillna(np.inf)
-    result_df["ic_ratio"] = ic
+    result_df["ic_ratio"]    = ic
     result_df["overleveraged"] |= (ic < cfg.min_interest_coverage)
 
     n_under = result_df["underleveraged"].sum()
     n_over  = result_df["overleveraged"].sum()
     logger.info(
-        "MM screen: %d undervalued (LONG), %d overvalued (SHORT) of %d stocks.",
+        "MM screen: %d undervalued (LONG), %d overvalued (SHORT) of %d stocks "
+        "[industry distress=%s, variable_spread=%s].",
         n_under, n_over, len(result_df),
+        getattr(cfg, "industry_distress_costs", True),
+        getattr(cfg, "variable_credit_spread", True),
     )
     return result_df

@@ -21,6 +21,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+
+
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -31,12 +34,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RiskConfig:
-    stop_loss_pct:       float = 0.10   # -10% depuis entrée → STP ordre
+    stop_loss_pct:       float = 0.10   # -10% depuis entrée → STP ordre (flat)
     take_profit_pct:     float = 0.20   # +20% depuis entrée → LMT ordre (take profit)
     trailing_stop_pct:   float = 0.10   # -10% depuis le pic → coupe (risk monitor)
     circuit_breaker_pct: float = 0.15   # -15% portfolio global → tout couper
     min_hold_days:       int   = 3      # ne pas couper avant 3 jours (évite faux signaux)
     state_file:          str   = ".cache/risk_state.json"
+    # Vol-adjusted stops: stop = entry_vol × stop_vol_multiplier
+    # More conservative for volatile stocks, less trigger-happy for stable ones.
+    vol_adjusted_stops:  bool  = True   # use entry volatility to scale stop level
+    stop_vol_multiplier: float = 2.0    # stop = 2× trailing σ (monthly, annualised)
+    min_stop_pct:        float = 0.06   # floor: never tighter than 6%
+    max_stop_pct:        float = 0.20   # ceiling: never wider than 20%
 
 
 # --------------------------------------------------------------------------- #
@@ -52,6 +61,7 @@ class PositionState:
     peak_price:  float        # plus haut atteint depuis entrée (LONG) ou plus bas (SHORT)
     shares:      int
     universe:    str
+    entry_vol:   float = 0.0  # annualised trailing vol at entry (for vol-adjusted stops)
 
     def update_peak(self, current_price: float) -> None:
         if self.side == "LONG":
@@ -105,6 +115,7 @@ class RiskState:
                 data = json.load(f)
             self.ref_nav = data.get("ref_nav", 0.0)
             for t, p in data.get("positions", {}).items():
+                p.setdefault("entry_vol", 0.0)   # backward compat: old files lack entry_vol
                 self.positions[t] = PositionState(**p)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -126,15 +137,31 @@ class RiskState:
     def register_rebalance(
         self,
         snapshot,
-        prices:  Dict[str, float],
-        nav:     float,
+        prices:   Dict[str, float],
+        nav:      float,
         universe: str,
+        returns:  Optional[pd.DataFrame] = None,   # for vol-adjusted stops
     ) -> None:
         """
         Appelé après chaque rebalancement mensuel.
         Enregistre les nouvelles positions et reset la NAV de référence.
+
+        Parameters
+        ----------
+        returns : optional DataFrame of monthly returns (last 12 rows used
+                  to compute trailing volatility for vol-adjusted stops)
         """
         self.ref_nav = nav
+
+        # Pre-compute trailing vol for each ticker (annualised)
+        ticker_vol: Dict[str, float] = {}
+        if returns is not None:
+            lookback = min(12, len(returns))
+            vols = returns.tail(lookback).std() * np.sqrt(12)
+            ticker_vol = vols.to_dict()
+
+        def _vol(ticker: str) -> float:
+            return float(ticker_vol.get(ticker, 0.30))   # default 30% if unavailable
 
         # Nouvelles positions LONG
         for ticker, w in snapshot.long_weights.items():
@@ -145,6 +172,7 @@ class RiskState:
                     ticker=ticker, side="LONG",
                     entry_price=price, entry_date=date.today().isoformat(),
                     peak_price=price, shares=shares, universe=universe,
+                    entry_vol=_vol(ticker),
                 )
 
         # Nouvelles positions SHORT
@@ -156,6 +184,7 @@ class RiskState:
                     ticker=ticker, side="SHORT",
                     entry_price=price, entry_date=date.today().isoformat(),
                     peak_price=price, shares=shares, universe=universe,
+                    entry_vol=_vol(ticker),
                 )
 
         # Supprimer positions qui ne sont plus dans le portfolio
@@ -247,14 +276,27 @@ class RiskManager:
                 continue
 
             pos.update_peak(price)
-            pnl         = pos.pnl_pct(price)
-            drawdown    = pos.drawdown_from_peak(price)
+            pnl      = pos.pnl_pct(price)
+            drawdown = pos.drawdown_from_peak(price)
 
-            # Stop-loss : -10% depuis l'entrée
-            if pnl <= -self.config.stop_loss_pct:
+            # Vol-adjusted stop level: scale by entry volatility
+            if self.config.vol_adjusted_stops and pos.entry_vol > 0:
+                # Monthly vol → annualised; stop = k × monthly_vol
+                monthly_vol = pos.entry_vol / np.sqrt(12)
+                raw_stop    = self.config.stop_vol_multiplier * monthly_vol
+                stop_level  = float(np.clip(
+                    raw_stop,
+                    self.config.min_stop_pct,
+                    self.config.max_stop_pct,
+                ))
+            else:
+                stop_level = self.config.stop_loss_pct
+
+            # Stop-loss : depuis l'entrée (vol-adjusted)
+            if pnl <= -stop_level:
                 logger.warning(
-                    "🔴 STOP-LOSS %s %s: P&L=%.1f%% (entry=%.2f, now=%.2f)",
-                    pos.side, ticker, pnl * 100, pos.entry_price, price,
+                    "STOP-LOSS %s %s: P&L=%.1f%% (stop=%.1f%%, entry=%.2f, now=%.2f)",
+                    pos.side, ticker, pnl * 100, stop_level * 100, pos.entry_price, price,
                 )
                 events.append(RiskEvent(
                     ticker=ticker, side=pos.side, reason="stop_loss",

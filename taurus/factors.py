@@ -1,25 +1,27 @@
 """
-Taurus – Factor model: CAPM + Fama-French 5 Factors → SML alpha.
+Taurus – Factor model: CAPM + Fama-French 5/6 Factors → SML alpha.
 
 Key design decisions
 ─────────────────────
+• FF6 support:  When the factors DataFrame includes a "UMD" column
+  (i.e. cfg.use_umd_factor=True), the regression automatically switches
+  to 7 regressors [1, Mkt-RF, SMB, HML, RMW, CMA, UMD].  This strips
+  the momentum premium from alpha → purer residual signal.
+
 • Vectorised OLS:  All N stocks are regressed in a single matrix solve.
-  X  (T × 6) = [1, Mkt-RF, SMB, HML, RMW, CMA]
+  X  (T × K) = [1, Mkt-RF, SMB, HML, RMW, CMA, (UMD)]
   Y  (T × N) = excess stock returns
-  β  (6 × N) = (X'X)⁻¹ X'Y  – solved once for all stocks simultaneously.
+  β  (K × N) = (X'X)⁻¹ X'Y  – solved once for all stocks simultaneously.
 
-• Heteroskedasticity-consistent (HC1) standard errors for the alpha t-stat,
-  implemented without statsmodels to stay vectorised.
+• Heteroskedasticity-consistent (HC1) standard errors for the alpha t-stat.
 
-• Rolling window: the helper `rolling_alpha_signal` slides the estimation
-  window forward one month at a time, reusing cached XtX_inv for the
-  constant-factor block.
+• Student-t critical value when cfg.return_df is set (conservative, fat tails).
 
 Outputs
 ────────
 • alpha        : float array (N,) – annualised intercept
 • alpha_tstat  : float array (N,) – t-statistic of the intercept
-• betas        : DataFrame (N × 5) – market, SMB, HML, RMW, CMA loadings
+• betas        : DataFrame (N × K-1) – factor loadings
 • signal       : bool Series indexed by ticker – True iff |t| > threshold
 """
 
@@ -60,45 +62,21 @@ def _ols_vectorised(
 
 
 def _hc1_se_intercept(
-    X: np.ndarray,       # (T, K)
+    X: np.ndarray,          # (T, K)
     residuals: np.ndarray,  # (T, N)
-    XtX_inv: np.ndarray, # (K, K)
+    XtX_inv: np.ndarray,   # (K, K)
 ) -> np.ndarray:
     """
-    HC1 (heteroskedasticity-consistent) standard error for the intercept
-    coefficient (first row of beta), for each of N stocks.
-
-    HC1 sandwich: V = (X'X)⁻¹ [Σᵢ eᵢ² xᵢ xᵢ'] (X'X)⁻¹  × T/(T-K)
+    HC1 heteroskedasticity-consistent SE for the intercept, for each of N stocks.
 
     Returns se_alpha : (N,)
     """
     T, K = X.shape
-    N = residuals.shape[1]
     df_correction = T / (T - K)
-
-    # Meat = Σ eᵢ² xᵢ xᵢ'  for each stock n → (K, K, N) but we only need
-    # the [0,0] element of V, so we can simplify.
-    # Meat[0,0,n] = Σᵢ eᵢₙ² xᵢ₀²  where x₀ = 1 (intercept column)
-    # → Σᵢ eᵢₙ² × 1² = eₙ . eₙ element-wise
-    # V[0,0,n] = (XtX_inv @ Meat_n @ XtX_inv)[0,0]
-    # We compute the full K×K meat per stock vectorised over N.
-
-    # e²: (T, N)
-    e2 = residuals ** 2
-
-    # Build meat matrices: (K, K, N)
-    # meat[:, :, n] = X.T @ diag(e2[:, n]) @ X
-    # = (X * e2[:, n:n+1]).T @ X   (broadcast)
-    # Vectorised: meat = einsum('ti,tj,tn->ijn', X, X, e2)
-    # Too memory-heavy; instead compute only the 0-th row/col we need.
-    # row0 of (XtX_inv @ meat @ XtX_inv) = XtX_inv[0, :] @ meat @ XtX_inv
-    # scalar V[0,0,n] = XtX_inv[0,:] @ meat_n @ XtX_inv[:,0]
-    #                 = (XtX_inv[0,:] @ X.T) @ diag(e2[:,n]) @ (X @ XtX_inv[:,0])
-    q = X @ XtX_inv[:, 0]        # (T,)   – leverage vector for intercept
-    # V[0,0,n] = q.T @ diag(e2[:,n]) @ q = sum_t q_t² e_tn²
-    V00 = (q[:, None] ** 2 * e2).sum(axis=0) * df_correction  # (N,)
-    se_alpha = np.sqrt(np.maximum(V00, 1e-16))
-    return se_alpha
+    q = X @ XtX_inv[:, 0]          # (T,) – hat vector for intercept
+    e2 = residuals ** 2             # (T, N)
+    V00 = (q[:, None] ** 2 * e2).sum(axis=0) * df_correction   # (N,)
+    return np.sqrt(np.maximum(V00, 1e-16))
 
 
 # --------------------------------------------------------------------------- #
@@ -106,25 +84,28 @@ def _hc1_se_intercept(
 # --------------------------------------------------------------------------- #
 
 def compute_ff5_alpha(
-    returns: pd.DataFrame,        # (T, N) monthly stock excess returns
-    factors: pd.DataFrame,        # (T, 6) FF5 + RF  columns
+    returns: pd.DataFrame,        # (T, N) monthly stock returns (not excess)
+    factors: pd.DataFrame,        # (T, 6 or 7) FF5/FF6 + RF columns
     cfg: TaurusConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
     """
-    Run the FF5 regression for every stock and return a result DataFrame.
+    Run the FF5 or FF6 regression for every stock simultaneously.
+
+    Automatically uses FF6 when the factors DataFrame contains a "UMD" column
+    and cfg.use_umd_factor=True.  The UMD factor strips the momentum premium
+    from alpha, producing a purer residual signal for stock selection.
 
     Parameters
     ----------
-    returns : monthly stock returns (NOT excess; RF is subtracted here)
-    factors : DataFrame with columns Mkt-RF, SMB, HML, RMW, CMA, RF
-              (decimal, month-end index)
+    returns : monthly stock returns (RF is subtracted inside)
+    factors : columns Mkt-RF, SMB, HML, RMW, CMA, RF [, UMD] (decimal)
 
     Returns
     -------
     DataFrame indexed by ticker with columns:
         alpha_monthly, alpha_annual, alpha_tstat,
-        beta_mkt, beta_smb, beta_hml, beta_rmw, beta_cma,
-        r_squared, signal (bool)
+        beta_mkt, beta_smb, beta_hml, beta_rmw, beta_cma [, beta_umd],
+        r_squared, signal (bool), alpha_sign (+1/-1)
     """
     # ── Align ──────────────────────────────────────────────────────────── #
     aligned_idx = returns.index.intersection(factors.index)
@@ -138,22 +119,32 @@ def compute_ff5_alpha(
     ret = returns.loc[aligned_idx]
     fac = factors.loc[aligned_idx]
 
-    rf = fac["RF"].values                    # (T,)
+    rf     = fac["RF"].values
     mkt_rf = fac["Mkt-RF"].values
     smb    = fac["SMB"].values
     hml    = fac["HML"].values
     rmw    = fac["RMW"].values
     cma    = fac["CMA"].values
 
+    # ── FF6: use UMD when available and configured ──────────────────────── #
+    use_umd = (
+        getattr(cfg, "use_umd_factor", False)
+        and "UMD" in fac.columns
+        and fac["UMD"].notna().any()
+    )
+
     # ── Excess returns ──────────────────────────────────────────────────── #
     Y = ret.values - rf[:, None]             # (T, N)
 
     # ── Design matrix ──────────────────────────────────────────────────── #
     T = len(aligned_idx)
-    X = np.column_stack([
-        np.ones(T),
-        mkt_rf, smb, hml, rmw, cma,
-    ])                                        # (T, 6)
+    if use_umd:
+        umd = fac["UMD"].fillna(0.0).values
+        X = np.column_stack([np.ones(T), mkt_rf, smb, hml, rmw, cma, umd])  # (T, 7)
+        model_label = "FF6"
+    else:
+        X = np.column_stack([np.ones(T), mkt_rf, smb, hml, rmw, cma])        # (T, 6)
+        model_label = "FF5"
 
     # ── Vectorised OLS ─────────────────────────────────────────────────── #
     beta, residuals, XtX_inv = _ols_vectorised(X, Y)
@@ -169,54 +160,45 @@ def compute_ff5_alpha(
     ss_tot = ((Y - Y.mean(axis=0)) ** 2).sum(axis=0)
     r2 = 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, np.nan)
 
-    # ── Assemble results ─────────────────────────────────────────────────── #
+    # ── Assemble ─────────────────────────────────────────────────────────── #
     tickers = ret.columns.tolist()
-    result = pd.DataFrame(
-        {
-            "alpha_monthly": alpha_m,
-            "alpha_annual":  alpha_a,
-            "alpha_tstat":   t_stats,
-            "beta_mkt":  beta[1],
-            "beta_smb":  beta[2],
-            "beta_hml":  beta[3],
-            "beta_rmw":  beta[4],
-            "beta_cma":  beta[5],
-            "r_squared": r2,
-        },
-        index=tickers,
-    )
+    out = {
+        "alpha_monthly": alpha_m,
+        "alpha_annual":  alpha_a,
+        "alpha_tstat":   t_stats,
+        "beta_mkt":  beta[1],
+        "beta_smb":  beta[2],
+        "beta_hml":  beta[3],
+        "beta_rmw":  beta[4],
+        "beta_cma":  beta[5],
+        "r_squared": r2,
+    }
+    if use_umd:
+        out["beta_umd"] = beta[6]
 
-    # ── Signal: |t| ≥ threshold ──────────────────────────────────────────── #
-    # With a Student-t distribution (ν degrees of freedom), the correct
-    # two-sided 5% critical value is t.ppf(0.975, df=ν), not 1.96.
-    # For finite samples: df_resid = T - K (T obs, K=6 regressors).
-    # When return_df is set we also account for fat tails in the residuals
-    # by using the configured ν as an upper bound on the effective df.
-    K = X.shape[1]          # number of regressors (6: intercept + 5 factors)
-    df_resid = T - K        # residual degrees of freedom
+    result = pd.DataFrame(out, index=tickers)
+
+    # ── Signal: |t| ≥ threshold (Student-t critical value) ─────────────── #
+    K = X.shape[1]
+    df_resid = T - K
 
     return_df = getattr(cfg, "return_df", None)
     if return_df is not None and return_df > 2:
         from scipy.stats import t as _t
-        # Effective df = min(sample residual df, configured ν)
-        # → conservative (lower df = fatter tails = higher critical value)
-        eff_df   = min(df_resid, return_df)
-        t_crit   = float(_t.ppf(0.975, df=eff_df))
+        eff_df     = min(df_resid, return_df)
+        t_crit     = float(_t.ppf(0.975, df=eff_df))
         dist_label = f"Student-t(ν={eff_df:.0f})"
     else:
         t_crit     = cfg.alpha_tstat_threshold
         dist_label = "Normal (ν→∞)"
 
-    result["signal"] = result["alpha_tstat"].abs() >= t_crit
-    result["alpha_sign"] = np.sign(result["alpha_monthly"])   # +1 / -1
+    result["signal"]     = result["alpha_tstat"].abs() >= t_crit
+    result["alpha_sign"] = np.sign(result["alpha_monthly"])
 
     logger.info(
-        "FF5 regression: %d stocks, %d with |t|≥%.3f [%s, p<5%% two-sided] (%.0f%%).",
-        len(tickers),
-        result["signal"].sum(),
-        t_crit,
-        dist_label,
-        100 * result["signal"].mean(),
+        "%s regression: %d stocks, %d with |t|≥%.3f [%s, p<5%% two-sided] (%.0f%%).",
+        model_label, len(tickers), result["signal"].sum(),
+        t_crit, dist_label, 100 * result["signal"].mean(),
     )
     return result
 
@@ -231,14 +213,14 @@ def rolling_alpha_signal(
     cfg: TaurusConfig = DEFAULT_CONFIG,
 ) -> pd.DataFrame:
     """
-    Compute the FF5 alpha signal at every rebalance date.
+    Compute the FF5/FF6 alpha signal at every rebalance date.
 
     Returns a DataFrame with a MultiIndex (date, ticker) and the same
     columns as `compute_ff5_alpha`.
     """
     returns = prices.pct_change().dropna(how="all")
-    dates = returns.index
-    window = cfg.lookback_months
+    dates   = returns.index
+    window  = cfg.lookback_months
 
     frames = []
     rebalance_dates = pd.date_range(
@@ -248,12 +230,10 @@ def rolling_alpha_signal(
     ).intersection(dates)
 
     for reb_date in rebalance_dates:
-        loc = dates.get_loc(reb_date)
+        loc       = dates.get_loc(reb_date)
         start_loc = max(0, loc - window + 1)
         window_ret = returns.iloc[start_loc : loc + 1]
-        # Keep only stocks with full history in window
-        min_obs = cfg.min_obs
-        valid_cols = window_ret.columns[window_ret.notna().sum() >= min_obs]
+        valid_cols = window_ret.columns[window_ret.notna().sum() >= cfg.min_obs]
         window_ret = window_ret[valid_cols].dropna()
 
         alpha_df = compute_ff5_alpha(window_ret, factors, cfg)
