@@ -126,8 +126,10 @@ class RebalanceScheduler:
 
                 if _should_rebalance(last_reb, today):
                     logger.info("=== REBALANCE DAY: %s ===", today)
-                    self._run_all_universes(pd.Timestamp(today))
+                    # Save state FIRST — prevents double-run if _run_all_universes
+                    # crashes after placing orders but before state was persisted.
                     self._save_state(today)
+                    self._run_all_universes(pd.Timestamp(today))
                     logger.info("=== Rebalance complete ===")
                 else:
                     next_reb = _last_business_day_of_month(today)
@@ -349,6 +351,7 @@ class RebalanceScheduler:
                 peak_price=avg_cost,
                 shares=abs(int(qty)),
                 universe=universe,
+                entry_vol=0.0,   # unknown at sync time; vol-adjusted stops use flat fallback
             )
             added += 1
 
