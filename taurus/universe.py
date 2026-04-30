@@ -28,6 +28,7 @@ from .data import (
     _cache_load, _cache_save,
     get_fundamentals,
     _download_ff5_directly,
+    get_umd_factor,
 )
 
 
@@ -628,7 +629,7 @@ class UniverseDef:
         cfg: TaurusConfig = DEFAULT_CONFIG,
     ) -> pd.DataFrame:
         """
-        Download Fama-French 5 factors for this universe's region.
+        Download Fama-French 5 (or 6) factors for this universe's region.
 
         Routing:
           US               → F-F_Research_Data_5_Factors_2x3  (pandas_datareader or direct)
@@ -636,12 +637,16 @@ class UniverseDef:
           Japan            → Japan_5_Factors                   (direct download)
           Asia / MiddleEast→ Asia_Pacific_ex_Japan_5_Factors   (best proxy)
           Global           → Global_5_Factors                  (fallback)
+
+        When cfg.use_umd_factor=True the UMD momentum factor is appended,
+        yielding a FF6 dataset for alpha orthogonalisation.
         """
         from .data import _cache_load, _cache_save
 
+        include_umd = getattr(cfg, "use_umd_factor", False)
         dataset   = self.config.ff5_dataset
         region    = self.config.region
-        cache_key = f"ff5_{self.config.name}_{start}_{end}"
+        cache_key = f"ff{'6' if include_umd else '5'}_{self.config.name}_{start}_{end}"
         cached    = _cache_load(cache_key, cfg)
         if cached is not None:
             return cached
@@ -671,6 +676,16 @@ class UniverseDef:
                 f"Cannot load FF5 factors for universe {self.config.name} "
                 f"(dataset={dataset}, start={start}, end={end})"
             )
+
+        # Optionally append UMD (FF5 → FF6) — same factor regardless of region
+        if include_umd:
+            umd = get_umd_factor(start, end, cfg)
+            if umd is not None:
+                ff5 = ff5.join(umd.rename("UMD"), how="left")
+                ff5["UMD"] = ff5["UMD"].fillna(0.0)
+                logger.info("[%s] UMD factor merged → FF6 dataset (%d rows).", self.config.name, len(ff5))
+            else:
+                logger.warning("[%s] UMD unavailable — running FF5 without momentum factor.", self.config.name)
 
         _cache_save(cache_key, ff5, cfg)
         return ff5
