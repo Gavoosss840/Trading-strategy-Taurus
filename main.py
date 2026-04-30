@@ -340,15 +340,30 @@ def run_backtest(args, cfg) -> None:
         next(iter(all_results.values())).positions_df().to_csv(pos_path, index=False)
     logger.info("Positions saved to %s", pos_path)
 
+    # ── Blend backtest with live returns (if available) ──────────────────── #
+    # Done once here so ALL charts (equity, heatmap, rolling Sharpe, report.png)
+    # receive the same blended series with live months included.
+    try:
+        from taurus.live_reporting import blend_returns_with_live
+        bt_rets = {name: r.portfolio_returns() for name, r in all_results.items()}
+        _blended = blend_returns_with_live(bt_rets, output_dir=str(output))
+        combined_override = _blended if not _blended.empty else None
+    except Exception as _e:
+        logger.warning("Could not blend live returns: %s", _e)
+        combined_override = None
+
     # ── Combined charts (multi-universe OR single) ───────────────────────── #
     try:
         if len(all_results) > 1:
             plot_combined_equity_curve(
-                all_results, save_path=str(output / "equity_curve.png"))
+                all_results, save_path=str(output / "equity_curve.png"),
+                combined_override=combined_override)
             plot_combined_heatmap(
-                all_results, save_path=str(output / "monthly_heatmap.png"))
+                all_results, save_path=str(output / "monthly_heatmap.png"),
+                combined_override=combined_override)
             plot_combined_rolling_sharpe(
-                all_results, save_path=str(output / "rolling_sharpe.png"))
+                all_results, save_path=str(output / "rolling_sharpe.png"),
+                combined_override=combined_override)
         else:
             result = next(iter(all_results.values()))
             plot_equity_curve(result,    save_path=str(output / "equity_curve.png"))
@@ -358,14 +373,10 @@ def run_backtest(args, cfg) -> None:
     except Exception as exc:
         logger.warning("Combined chart generation failed: %s", exc)
 
-    # ── One-page combined report (blended backtest + live if available) ─────── #
+    # ── One-page combined report ──────────────────────────────────────────── #
     try:
-        from taurus.live_reporting import blend_returns_with_live
-        bt_rets = {name: r.portfolio_returns() for name, r in all_results.items()}
-        blended = blend_returns_with_live(bt_rets, output_dir=str(output))
-        combined_override = blended if not blended.empty else None
         report_end = (
-            str(blended.index[-1].date()) if combined_override is not None else args.end
+            str(combined_override.index[-1].date()) if combined_override is not None else args.end
         )
         generate_combined_report(
             results           = all_results,
@@ -512,11 +523,14 @@ def run_report(args, cfg) -> None:
     try:
         if len(proxy_results) > 1:
             plot_combined_equity_curve(
-                proxy_results, save_path=str(output / "equity_curve.png"))
+                proxy_results, save_path=str(output / "equity_curve.png"),
+                combined_override=combined_override)
             plot_combined_heatmap(
-                proxy_results, save_path=str(output / "monthly_heatmap.png"))
+                proxy_results, save_path=str(output / "monthly_heatmap.png"),
+                combined_override=combined_override)
             plot_combined_rolling_sharpe(
-                proxy_results, save_path=str(output / "rolling_sharpe.png"))
+                proxy_results, save_path=str(output / "rolling_sharpe.png"),
+                combined_override=combined_override)
 
         all_ret = next(iter(ret_map.values()))
         blended_end = blended_combined.index[-1].date() if not blended_combined.empty else all_ret.index[-1].date()

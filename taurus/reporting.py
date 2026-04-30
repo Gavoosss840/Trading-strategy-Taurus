@@ -169,18 +169,21 @@ def plot_rolling_sharpe(
 def plot_combined_equity_curve(
     results: Dict[str, "BacktestResult"],
     save_path: Optional[str] = None,
+    combined_override: Optional[pd.Series] = None,
 ):
     """
-    Equity curve showing each universe + equal-weighted combined line.
+    Equity curve showing each universe + combined line.
 
     Parameters
     ----------
-    results   : {universe_name: BacktestResult}
-    save_path : if given, save figure to this path
+    results            : {universe_name: BacktestResult}
+    save_path          : if given, save figure to this path
+    combined_override  : pre-computed blended series (backtest + live).
+                         When provided, replaces equal-weighted combined.
     """
     plt, gridspec = _plt()
 
-    combined = _combined_returns(results)
+    combined = combined_override.dropna() if combined_override is not None else _combined_returns(results)
     if combined.empty:
         logger.warning("No combined returns to plot.")
         return
@@ -193,7 +196,7 @@ def plot_combined_equity_curve(
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
 
-    # Individual universe lines
+    # Individual universe lines (backtest only)
     for i, (name, result) in enumerate(results.items()):
         ret = result.portfolio_returns()
         if ret.empty:
@@ -203,9 +206,21 @@ def plot_combined_equity_curve(
         ax1.plot(cum.index, cum.values, linewidth=1.2, color=color,
                  linestyle="--", alpha=0.7, label=name.upper())
 
-    # Combined bold line
+    label = "Combined (Backtest → Live)" if combined_override is not None else "Combined (equal-weighted)"
     ax1.plot(cum_combined.index, cum_combined.values, linewidth=2.2,
-             color="black", label="Combined (equal-weighted)")
+             color="black", label=label)
+
+    # Mark backtest → live transition
+    if combined_override is not None and results:
+        bt_frames = [r.portfolio_returns() for r in results.values()]
+        if bt_frames:
+            last_bt = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
+            live_dates = combined_override.index[combined_override.index > last_bt]
+            if len(live_dates):
+                vline = live_dates[0]
+                ax1.axvline(vline, color="#e67e22", linewidth=1.2, linestyle="--",
+                            label=f"Live start ({vline.strftime('%Y-%m')})")
+                ax2.axvline(vline, color="#e67e22", linewidth=1.2, linestyle="--")
 
     ax1.set_ylabel("Cumulative Return", fontsize=11)
     ax1.set_title("Taurus – Combined Equity Curve", fontsize=13, fontweight="bold")
@@ -230,20 +245,24 @@ def plot_combined_equity_curve(
 def plot_combined_heatmap(
     results: Dict[str, "BacktestResult"],
     save_path: Optional[str] = None,
+    combined_override: Optional[pd.Series] = None,
 ):
     """
     Multi-panel heatmap: one row of subplots per universe + combined row.
 
     Parameters
     ----------
-    results   : {universe_name: BacktestResult}
-    save_path : if given, save figure to this path
+    results            : {universe_name: BacktestResult}
+    save_path          : if given, save figure to this path
+    combined_override  : pre-computed blended series (backtest + live) for the
+                         Combined row. When provided, live months appear in the heatmap.
     """
     plt, _ = _plt()
 
-    combined = _combined_returns(results)
+    combined = combined_override.dropna() if combined_override is not None else _combined_returns(results)
+    combined_label = "COMBINED (Backtest→Live)" if combined_override is not None else "COMBINED"
     all_series = {**{k: v.portfolio_returns() for k, v in results.items()},
-                  "Combined": combined}
+                  combined_label: combined}
 
     n = len(all_series)
     fig, axes = plt.subplots(n, 1, figsize=(16, max(3, n * 2.5)))
@@ -269,23 +288,26 @@ def plot_combined_rolling_sharpe(
     results: Dict[str, "BacktestResult"],
     window: int = 12,
     save_path: Optional[str] = None,
+    combined_override: Optional[pd.Series] = None,
 ):
     """
     Rolling Sharpe for each universe + combined, all on a single chart.
 
     Parameters
     ----------
-    results : {universe_name: BacktestResult}
-    window  : rolling window in months (default 12)
+    results            : {universe_name: BacktestResult}
+    window             : rolling window in months (default 12)
+    combined_override  : pre-computed blended series (backtest + live).
+                         When provided, the combined rolling Sharpe extends into live months.
     """
     plt, _ = _plt()
 
-    combined = _combined_returns(results)
-    # Use rf from first result
+    combined = combined_override.dropna() if combined_override is not None else _combined_returns(results)
     rf_m = next(iter(results.values())).cfg.rf_monthly
 
+    combined_label = "Combined (B→L)" if combined_override is not None else "Combined"
     all_series = {**{k: v.portfolio_returns() for k, v in results.items()},
-                  "Combined": combined}
+                  combined_label: combined}
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
@@ -293,12 +315,22 @@ def plot_combined_rolling_sharpe(
         if len(ret) < window + 1:
             continue
         roll_sh = _rolling_sharpe(ret, rf_m, window)
-        is_combined = name == "Combined"
+        is_combined = name == combined_label
         color = "black" if is_combined else _PALETTE[i % len(_PALETTE)]
         lw    = 2.2 if is_combined else 1.2
         ls    = "-"  if is_combined else "--"
         ax.plot(roll_sh.index, roll_sh.values, linewidth=lw, color=color,
                 linestyle=ls, alpha=0.85 if is_combined else 0.65, label=name.upper())
+
+    # Mark backtest → live transition
+    if combined_override is not None and results:
+        bt_frames = [r.portfolio_returns() for r in results.values()]
+        if bt_frames:
+            last_bt = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
+            live_dates = combined_override.index[combined_override.index > last_bt]
+            if len(live_dates):
+                ax.axvline(live_dates[0], color="#e67e22", linewidth=1.2,
+                           linestyle="--", label=f"Live start ({live_dates[0].strftime('%Y-%m')})")
 
     ax.axhline(0, color="grey", linewidth=0.8)
     ax.axhline(1, color="#1f77b4", linewidth=0.8, linestyle=":", label="Sharpe=1")
