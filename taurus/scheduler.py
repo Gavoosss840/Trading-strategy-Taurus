@@ -269,18 +269,61 @@ class RebalanceScheduler:
             universe_name, snapshot.n_longs, snapshot.n_shorts,
         )
 
-        # Extract last yfinance close prices — used as fallback when IBKR market data
-        # subscription is missing (e.g. LSE / TSEJ on paper account, or market closed)
+        # Extract CURRENT yfinance prices for STP/LMT calculation.
+        # CRITICAL: must use TODAY's price, NOT as_of (March 31) price.
+        # If the stock dropped -20% between as_of and today, a stop based on
+        # the March 31 price would be placed above the current market price,
+        # triggering immediately or never protecting against further downside.
         yf_prices: dict = {}
         try:
-            prices_df = strategy._prices   # DataFrame: rows=dates, cols=tickers
+            prices_df = strategy._prices
             if prices_df is not None and not prices_df.empty:
-                last_row = prices_df.iloc[-1].dropna()
-                yf_prices = last_row.to_dict()
-                logger.info(
-                    "[%s] yfinance fallback prices ready for %d tickers (last date: %s)",
-                    universe_name, len(yf_prices), prices_df.index[-1].date(),
-                )
+                stale_date = prices_df.index[-1].date()
+                today_date = pd.Timestamp.today().date()
+                days_stale = (today_date - stale_date).days
+
+                if days_stale <= 1:
+                    # Data is current (same day or 1 day old) — use directly
+                    last_row   = prices_df.iloc[-1].dropna()
+                    yf_prices  = last_row.to_dict()
+                    logger.info(
+                        "[%s] yfinance prices ready for %d tickers (date: %s)",
+                        universe_name, len(yf_prices), stale_date,
+                    )
+                else:
+                    # as_of is in the past — download TODAY's prices to avoid stale
+                    # stop/limit levels that are already breached.
+                    logger.info(
+                        "[%s] as_of prices are %d days old (%s) — downloading fresh prices for correct STP/LMT levels",
+                        universe_name, days_stale, stale_date,
+                    )
+                    import yfinance as _yf
+                    all_t = list(snapshot.long_weights.index) + list(snapshot.short_weights.index)
+                    if all_t:
+                        raw = _yf.download(
+                            all_t,
+                            period="2d",
+                            interval="1d",
+                            auto_adjust=True,
+                            progress=False,
+                            threads=True,
+                        )
+                        if isinstance(raw.columns, pd.MultiIndex):
+                            close = raw["Close"]
+                        else:
+                            close = raw[["Close"]]
+                            close.columns = all_t
+                        fresh_row = close.iloc[-1].dropna()
+                        yf_prices = fresh_row.to_dict()
+                        logger.info(
+                            "[%s] Fresh prices downloaded for %d tickers (date: %s)",
+                            universe_name, len(yf_prices), close.index[-1].date(),
+                        )
+                    # Fill any gaps with as_of prices (better than nothing)
+                    stale_row = prices_df.iloc[-1].dropna().to_dict()
+                    for t, p in stale_row.items():
+                        if t not in yf_prices or yf_prices[t] <= 0:
+                            yf_prices[t] = p
         except Exception as e:
             logger.warning("[%s] Could not extract yfinance prices: %s", universe_name, e)
 
