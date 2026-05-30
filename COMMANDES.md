@@ -3,9 +3,7 @@
 ## Rebalancement mensuel (commande principale)
 
 ```bash
-python main.py --mode force-rebalance \
-  --universes sp500 nasdaq100 ftse100 cac40 nikkei225 \
-  --no-dry-run
+python main.py --mode force-rebalance --universes sp500 nasdaq100 ftse100 cac40 nikkei225 --no-dry-run
 ```
 
 > **À lancer le 1er du mois** (ex: 1er juin pour les signaux de mai).
