@@ -1,56 +1,120 @@
 # Taurus Strategy — Commandes
 
-## Backtest
+## Rebalancement mensuel (commande principale)
 
 ```bash
-python main.py --mode backtest --start 2022-01-01 --end 2026-03-31 --universes sp500 nasdaq100 ftse100 cac40 nikkei225
+python main.py --mode force-rebalance \
+  --universes sp500 nasdaq100 ftse100 cac40 nikkei225 \
+  --no-dry-run
 ```
-> Lance un backtest complet sur tous les univers et génère les rapports dans `output/`
+
+> **À lancer le 1er du mois** (ex: 1er juin pour les signaux de mai).
+> Lance une fois, place les ordres, s'arrête automatiquement.
+> Connexion paper par défaut (port 7497). Ajouter `--live` pour le compte réel (port 7496).
+
+**Pourquoi le 1er du mois ?**
+Le calcul des signaux utilise `as_of` = dernier jour ouvrable du mois précédent complété.
+- Lancé le **1er juin** → `as_of = 29 mai` (signaux MAI complets) ✓
+- Lancé le **31 mai** → `as_of = 30 avril` (signaux AVRIL — même que le mois dernier) ✗
 
 ---
 
-## Live (rebalance mensuel)
+## Correction des ordres STP/LMT après rebalancement
 
 ```bash
-python main.py --mode live --universes sp500 nasdaq100 ftse100 cac40 nikkei225
+# Prévisualisation (dry-run)
+python main.py --mode refresh-protective \
+  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
+
+# Application
+python main.py --mode refresh-protective \
+  --universes sp500 nasdaq100 ftse100 cac40 nikkei225 \
+  --no-dry-run
 ```
-> À lancer le **30 ou 31 du mois**. Se connecte au TWS (paper par défaut, port 7497).  
-> L'algo tourne toute la nuit et exécute les ordres à la clôture US (~22h30 CET).  
-> Les stops natifs IBKR sont posés automatiquement → tu peux éteindre le PC le 1er du mois.
+
+> Recalcule les niveaux stop-loss et take-profit depuis le `avg_cost` IBKR réel.
+> Ne touche **jamais** aux ordres MKT (entrées déjà placées).
+> À lancer si des STP/LMT semblent mal positionnés dans TWS.
 
 ---
 
-## Rapport live (à tout moment)
+## Rapport de performance
 
 ```bash
-python main.py --mode report --universes sp500 nasdaq100 ftse100 cac40 nikkei225
+python main.py --mode report \
+  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
 ```
-> Génère `output/report.png` en ~3 secondes depuis les données déjà stockées.  
+
+> Génère tous les charts en ~3 secondes depuis les données stockées.
+> Fusionne automatiquement backtest + données live si `output/live/nav_history.csv` existe.
 > Aucune connexion IBKR ni téléchargement nécessaire.
 
+**Fichiers générés dans `output/` :**
+
+| Fichier | Description |
+|---------|-------------|
+| `report.png` | Rapport complet 1 page (table + equity curve + heatmap) |
+| `equity_curve.png` | Courbe de performance avec ligne de transition backtest→live |
+| `monthly_heatmap.png` | Heatmap des returns mensuels (backtest + cases live) |
+| `rolling_sharpe.png` | Sharpe ratio glissant 12 mois |
+| `positions.csv` | Positions actuelles tous univers |
+| `combined_analytics.json` | Stats détaillées JSON |
+| `{univers}/monthly_returns.csv` | Returns mensuels par univers |
+| `live/nav_history.csv` | Historique NAV live (1 ligne par rebalancement) |
+| `execution_{univers}_{date}.json` | Rapport d'exécution des ordres |
+
 ---
 
-## Git
+## Backtest complet
 
 ```bash
-# Récupérer les dernières modifs
-git pull origin claude/optimize-python-algorithm-dWMxq
-
-# Pousser tes modifs
-git add -A && git commit -m "ton message" && git push -u origin claude/optimize-python-algorithm-dWMxq
+python main.py --mode backtest \
+  --start 2020-01-01 --end 2026-05-29 \
+  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
 ```
+
+> Durée : ~10-15 min (téléchargement EDGAR + yfinance + calcul).
+> Génère les `monthly_returns.csv` nécessaires pour `--mode report`.
 
 ---
 
-## Checklist mensuelle (J-1 = 30 ou 31 du mois)
+## Vérifier les ordres de protection en cours
 
-| Heure | Action |
-|-------|--------|
-| Matin | Ouvrir TWS (paper) → vérifier connexion |
-| Matin | `python main.py --mode live --universes sp500 nasdaq100 ftse100 cac40 nikkei225` |
-| 22h30 | Vérifier les ordres dans TWS (blotter) |
-| 1er du mois | `python main.py --mode report --universes sp500 nasdaq100 ftse100 cac40 nikkei225` |
-| 1er du mois | Vérifier `output/report.png` → fermer TWS → éteindre PC |
+```bash
+python main.py --mode check-protective \
+  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
+```
+
+> Liste tous les STP/LMT actifs et leur statut sans rien modifier.
+
+---
+
+## Checklist mensuelle (1er du mois)
+
+| Étape | Commande / Action |
+|-------|-------------------|
+| 1. Ouvrir TWS | Paper trading → vérifier connexion (port 7497) |
+| 2. Git pull | `git pull origin claude/optimize-python-algorithm-dWMxq` |
+| 3. Rebalancement | `python main.py --mode force-rebalance --universes sp500 nasdaq100 ftse100 cac40 nikkei225 --no-dry-run` |
+| 4. Vérifier TWS | Contrôler les ordres MKT dans le blotter |
+| 5. Corriger STP/LMT | `python main.py --mode refresh-protective --universes sp500 nasdaq100 ftse100 cac40 nikkei225 --no-dry-run` |
+| 6. Rapport | `python main.py --mode report --universes sp500 nasdaq100 ftse100 cac40 nikkei225` |
+| 7. Ouvrir | `output/report.png` |
+
+---
+
+## Ajouter une NAV manuelle dans l'historique live
+
+Si une NAV mensuelle est manquante (ex: mois de démarrage), l'ajouter dans
+`output/live/nav_history.csv` :
+
+```csv
+date,nav,currency,note,recorded_at
+2026-03-31,100000.00,USD,manual-baseline,2026-04-01T09:00:00
+2026-04-30,XXXXX.XX,USD,force-rebalance,2026-04-30T11:...
+```
+
+> La valeur NAV du 31 mars se trouve dans TWS → Account → Reports → Account Statement.
 
 ---
 
@@ -70,9 +134,36 @@ print('LVMH last price:', ticker.last)
 ib.disconnect()
 "
 
-# Tester yfinance (données fondamentaux)
+# Tester yfinance
 python -c "import yfinance as yf; print(yf.Ticker('AAPL').info.get('marketCap', 'N/A'))"
 ```
+
+---
+
+## Git
+
+```bash
+# Récupérer les dernières mises à jour
+git pull origin claude/optimize-python-algorithm-dWMxq
+
+# Pousser ses modifications
+git add -A && git commit -m "message" && git push -u origin claude/optimize-python-algorithm-dWMxq
+```
+
+---
+
+## Modes disponibles (référence complète)
+
+| Mode | Usage | Boucle infinie |
+|------|-------|:--------------:|
+| `force-rebalance` | **Rebalancement mensuel manuel** | Non — s'arrête seul |
+| `refresh-protective` | Corriger STP/LMT après rebalancement | Non — s'arrête seul |
+| `check-protective` | Inspecter les ordres de protection | Non — s'arrête seul |
+| `report` | Générer les charts (backtest + live) | Non — s'arrête seul |
+| `live-report` | Rapport live uniquement (NAV history) | Non — s'arrête seul |
+| `backtest` | Backtest complet (données historiques) | Non — s'arrête seul |
+| `snapshot` | Snapshot du portefeuille actuel | Non — s'arrête seul |
+| `live` | Daemon 24/7 automatique (pas utile en manuel) | **Oui — Ctrl+C pour stop** |
 
 ---
 
@@ -81,24 +172,13 @@ python -c "import yfinance as yf; print(yf.Ticker('AAPL').info.get('marketCap', 
 | Paramètre | Valeur | Description |
 |-----------|--------|-------------|
 | `ibkr_port` | 7497 | Paper trading (live = 7496) |
-| `trailing_stop_pct` | 10% | Stop trailing natif IBKR |
-| `circuit_breaker_pct` | 15% | Coupe tout si -15% portefeuille |
-| `stop_loss_pct` | 10% | Stop-loss par position |
-| `lookback_months` | 60 | Fenêtre régression FF5 |
-| `n_longs` | 10 | Nombre de positions long |
-| `n_shorts` | 10 | Nombre de positions short |
-
----
-
-## Fichiers de sortie (`output/`)
-
-| Fichier | Description |
-|---------|-------------|
-| `report.png` | Rapport complet 1 page |
-| `equity_curve.png` | Courbe de performance |
-| `monthly_heatmap.png` | Heatmap des returns mensuels |
-| `rolling_sharpe.png` | Sharpe ratio glissant 12 mois |
-| `positions.csv` | Positions actuelles tous univers |
-| `combined_analytics.json` | Stats détaillées JSON |
-| `{univers}/monthly_returns.csv` | Returns mensuels par univers |
-| `execution_{univers}_{date}.json` | Rapport d'exécution des ordres |
+| `stop_loss_pct` | 10% | Stop-loss par position (vol-ajusté si `vol_adjusted_stops=True`) |
+| `take_profit_pct` | 20% | Take-profit par position (ou divergence MM si disponible) |
+| `trailing_stop_pct` | 10% | Trailing stop depuis le pic |
+| `circuit_breaker_pct` | 15% | Coupe tout si portefeuille -15% depuis dernier rebalancement |
+| `lookback_months` | 60 | Fenêtre régression FF5/FF6 |
+| `optimizer_method` | `min_variance` | Optimiseur : min-variance + alpha tilt |
+| `signal_method` | `composite` | Signal : z-score composite (alpha + MM + momentum) |
+| `use_umd_factor` | `True` | FF6 : ajoute le facteur momentum dans la régression |
+| `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
+| `cov_halflife` | 36 | Demi-vie EWMA covariance (mois) |
