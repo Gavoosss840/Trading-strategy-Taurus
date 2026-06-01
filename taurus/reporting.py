@@ -337,7 +337,8 @@ def plot_combined_rolling_sharpe(
     fig, ax = plt.subplots(figsize=(14, 5))
 
     # Individual universe lines (pure backtest)
-    for i, (name, ret) in enumerate(results.items()):
+    for i, (name, result) in enumerate(results.items()):
+        ret = result.portfolio_returns() if hasattr(result, "portfolio_returns") else result
         if len(ret) < window + 1:
             continue
         roll_sh = _rolling_sharpe(ret, rf_m, window)
