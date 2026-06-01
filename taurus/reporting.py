@@ -196,15 +196,23 @@ def plot_combined_equity_curve(
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
 
-    # Compute live_start once so individual lines can be split
+    # live_start: prefer the value stored by blend_returns_with_live (exact NAV date)
+    # over the fallback heuristic (first combined_override date after last backtest).
     live_start = None
-    if combined_override is not None and results:
-        bt_frames = [r.portfolio_returns() for r in results.values()]
-        if bt_frames:
-            last_bt   = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
-            live_dates = combined_override.index[combined_override.index > last_bt]
-            if len(live_dates):
-                live_start = live_dates[0]
+    last_bt    = None
+    if combined_override is not None:
+        _ls = combined_override.attrs.get("live_start")
+        if _ls:
+            live_start = pd.Timestamp(_ls)
+        elif results:
+            bt_frames = [r.portfolio_returns() for r in results.values()]
+            if bt_frames:
+                last_bt    = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
+                live_dates = combined_override.index[combined_override.index > last_bt]
+                if len(live_dates):
+                    live_start = live_dates[0]
+    if live_start is not None and last_bt is None:
+        last_bt = live_start  # for the split boundary
 
     # Individual universe lines — bright in backtest, faded after live_start
     for i, (name, result) in enumerate(results.items()):
@@ -323,16 +331,22 @@ def plot_combined_rolling_sharpe(
 
     combined_label = "Combined (B→L)" if combined_override is not None else "Combined"
 
-    # Compute live_start once
+    # live_start: prefer attrs (set by blend_returns_with_live) over heuristic
     live_start = None
     last_bt    = None
-    if combined_override is not None and results:
-        bt_frames = [r.portfolio_returns() for r in results.values()]
-        if bt_frames:
-            last_bt    = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
-            live_dates = combined_override.index[combined_override.index > last_bt]
-            if len(live_dates):
-                live_start = live_dates[0]
+    if combined_override is not None:
+        _ls = combined_override.attrs.get("live_start")
+        if _ls:
+            live_start = pd.Timestamp(_ls)
+        elif results:
+            bt_frames = [r.portfolio_returns() for r in results.values()]
+            if bt_frames:
+                last_bt    = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
+                live_dates = combined_override.index[combined_override.index > last_bt]
+                if len(live_dates):
+                    live_start = live_dates[0]
+    if live_start is not None and last_bt is None:
+        last_bt = live_start
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
@@ -662,14 +676,20 @@ def generate_combined_report(
             tbl[combined_row_idx, j].set_facecolor("#d5e8d4")
             tbl[combined_row_idx, j].set_text_props(fontweight="bold")
 
-    # Detect live_start for visual split
+    # Detect live_start — prefer attrs (set by blend_returns_with_live)
     _live_start = None
     _last_bt    = None
-    if combined_override is not None and not df_ret.empty:
-        _last_bt   = df_ret.dropna(how="all").index[-1]
-        _live_d    = combined_override.index[combined_override.index > _last_bt]
-        if len(_live_d):
-            _live_start = _live_d[0]
+    if combined_override is not None:
+        _ls = combined_override.attrs.get("live_start")
+        if _ls:
+            _live_start = pd.Timestamp(_ls)
+        elif not df_ret.empty:
+            _last_bt = df_ret.dropna(how="all").index[-1]
+            _live_d  = combined_override.index[combined_override.index > _last_bt]
+            if len(_live_d):
+                _live_start = _live_d[0]
+    if _live_start is not None and _last_bt is None:
+        _last_bt = _live_start
 
     # Equity curve — bright in backtest, grey/faded in live period
     for i, (name, result) in enumerate(results.items()):

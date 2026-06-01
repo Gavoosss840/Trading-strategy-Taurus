@@ -181,13 +181,29 @@ def blend_returns_with_live(
     live_start = live.index[0]
     bt_slice   = bt_combined[bt_combined.index < live_start]
 
-    blended = pd.concat([bt_slice, live]).sort_index()
+    # For months in the live period where live NAV is missing (e.g. May skipped),
+    # fill from backtest if available.  Live data always takes precedence.
+    bt_in_live = bt_combined[
+        (bt_combined.index >= live_start) & (bt_combined.index <= live.index[-1])
+    ]
+    if not bt_in_live.empty:
+        gap_filled = bt_in_live.copy()
+        for idx, val in live.items():
+            gap_filled[idx] = val          # live overrides backtest for same month
+        live_combined = gap_filled
+    else:
+        live_combined = live
+
+    blended = pd.concat([bt_slice, live_combined]).sort_index()
     blended.name = "combined"
+    # Store live_start so chart functions use the correct transition date (not
+    # the last individual-universe backtest date which may be later).
+    blended.attrs["live_start"] = live_start.isoformat()
 
     n_bt   = len(bt_slice)
-    n_live = len(live)
+    n_live = len(live_combined)
     logger.info(
-        "Blended combined returns: %d backtest months + %d live months (from %s)",
+        "Blended combined returns: %d backtest months + %d live/gap-filled months (from %s)",
         n_bt, n_live, live_start.strftime("%Y-%m"),
     )
     return blended
