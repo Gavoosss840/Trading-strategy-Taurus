@@ -196,31 +196,47 @@ def plot_combined_equity_curve(
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
 
-    # Individual universe lines (backtest only)
+    # Compute live_start once so individual lines can be split
+    live_start = None
+    if combined_override is not None and results:
+        bt_frames = [r.portfolio_returns() for r in results.values()]
+        if bt_frames:
+            last_bt   = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
+            live_dates = combined_override.index[combined_override.index > last_bt]
+            if len(live_dates):
+                live_start = live_dates[0]
+
+    # Individual universe lines — bright in backtest, faded after live_start
     for i, (name, result) in enumerate(results.items()):
         ret = result.portfolio_returns()
         if ret.empty:
             continue
-        cum = (1 + ret).cumprod()
+        cum   = (1 + ret).cumprod()
         color = _PALETTE[i % len(_PALETTE)]
-        ax1.plot(cum.index, cum.values, linewidth=1.2, color=color,
-                 linestyle="--", alpha=0.7, label=name.upper())
+        if live_start is not None:
+            cum_bt   = cum[cum.index <= last_bt]
+            cum_post = cum[cum.index >  last_bt]
+            ax1.plot(cum_bt.index,   cum_bt.values,   linewidth=1.2, color=color,
+                     linestyle="--", alpha=0.65, label=name.upper())
+            if not cum_post.empty:
+                ax1.plot(cum_post.index, cum_post.values, linewidth=0.8, color="grey",
+                         linestyle="--", alpha=0.25)
+        else:
+            ax1.plot(cum.index, cum.values, linewidth=1.2, color=color,
+                     linestyle="--", alpha=0.7, label=name.upper())
 
     label = "Combined (Backtest → Live)" if combined_override is not None else "Combined (equal-weighted)"
     ax1.plot(cum_combined.index, cum_combined.values, linewidth=2.2,
              color="black", label=label)
 
-    # Mark backtest → live transition
-    if combined_override is not None and results:
-        bt_frames = [r.portfolio_returns() for r in results.values()]
-        if bt_frames:
-            last_bt = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
-            live_dates = combined_override.index[combined_override.index > last_bt]
-            if len(live_dates):
-                vline = live_dates[0]
-                ax1.axvline(vline, color="#e67e22", linewidth=1.2, linestyle="--",
-                            label=f"Live start ({vline.strftime('%Y-%m')})")
-                ax2.axvline(vline, color="#e67e22", linewidth=1.2, linestyle="--")
+    # Mark backtest → live transition + shade live region
+    if live_start is not None:
+        x_end = cum_combined.index[-1]
+        ax1.axvspan(live_start, x_end, alpha=0.06, color="#e67e22", zorder=0)
+        ax2.axvspan(live_start, x_end, alpha=0.06, color="#e67e22", zorder=0)
+        ax1.axvline(live_start, color="#e67e22", linewidth=1.4, linestyle="--",
+                    label=f"Live start ({live_start.strftime('%Y-%m')})")
+        ax2.axvline(live_start, color="#e67e22", linewidth=1.4, linestyle="--")
 
     ax1.set_ylabel("Cumulative Return", fontsize=11)
     ax1.set_title("Taurus – Combined Equity Curve", fontsize=13, fontweight="bold")
@@ -306,31 +322,51 @@ def plot_combined_rolling_sharpe(
     rf_m = next(iter(results.values())).cfg.rf_monthly
 
     combined_label = "Combined (B→L)" if combined_override is not None else "Combined"
-    all_series = {**{k: v.portfolio_returns() for k, v in results.items()},
-                  combined_label: combined}
 
-    fig, ax = plt.subplots(figsize=(14, 5))
-
-    for i, (name, ret) in enumerate(all_series.items()):
-        if len(ret) < window + 1:
-            continue
-        roll_sh = _rolling_sharpe(ret, rf_m, window)
-        is_combined = name == combined_label
-        color = "black" if is_combined else _PALETTE[i % len(_PALETTE)]
-        lw    = 2.2 if is_combined else 1.2
-        ls    = "-"  if is_combined else "--"
-        ax.plot(roll_sh.index, roll_sh.values, linewidth=lw, color=color,
-                linestyle=ls, alpha=0.85 if is_combined else 0.65, label=name.upper())
-
-    # Mark backtest → live transition
+    # Compute live_start once
+    live_start = None
+    last_bt    = None
     if combined_override is not None and results:
         bt_frames = [r.portfolio_returns() for r in results.values()]
         if bt_frames:
-            last_bt = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
+            last_bt    = pd.concat(bt_frames, axis=1).dropna(how="all").index[-1]
             live_dates = combined_override.index[combined_override.index > last_bt]
             if len(live_dates):
-                ax.axvline(live_dates[0], color="#e67e22", linewidth=1.2,
-                           linestyle="--", label=f"Live start ({live_dates[0].strftime('%Y-%m')})")
+                live_start = live_dates[0]
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    # Individual universe lines (pure backtest)
+    for i, (name, ret) in enumerate(results.items()):
+        if len(ret) < window + 1:
+            continue
+        roll_sh = _rolling_sharpe(ret, rf_m, window)
+        color   = _PALETTE[i % len(_PALETTE)]
+        if live_start is not None:
+            # Bright up to live_start, then fade to grey
+            sh_bt   = roll_sh[roll_sh.index <= last_bt]
+            sh_post = roll_sh[roll_sh.index >  last_bt]
+            ax.plot(sh_bt.index,   sh_bt.values,   linewidth=1.2, color=color,
+                    linestyle="--", alpha=0.65, label=name.upper())
+            if not sh_post.empty:
+                ax.plot(sh_post.index, sh_post.values, linewidth=0.8, color="grey",
+                        linestyle="--", alpha=0.20)
+        else:
+            ax.plot(roll_sh.index, roll_sh.values, linewidth=1.2, color=color,
+                    linestyle="--", alpha=0.65, label=name.upper())
+
+    # Combined line (blended backtest + live)
+    if len(combined) >= window + 1:
+        roll_c = _rolling_sharpe(combined, rf_m, window)
+        ax.plot(roll_c.index, roll_c.values, linewidth=2.2, color="black",
+                linestyle="-", alpha=0.9, label=combined_label.upper())
+
+    # Shade live region + vertical line
+    if live_start is not None:
+        x_end = combined.index[-1]
+        ax.axvspan(live_start, x_end, alpha=0.07, color="#e67e22", zorder=0)
+        ax.axvline(live_start, color="#e67e22", linewidth=1.4,
+                   linestyle="--", label=f"Live start ({live_start.strftime('%Y-%m')})")
 
     ax.axhline(0, color="grey", linewidth=0.8)
     ax.axhline(1, color="#1f77b4", linewidth=0.8, linestyle=":", label="Sharpe=1")
@@ -625,32 +661,46 @@ def generate_combined_report(
             tbl[combined_row_idx, j].set_facecolor("#d5e8d4")
             tbl[combined_row_idx, j].set_text_props(fontweight="bold")
 
-    # Equity curve
+    # Detect live_start for visual split
+    _live_start = None
+    _last_bt    = None
+    if combined_override is not None and not df_ret.empty:
+        _last_bt   = df_ret.dropna(how="all").index[-1]
+        _live_d    = combined_override.index[combined_override.index > _last_bt]
+        if len(_live_d):
+            _live_start = _live_d[0]
+
+    # Equity curve — bright in backtest, grey/faded in live period
     for i, (name, result) in enumerate(results.items()):
         ret = result.portfolio_returns()
         if ret.empty:
             continue
-        cum = (1 + ret).cumprod()
-        ax_eq.plot(cum.index, cum.values, linewidth=1.2,
-                   color=_PALETTE[i % len(_PALETTE)],
-                   linestyle="--", alpha=0.65, label=name.upper())
+        cum   = (1 + ret).cumprod()
+        color = _PALETTE[i % len(_PALETTE)]
+        if _live_start is not None:
+            cum_bt   = cum[cum.index <= _last_bt]
+            cum_post = cum[cum.index >  _last_bt]
+            ax_eq.plot(cum_bt.index,   cum_bt.values,   linewidth=1.2, color=color,
+                       linestyle="--", alpha=0.65, label=name.upper())
+            if not cum_post.empty:
+                ax_eq.plot(cum_post.index, cum_post.values, linewidth=0.8, color="grey",
+                           linestyle="--", alpha=0.20)
+        else:
+            ax_eq.plot(cum.index, cum.values, linewidth=1.2, color=color,
+                       linestyle="--", alpha=0.65, label=name.upper())
 
     combined_label = "COMBINED (Live)" if combined_override is not None else "COMBINED (Sharpe-wtd)"
     ax_eq.plot(cum_c.index, cum_c.values, linewidth=2.2,
                color="black", label=combined_label)
     ax_eq.axhline(1.0, color="grey", linewidth=0.7, linestyle=":")
 
-    # Mark the transition from backtest to live data with a vertical line.
-    # The live portion starts where combined_override extends beyond the last
-    # backtest-only date, i.e. beyond the last date present in all universe returns.
-    if combined_override is not None and not df_ret.empty:
-        last_bt_date = df_ret.dropna(how="all").index[-1]
-        live_dates   = combined_override.index[combined_override.index > last_bt_date]
-        if len(live_dates):
-            live_start = live_dates[0]
-            ax_eq.axvline(live_start, color="#e67e22", linewidth=1.2,
-                          linestyle="--", label=f"Live start ({live_start.strftime('%Y-%m')})")
-            ax_dd.axvline(live_start, color="#e67e22", linewidth=1.2, linestyle="--")
+    if _live_start is not None:
+        x_end = cum_c.index[-1]
+        ax_eq.axvspan(_live_start, x_end, alpha=0.06, color="#e67e22", zorder=0)
+        ax_dd.axvspan(_live_start, x_end, alpha=0.06, color="#e67e22", zorder=0)
+        ax_eq.axvline(_live_start, color="#e67e22", linewidth=1.2,
+                      linestyle="--", label=f"Live start ({_live_start.strftime('%Y-%m')})")
+        ax_dd.axvline(_live_start, color="#e67e22", linewidth=1.2, linestyle="--")
 
     title_suffix = " (Backtest → Live)" if combined_override is not None else ""
     ax_eq.set_title(f"Equity Curve – Combined{title_suffix}", fontsize=11, fontweight="bold")
@@ -673,14 +723,28 @@ def generate_combined_report(
         if len(ret) < window + 1:
             continue
         roll_sh = _rolling_sharpe(ret, 0.0, window)
-        ax_sh.plot(roll_sh.index, roll_sh.values,
-                   linewidth=1.2, color=_PALETTE[i % len(_PALETTE)],
-                   linestyle="--", alpha=0.65, label=name.upper())
+        color   = _PALETTE[i % len(_PALETTE)]
+        if _live_start is not None:
+            sh_bt   = roll_sh[roll_sh.index <= _last_bt]
+            sh_post = roll_sh[roll_sh.index >  _last_bt]
+            ax_sh.plot(sh_bt.index,   sh_bt.values,   linewidth=1.2, color=color,
+                       linestyle="--", alpha=0.65, label=name.upper())
+            if not sh_post.empty:
+                ax_sh.plot(sh_post.index, sh_post.values, linewidth=0.8, color="grey",
+                           linestyle="--", alpha=0.20)
+        else:
+            ax_sh.plot(roll_sh.index, roll_sh.values, linewidth=1.2, color=color,
+                       linestyle="--", alpha=0.65, label=name.upper())
 
     if len(combined_ret) > window:
         roll_c = _rolling_sharpe(combined_ret, 0.0, window)
         ax_sh.plot(roll_c.index, roll_c.values, linewidth=2.2,
                    color="black", label="COMBINED")
+
+    if _live_start is not None:
+        ax_sh.axvspan(_live_start, combined_ret.index[-1], alpha=0.07, color="#e67e22", zorder=0)
+        ax_sh.axvline(_live_start, color="#e67e22", linewidth=1.2,
+                      linestyle="--", label=f"Live start ({_live_start.strftime('%Y-%m')})")
 
     ax_sh.axhline(0, color="grey", linewidth=0.7)
     ax_sh.axhline(1, color="#1f77b4", linewidth=0.8, linestyle=":", label="Sharpe=1")
