@@ -120,8 +120,17 @@ def compute_live_monthly_returns(output_dir: str = "output") -> pd.Series:
 
     returns = df["nav"].pct_change().dropna()
     returns.index = pd.to_datetime(returns.index)
-    # Align to month-end timestamps for heatmap compatibility
-    returns.index = returns.index.to_period("M").to_timestamp("M")
+
+    # Map each NAV date to the month it represents.
+    # When the algo runs on the 1st of month M using signals from month M-1,
+    # the captured NAV is the closing value of M-1 — so dates within the first
+    # 5 days of a month are attributed to the previous month.
+    def _nav_date_to_period(dt: pd.Timestamp) -> pd.Timestamp:
+        if dt.day <= 5:
+            return (dt - pd.DateOffset(months=1)).to_period("M").to_timestamp("M")
+        return dt.to_period("M").to_timestamp("M")
+
+    returns.index = returns.index.map(_nav_date_to_period)
     returns.name = "live_returns"
     return returns
 
