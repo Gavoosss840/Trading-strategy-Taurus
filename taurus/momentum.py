@@ -70,7 +70,10 @@ def momentum_signal(
     window = cfg.momentum_months
 
     idx       = prices.index
-    as_of_loc = idx.get_loc(as_of)
+    as_of_loc = idx.get_indexer([as_of], method='pad')[0]
+    if as_of_loc < 0:
+        logger.debug("as_of %s is before price history start.", as_of)
+        return pd.DataFrame()
 
     # Momentum measurement: from (as_of - window - skip) to (as_of - skip)
     end_loc   = as_of_loc - skip
