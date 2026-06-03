@@ -1045,16 +1045,23 @@ class IBKRExecutor:
 
     def _handle_sub_lot(
         self,
-        target:   "pd.Series",
+        target:      "pd.Series",
         snapshot,
-        prices:   dict,
+        prices:      dict,
+        nav_budget:  float = None,
     ) -> "tuple[pd.Series, list]":
         """
         Handle positions where the strategy weight converts to < 1 share.
 
         Rules:
-          1. If (1 lot × price) ≤ available cash → round up to 1 lot and execute.
+          1. If (1 lot × price) ≤ remaining universe budget → round up to 1 lot.
           2. Otherwise → add to manual-orders list (report saved separately).
+
+        nav_budget: the universe's NAV allocation in local currency (already
+        multiplied by nav_fraction).  Sub-lot round-ups are capped to this budget
+        so an expensive stock (e.g. Fast Retailing at ¥50 000 × 100 lot = ¥5 M)
+        cannot consume more than its fair share of the account.
+        If not provided, falls back to account available cash (old behaviour).
 
         Returns (updated_target, manual_rows).
         """
@@ -1082,9 +1089,19 @@ class IBKRExecutor:
         if not sub_lot:
             return target, []
 
-        lot           = getattr(self.udef_cfg, "min_lot_size", 1) or 1
-        avail_cash    = self._get_available_cash()
-        remaining     = avail_cash
+        lot        = getattr(self.udef_cfg, "min_lot_size", 1) or 1
+        avail_cash = self._get_available_cash()
+
+        # Cap rescue budget: min(account available cash, universe NAV budget).
+        # This prevents expensive stocks (e.g. Nikkei 100-lot min) from consuming
+        # far more than their intended portfolio weight just because 1 lot is large.
+        # The universe NAV budget (gross_leverage × nav_budget) is the theoretical
+        # maximum deployment for this universe; sub-lot round-ups stay within it.
+        if nav_budget and nav_budget > 0:
+            universe_cap = nav_budget * self.cfg.gross_leverage
+            remaining    = min(avail_cash, universe_cap)
+        else:
+            remaining = avail_cash
         roundup: dict = {}
         manual: list  = []
 
@@ -1430,7 +1447,8 @@ class IBKRExecutor:
 
             # 3b. Handle sub-lot positions (strategy weight → < 1 share)
             #     Round up to 1 lot if cash permits; otherwise write manual-orders report.
-            target, manual_rows = self._handle_sub_lot(target, snapshot, prices)
+            #     Pass nav_budget so the rescue is capped at this universe's allocation.
+            target, manual_rows = self._handle_sub_lot(target, snapshot, prices, nav_budget=nav)
             if manual_rows and not self.cfg.dry_run:
                 self._save_fractional_report(manual_rows, snapshot.date)
 
