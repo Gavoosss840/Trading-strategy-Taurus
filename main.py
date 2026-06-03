@@ -1264,9 +1264,15 @@ def run_force_rebalance(args, cfg) -> None:
                 from taurus.live_reporting import record_nav_snapshot
                 from taurus.execution import IBKRConnection, PositionReconciler
                 _rec = PositionReconciler()
-                _nav = _rec.get_account_nav(conn, currency=None)
-                record_nav_snapshot(_nav, "USD", args.output, note="force-rebalance")
-                logger.info("NAV snapshot recorded: %.2f USD", _nav)
+                _summary = conn.ib.accountSummary(account=conn.cfg.ibkr_account or "")
+                _base_ccy = next(
+                    (v.currency for v in _summary
+                     if v.tag == "NetLiquidation" and v.currency not in ("BASE", "")),
+                    "EUR",
+                )
+                _nav = _rec.get_account_nav(conn, currency=_base_ccy)
+                record_nav_snapshot(_nav, _base_ccy, args.output, note="force-rebalance")
+                logger.info("NAV snapshot recorded: %.2f %s", _nav, _base_ccy)
             except Exception as _e:
                 logger.warning("Could not record NAV snapshot: %s", _e)
 

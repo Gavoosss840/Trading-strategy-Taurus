@@ -993,19 +993,54 @@ class IBKRExecutor:
 
 
     def _get_available_cash(self) -> float:
-        """Return available funds in this universe's currency from IBKR account summary."""
+        """
+        Return available funds expressed in this universe's currency.
+
+        First tries the exact currency match from IBKR (works when the account
+        already holds that currency).  If not found (e.g. no JPY cash before
+        the first NIKKEI rebalance), falls back to the base-currency total and
+        converts via a live FX quote so the result is always in the correct
+        units for the order_value comparison in _handle_sub_lot.
+        """
         currency = self.udef_cfg.currency
         try:
             summary = self.conn.ib.accountSummary()
         except Exception:
             return 0.0
+
+        # 1. Exact match
         for item in summary:
             if item.tag == "AvailableFunds" and item.currency == currency:
                 return float(item.value)
-        # Fallback: base-currency available funds
+
+        # 2. Base-currency total → FX convert to universe currency
+        base_val = None
+        base_ccy = None
         for item in summary:
             if item.tag == "AvailableFunds" and item.currency not in ("BASE", ""):
-                return float(item.value)
+                base_val = float(item.value)
+                base_ccy = item.currency
+                break
+
+        if base_val is None:
+            return 0.0
+        if base_ccy == currency:
+            return base_val
+
+        rate = PositionReconciler._fetch_fx_rate(self.conn, base_ccy, currency)
+        if rate and rate > 0:
+            converted = base_val * rate
+            logger.debug(
+                "[%s] AvailableFunds: %.2f %s × %.4f = %.2f %s",
+                self.udef_cfg.name, base_val, base_ccy, rate, converted, currency,
+            )
+            return converted
+
+        # 3. No FX rate → return 0 so sub-lot positions go to manual report
+        logger.warning(
+            "[%s] Could not convert AvailableFunds %s→%s — sub-lot rescue disabled",
+            self.udef_cfg.name, base_ccy, currency,
+        )
         return 0.0
 
     def _handle_sub_lot(
