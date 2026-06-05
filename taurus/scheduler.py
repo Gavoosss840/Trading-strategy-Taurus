@@ -269,6 +269,9 @@ class RebalanceScheduler:
             universe_name, snapshot.n_longs, snapshot.n_shorts,
         )
 
+        # Append last month's realised return BEFORE overwriting the snapshot file
+        self._compute_and_append_monthly_return(universe_name, as_of)
+
         # Extract CURRENT yfinance prices for STP/LMT calculation.
         # CRITICAL: must use TODAY's price, NOT as_of (March 31) price.
         # If the stock dropped -20% between as_of and today, a stop based on
@@ -339,7 +342,139 @@ class RebalanceScheduler:
             "[%s] Execution: %d orders placed, %d errors",
             universe_name, len(report.orders), len(report.errors),
         )
+
+        # Save current weights so next rebalance can compute this month's return
+        self._save_universe_snapshot(universe_name, snapshot, as_of)
+
         return report
+
+    # ── Live monthly return tracking ─────────────────────────────────────── #
+
+    def _save_universe_snapshot(
+        self, universe_name: str, snapshot, as_of: pd.Timestamp
+    ) -> None:
+        """
+        Persist long/short portfolio weights to output/{universe}/last_snapshot.csv.
+        Called after each rebalance so that next month we can measure the
+        realised return of those exact positions.
+        Weights are stored signed: +w for longs, -w for shorts.
+        """
+        path = Path(self.output_dir) / universe_name / "last_snapshot.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        rows = []
+        for ticker, w in snapshot.long_weights.items():
+            rows.append({"ticker": ticker, "weight": float(w), "side": "LONG"})
+        for ticker, w in snapshot.short_weights.items():
+            rows.append({"ticker": ticker, "weight": -float(w), "side": "SHORT"})
+
+        if not rows:
+            return
+
+        df = pd.DataFrame(rows)
+        df["as_of"] = as_of.date().isoformat()
+        df.to_csv(path, index=False)
+        logger.info(
+            "[%s] Snapshot saved (%d positions, as_of=%s).",
+            universe_name, len(rows), as_of.date(),
+        )
+
+    def _compute_and_append_monthly_return(
+        self, universe_name: str, as_of: pd.Timestamp
+    ) -> None:
+        """
+        Compute the realised portfolio return for the previous period using the
+        weights saved in last_snapshot.csv, then append it to
+        output/{universe}/monthly_returns.csv.
+
+        This keeps Sharpe weights current without requiring a full backtest after
+        each live rebalance.  The return is computed as:
+
+            r_portfolio = Σ  w_i × (P_i_end / P_i_start - 1)
+
+        where w_i is signed (+long / -short), P_i_start is the closing price on
+        the previous rebalance date, and P_i_end is the closing price on as_of.
+        """
+        snap_path = Path(self.output_dir) / universe_name / "last_snapshot.csv"
+        ret_path  = Path(self.output_dir) / universe_name / "monthly_returns.csv"
+
+        if not snap_path.exists():
+            logger.info("[%s] No previous snapshot — skipping return computation.", universe_name)
+            return
+
+        try:
+            prev = pd.read_csv(snap_path)
+            if prev.empty or "ticker" not in prev.columns:
+                return
+
+            prev_date = pd.Timestamp(prev["as_of"].iloc[0])
+            weights   = prev.set_index("ticker")["weight"].astype(float)  # signed
+            tickers   = weights.index.tolist()
+
+            if not tickers:
+                return
+
+            # Duplicate guard: don't append the same month twice
+            month_label = prev_date.strftime("%Y-%m-%d")
+            if ret_path.exists():
+                existing = pd.read_csv(ret_path, index_col=0, parse_dates=True)
+                existing.columns = ["return"]
+                if month_label in existing.index.strftime("%Y-%m-%d").tolist():
+                    logger.info(
+                        "[%s] Return for %s already recorded — skipping.",
+                        universe_name, month_label,
+                    )
+                    return
+            else:
+                existing = pd.DataFrame(columns=["return"])
+
+            # Download prices for [prev_date, as_of]
+            import yfinance as _yf
+            raw = _yf.download(
+                tickers,
+                start=prev_date.strftime("%Y-%m-%d"),
+                end=(as_of + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            if raw is None or raw.empty:
+                logger.warning("[%s] No price data for return computation.", universe_name)
+                return
+
+            if isinstance(raw.columns, pd.MultiIndex):
+                close = raw["Close"]
+            else:
+                close = raw[["Close"]]
+                if len(tickers) == 1:
+                    close.columns = tickers
+
+            first_prices = close.bfill().iloc[0]
+            last_prices  = close.ffill().iloc[-1]
+            rets = (last_prices - first_prices) / first_prices.replace(0, float("nan"))
+
+            common = weights.index.intersection(rets.index)
+            if common.empty:
+                logger.warning("[%s] No ticker overlap for return computation.", universe_name)
+                return
+
+            port_return = float((weights[common] * rets[common]).sum())
+
+            new_row  = pd.DataFrame({"return": [port_return]}, index=[pd.Timestamp(month_label)])
+            if existing.empty:
+                combined = new_row
+            else:
+                combined = pd.concat([existing, new_row]).sort_index()
+
+            combined.to_csv(ret_path, header=["return"])
+            logger.info(
+                "[%s] Monthly return appended: %s → %+.2f%% (%d/%d tickers matched).",
+                universe_name, month_label, port_return * 100, len(common), len(tickers),
+            )
+
+        except Exception as e:
+            logger.warning("[%s] Could not compute monthly return: %s", universe_name, e)
 
     # ── Daily risk check ────────────────────────────────────────────────── #
 
