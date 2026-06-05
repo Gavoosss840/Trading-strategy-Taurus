@@ -203,7 +203,16 @@ class TaurusStrategy:
         valid_cols = window_returns.columns[
             window_returns.notna().sum() >= cfg.min_obs
         ]
-        window_returns = window_returns[valid_cols].dropna()
+        window_returns = window_returns[valid_cols]
+        # Impute NaN with cross-sectional median for that month before OLS.
+        # A recently-added index constituent may have NaN in earlier months;
+        # dropna(how='any') would then truncate the whole regression window
+        # to the shortest history in valid_cols (e.g. 35 months → below min_obs).
+        # Cross-sectional median is the standard academic substitute for missing
+        # returns in factor-model panels (no look-ahead, unbiased in expectation).
+        _monthly_median = window_returns.median(axis=1)
+        window_returns = window_returns.apply(lambda col: col.fillna(_monthly_median))
+        window_returns = window_returns.dropna()  # drop only truly empty rows
 
         # ── 2. FF5/FF6 regression → SML alpha ────────────────────────────── #
         logger.info("[%s] Running FF5/FF6 regression...", as_of.date())

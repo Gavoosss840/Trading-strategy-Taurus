@@ -109,12 +109,21 @@ def compute_ff5_alpha(
     """
     # ── Align ──────────────────────────────────────────────────────────── #
     aligned_idx = returns.index.intersection(factors.index)
-    if len(aligned_idx) < cfg.min_obs:
+    # Hard minimum: at least 24 months for a meaningful regression.
+    # Soft minimum (cfg.min_obs, default 36): warn but proceed — 30-35 months
+    # is still statistically reliable and avoids a complete blackout caused by
+    # a single recently-listed constituent truncating the dropna() window.
+    if len(aligned_idx) < 24:
         logger.warning(
-            "Only %d overlapping observations (need %d).",
-            len(aligned_idx), cfg.min_obs,
+            "Only %d overlapping observations (need at least 24) — skipping.",
+            len(aligned_idx),
         )
         return pd.DataFrame()
+    if len(aligned_idx) < cfg.min_obs:
+        logger.warning(
+            "Only %d overlapping observations (soft threshold %d) — proceeding with reduced sample.",
+            len(aligned_idx), cfg.min_obs,
+        )
 
     ret = returns.loc[aligned_idx]
     fac = factors.loc[aligned_idx]
@@ -234,7 +243,9 @@ def rolling_alpha_signal(
         start_loc = max(0, loc - window + 1)
         window_ret = returns.iloc[start_loc : loc + 1]
         valid_cols = window_ret.columns[window_ret.notna().sum() >= cfg.min_obs]
-        window_ret = window_ret[valid_cols].dropna()
+        window_ret = window_ret[valid_cols]
+        _med = window_ret.median(axis=1)
+        window_ret = window_ret.apply(lambda col: col.fillna(_med)).dropna()
 
         alpha_df = compute_ff5_alpha(window_ret, factors, cfg)
         if alpha_df.empty:
