@@ -1221,9 +1221,11 @@ def run_force_rebalance(args, cfg) -> None:
         )
         scheduler.conn = conn   # reuse already-connected instance
 
-        # Compute Sharpe weights over ALL known universes so that running a
-        # single universe (e.g. --universes nikkei225) still gets its proper
-        # fraction of NAV (e.g. ~20%) instead of 100%.
+        # Compute Sharpe weights using monthly_returns.csv for each traded universe.
+        # Weights are proportional to max(Sharpe_12m, 0) and renormalised to sum
+        # to 1.0 across the traded universes only — so 100% of NAV is deployed
+        # regardless of how many universes are included in this run.
+        # Bootstrap (no CSV data yet): equal weight across traded universes.
         from taurus.universe import REGISTRY as _UREG
         all_universe_names = _UREG.all_names()
         full_scheduler = RebalanceScheduler(
@@ -1231,7 +1233,20 @@ def run_force_rebalance(args, cfg) -> None:
             universes=all_universe_names,
             output_dir=args.output,
         )
-        nav_weights = full_scheduler._sharpe_weights()
+        raw_weights = full_scheduler._sharpe_weights()
+
+        # Renormalise to only the universes being traded in this run
+        active_weights = {u: raw_weights.get(u, 0.0) for u in universes}
+        total_active   = sum(active_weights.values())
+        if total_active > 1e-9:
+            nav_weights = {u: w / total_active for u, w in active_weights.items()}
+        else:
+            nav_weights = {u: 1.0 / len(universes) for u in universes}
+
+        logger.info(
+            "NAV allocation (renormalised to traded universes): %s",
+            "  ".join(f"{u.upper()}={w*100:.1f}%" for u, w in nav_weights.items()),
+        )
 
         # as_of must be the last business day of the most recently completed month
         # so the date exists in the monthly price data.
