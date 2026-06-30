@@ -68,6 +68,90 @@ def _should_rebalance(last_rebalance: Optional[date], check_date: date) -> bool:
 #  Scheduler                                                                   #
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+#  Live MTD (month-to-date) return computation                                 #
+# --------------------------------------------------------------------------- #
+
+def compute_live_mtd_returns(output_dir: str, universes: List[str]) -> dict:
+    """
+    For each universe with a last_snapshot.csv, compute the portfolio return
+    from the snapshot date to today using current market prices.
+
+    Returns {universe_name: (last_price_date, portfolio_return, n_matched, n_total)}
+
+    The result is ephemeral (not saved to CSV) — it represents the current
+    incomplete period.  Once the next rebalance runs, that period's return
+    is locked into monthly_returns.csv and the snapshot is replaced.
+    """
+    import yfinance as _yf
+
+    results = {}
+    for name in universes:
+        snap_path = Path(output_dir) / name / "last_snapshot.csv"
+        if not snap_path.exists():
+            continue
+
+        try:
+            prev = pd.read_csv(snap_path)
+            if prev.empty or "ticker" not in prev.columns:
+                continue
+
+            start_date = pd.Timestamp(prev["as_of"].iloc[0])
+            weights = prev.set_index("ticker")["weight"].astype(float)
+            tickers = weights.index.tolist()
+
+            if not tickers:
+                continue
+
+            today = pd.Timestamp.today()
+            if (today - start_date).days < 1:
+                continue
+
+            raw = _yf.download(
+                tickers,
+                start=start_date.strftime("%Y-%m-%d"),
+                end=(today + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+
+            if raw is None or raw.empty:
+                continue
+
+            if isinstance(raw.columns, pd.MultiIndex):
+                close = raw["Close"]
+            else:
+                close = raw[["Close"]]
+                if len(tickers) == 1:
+                    close.columns = tickers
+
+            first_prices = close.bfill().iloc[0]
+            last_prices = close.ffill().iloc[-1]
+            rets = (last_prices - first_prices) / first_prices.replace(0, float("nan"))
+
+            common = weights.index.intersection(rets.index)
+            if common.empty:
+                continue
+
+            port_return = float((weights[common] * rets[common]).sum())
+            last_price_date = close.index[-1]
+
+            results[name] = (last_price_date, port_return, len(common), len(tickers))
+
+            logger.info(
+                "[%s] Live MTD: %s → %s = %+.2f%% (%d/%d tickers)",
+                name, start_date.date(), last_price_date.date(),
+                port_return * 100, len(common), len(tickers),
+            )
+
+        except Exception as e:
+            logger.warning("[%s] Could not compute MTD return: %s", name, e)
+
+    return results
+
+
 class RebalanceScheduler:
     """
     24/7 infinite loop that triggers monthly rebalances across all universes.

@@ -436,51 +436,60 @@ def run_report(args, cfg) -> None:
         except Exception as e:
             logger.warning("[%s] Could not load returns: %s", name, e)
 
+    # ── Append live MTD returns (current period, not saved to CSV) ────────── #
+    from taurus.scheduler import compute_live_mtd_returns
+    mtd_data = compute_live_mtd_returns(str(output), universes)
+    for name, (mtd_date, mtd_ret, n_matched, n_total) in mtd_data.items():
+        mtd_entry = pd.Series([mtd_ret], index=[mtd_date], name=name)
+        if name in ret_map:
+            if mtd_date not in ret_map[name].index:
+                ret_map[name] = pd.concat([ret_map[name], mtd_entry])
+        else:
+            ret_map[name] = mtd_entry
+
     if not ret_map:
         logger.error("No stored returns found in %s. Run a backtest or live rebalance first.", output)
         return
 
-    # ── Load analytics if available ──────────────────────────────────────── #
-    analytics_path = output / "combined_analytics.json"
-    all_analytics  = {}
-    if analytics_path.exists():
-        with open(analytics_path) as f:
-            all_analytics = json.load(f)
-    else:
-        # Compute analytics from stored returns
-        for name, ret in ret_map.items():
-            ret = ret.dropna()
-            if ret.empty:
-                continue
-            cum      = (1 + ret).cumprod()
-            total    = cum.iloc[-1] - 1
-            ann      = (1 + total) ** (12 / len(ret)) - 1
-            vol      = ret.std() * np.sqrt(12)
-            sharpe   = (ann - cfg.risk_free_rate_annual) / vol if vol > 0 else float("nan")
-            drawdown = (cum / cum.cummax() - 1).min()
-            all_analytics[name] = {
-                "total_return":  float(total),
-                "annual_return": float(ann),
-                "annual_vol":    float(vol),
-                "sharpe_ratio":  float(sharpe),
-                "max_drawdown":  float(drawdown),
-                "n_months":      len(ret),
-            }
+    # ── Recompute analytics including MTD ────────────────────────────────── #
+    all_analytics = {}
+    for name, ret in ret_map.items():
+        ret = ret.dropna()
+        if ret.empty:
+            continue
+        cum      = (1 + ret).cumprod()
+        total    = cum.iloc[-1] - 1
+        ann      = (1 + total) ** (12 / len(ret)) - 1
+        vol      = ret.std() * np.sqrt(12)
+        sharpe   = (ann - cfg.risk_free_rate_annual) / vol if vol > 0 else float("nan")
+        drawdown = (cum / cum.cummax() - 1).min()
+        has_mtd  = name in mtd_data
+        all_analytics[name] = {
+            "total_return":  float(total),
+            "annual_return": float(ann),
+            "annual_vol":    float(vol),
+            "sharpe_ratio":  float(sharpe),
+            "max_drawdown":  float(drawdown),
+            "n_months":      len(ret),
+            "includes_mtd":  has_mtd,
+        }
 
     # ── Print summary ─────────────────────────────────────────────────────── #
     logger.info("=" * 60)
-    logger.info("LIVE PORTFOLIO REPORT")
+    logger.info("LIVE PORTFOLIO REPORT  (includes MTD: %s)", bool(mtd_data))
     logger.info("=" * 60)
     for name, a in all_analytics.items():
         if name == "combined":
             continue
+        mtd_tag = " [+MTD]" if a.get("includes_mtd") else ""
         logger.info(
-            "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%",
+            "  %-12s  Return=%+.1f%%  Annual=%+.1f%%  Sharpe=%.2f  MaxDD=%.1f%%%s",
             name.upper(),
             a.get("total_return",  0) * 100,
             a.get("annual_return", 0) * 100,
             a.get("sharpe_ratio",  0),
             a.get("max_drawdown",  0) * 100,
+            mtd_tag,
         )
     ca = all_analytics.get("combined", {})
     if ca:
