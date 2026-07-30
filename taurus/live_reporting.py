@@ -130,7 +130,7 @@ def compute_live_monthly_returns(output_dir: str = "output") -> pd.Series:
             return (dt - pd.DateOffset(months=1)).to_period("M").to_timestamp("M")
         return dt.to_period("M").to_timestamp("M")
 
-    returns.index = returns.index.map(_nav_date_to_period)
+    returns.index = pd.DatetimeIndex(returns.index.map(_nav_date_to_period))
     returns.name = "live_returns"
     return returns
 
