@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance", "check-protective", "refresh-protective"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -233,10 +233,36 @@ def run_backtest(args, cfg) -> None:
         if not top.empty:
             logger.info("[%s] Top positions:\n%s", universe_name, top.to_string(index=False))
 
-    # ── Save monthly returns per universe (used by scheduler for Sharpe weights) ── #
+    # ── Save monthly returns + position snapshots per universe ────────────── #
     for name, result in all_results.items():
         ret_path = output / name / "monthly_returns.csv"
         result.portfolio_returns().to_csv(ret_path, header=["return"])
+
+        # Archive each rebalance snapshot so live runs can build on backtest history
+        snap_dir = output / name / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        for snap in result.snapshots:
+            rows = []
+            for t, w in snap.long_weights.items():
+                rows.append({"ticker": t, "weight": float(w), "side": "LONG"})
+            for t, w in snap.short_weights.items():
+                rows.append({"ticker": t, "weight": -float(w), "side": "SHORT"})
+            if rows:
+                sdf = pd.DataFrame(rows)
+                sdf["as_of"] = snap.date.date().isoformat()
+                sdf.to_csv(snap_dir / f"snapshot_{snap.date.date()}.csv", index=False)
+        # Latest snapshot pointer
+        if result.snapshots:
+            last = result.snapshots[-1]
+            rows = []
+            for t, w in last.long_weights.items():
+                rows.append({"ticker": t, "weight": float(w), "side": "LONG"})
+            for t, w in last.short_weights.items():
+                rows.append({"ticker": t, "weight": -float(w), "side": "SHORT"})
+            if rows:
+                ldf = pd.DataFrame(rows)
+                ldf["as_of"] = last.date.date().isoformat()
+                ldf.to_csv(output / name / "last_snapshot.csv", index=False)
 
     # ── Combined summary ─────────────────────────────────────────────────── #
     logger.info("\n%s", "=" * 60)
@@ -1307,6 +1333,135 @@ def run_force_rebalance(args, cfg) -> None:
         conn.disconnect()
 
 
+def run_backfill_returns(args, cfg) -> None:
+    """
+    Reconstruct monthly_returns.csv from archived snapshots.
+
+    Reads output/{universe}/snapshots/snapshot_YYYY-MM-DD.csv files,
+    pairs consecutive snapshots, downloads prices for each period via
+    yfinance, and computes the realised portfolio return.
+
+    This recovers the full return history from live trading — no backtest
+    simulation needed.  Existing entries in monthly_returns.csv are preserved
+    (duplicate dates are skipped).
+
+    Usage:
+        python main.py --mode backfill-returns \\
+            --universes sp500 nasdaq100 cac40 ftse100 nikkei225
+    """
+    import numpy as np
+    import pandas as pd
+    import yfinance as _yf
+
+    output    = Path(args.output)
+    universes = args.universes
+
+    logger.info("=" * 60)
+    logger.info("BACKFILL MONTHLY RETURNS FROM ARCHIVED SNAPSHOTS")
+    logger.info("=" * 60)
+
+    for universe_name in universes:
+        snap_dir = output / universe_name / "snapshots"
+        ret_path = output / universe_name / "monthly_returns.csv"
+
+        if not snap_dir.exists():
+            logger.warning("[%s] No snapshots/ directory — skipping.", universe_name)
+            continue
+
+        snap_files = sorted(snap_dir.glob("snapshot_*.csv"))
+        if len(snap_files) < 2:
+            logger.info("[%s] Only %d snapshot(s) — need at least 2 to compute a return.", universe_name, len(snap_files))
+            continue
+
+        # Load existing returns to avoid duplicates
+        if ret_path.exists():
+            existing = pd.read_csv(ret_path, index_col=0, parse_dates=True)
+            existing.columns = ["return"]
+            existing_dates = set(existing.index.strftime("%Y-%m-%d"))
+        else:
+            existing = pd.DataFrame(columns=["return"])
+            existing_dates = set()
+
+        new_rows = []
+
+        for i in range(len(snap_files) - 1):
+            prev_snap = pd.read_csv(snap_files[i])
+            next_snap = pd.read_csv(snap_files[i + 1])
+
+            prev_date = pd.Timestamp(prev_snap["as_of"].iloc[0])
+            next_date = pd.Timestamp(next_snap["as_of"].iloc[0])
+            date_label = prev_date.strftime("%Y-%m-%d")
+
+            if date_label in existing_dates:
+                logger.info("[%s] %s already in monthly_returns — skipping.", universe_name, date_label)
+                continue
+
+            weights = prev_snap.set_index("ticker")["weight"].astype(float)
+            tickers = weights.index.tolist()
+
+            if not tickers:
+                continue
+
+            try:
+                raw = _yf.download(
+                    tickers,
+                    start=prev_date.strftime("%Y-%m-%d"),
+                    end=(next_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True,
+                )
+                if raw is None or raw.empty:
+                    logger.warning("[%s] No price data for %s → %s.", universe_name, prev_date.date(), next_date.date())
+                    continue
+
+                if isinstance(raw.columns, pd.MultiIndex):
+                    close = raw["Close"]
+                else:
+                    close = raw[["Close"]]
+                    if len(tickers) == 1:
+                        close.columns = tickers
+
+                first_prices = close.bfill().iloc[0]
+                last_prices  = close.ffill().iloc[-1]
+                rets = (last_prices - first_prices) / first_prices.replace(0, float("nan"))
+
+                common = weights.index.intersection(rets.index)
+                if common.empty:
+                    continue
+
+                port_return = float((weights[common] * rets[common]).sum())
+                new_rows.append({"date": pd.Timestamp(date_label), "return": port_return})
+
+                logger.info(
+                    "[%s] %s → %s : %+.2f%% (%d/%d tickers)",
+                    universe_name, prev_date.date(), next_date.date(),
+                    port_return * 100, len(common), len(tickers),
+                )
+
+            except Exception as e:
+                logger.warning("[%s] Failed for %s: %s", universe_name, date_label, e)
+
+        if new_rows:
+            new_df = pd.DataFrame(new_rows).set_index("date")
+            if not existing.empty:
+                combined = pd.concat([existing, new_df]).sort_index()
+            else:
+                combined = new_df.sort_index()
+            combined.to_csv(ret_path, header=["return"])
+            logger.info(
+                "[%s] monthly_returns.csv updated: %d new months added, %d total.",
+                universe_name, len(new_rows), len(combined),
+            )
+        else:
+            logger.info("[%s] No new returns to add.", universe_name)
+
+    logger.info("=" * 60)
+    logger.info("Backfill complete.")
+    logger.info("=" * 60)
+
+
 def run_live(args, cfg) -> None:
     from taurus.scheduler import RebalanceScheduler
     logger.info(
@@ -1349,6 +1504,8 @@ def main() -> None:
         run_check_protective(args, cfg)
     elif args.mode == "refresh-protective":
         run_refresh_protective(args, cfg)
+    elif args.mode == "backfill-returns":
+        run_backfill_returns(args, cfg)
     else:
         logger.error("Unknown mode: %s", args.mode)
         sys.exit(1)

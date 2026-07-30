@@ -438,13 +438,18 @@ class RebalanceScheduler:
         self, universe_name: str, snapshot, as_of: pd.Timestamp
     ) -> None:
         """
-        Persist long/short portfolio weights to output/{universe}/last_snapshot.csv.
-        Called after each rebalance so that next month we can measure the
-        realised return of those exact positions.
+        Persist long/short portfolio weights to TWO files:
+
+        1. output/{universe}/snapshots/snapshot_{date}.csv  — permanent archive,
+           never overwritten.  Full history of every rebalance is preserved.
+        2. output/{universe}/last_snapshot.csv  — copy of the latest, used by
+           _compute_and_append_monthly_return() and the MTD report.
+
         Weights are stored signed: +w for longs, -w for shorts.
         """
-        path = Path(self.output_dir) / universe_name / "last_snapshot.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        uni_dir  = Path(self.output_dir) / universe_name
+        hist_dir = uni_dir / "snapshots"
+        hist_dir.mkdir(parents=True, exist_ok=True)
 
         rows = []
         for ticker, w in snapshot.long_weights.items():
@@ -457,10 +462,18 @@ class RebalanceScheduler:
 
         df = pd.DataFrame(rows)
         df["as_of"] = as_of.date().isoformat()
-        df.to_csv(path, index=False)
+
+        # 1. Permanent dated archive (never overwritten)
+        date_str  = as_of.date().isoformat()
+        hist_path = hist_dir / f"snapshot_{date_str}.csv"
+        df.to_csv(hist_path, index=False)
+
+        # 2. Latest pointer (overwritten each rebalance)
+        df.to_csv(uni_dir / "last_snapshot.csv", index=False)
+
         logger.info(
-            "[%s] Snapshot saved (%d positions, as_of=%s).",
-            universe_name, len(rows), as_of.date(),
+            "[%s] Snapshot archived: %s (%d positions).",
+            universe_name, hist_path.name, len(rows),
         )
 
     def _compute_and_append_monthly_return(
