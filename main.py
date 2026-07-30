@@ -1230,31 +1230,34 @@ def run_force_rebalance(args, cfg) -> None:
         )
         scheduler.conn = conn   # reuse already-connected instance
 
-        # Compute Sharpe weights using monthly_returns.csv for each traded universe.
-        # Weights are proportional to max(Sharpe_12m, 0) and renormalised to sum
-        # to 1.0 across the traded universes only — so 100% of NAV is deployed
-        # regardless of how many universes are included in this run.
-        # Bootstrap (no CSV data yet): equal weight across traded universes.
+        # Compute Sharpe weights across ALL actively-traded universes (those
+        # with existing snapshots or return data), not just the ones requested
+        # in this run.  This way, running `--universes cac40 ftse100` gives each
+        # its proper global fraction (~20%) rather than 50%+50%.
         from taurus.universe import REGISTRY as _UREG
-        all_universe_names = _UREG.all_names()
+
+        # Detect all universes that have been traded (have data on disk)
+        active_universes = set(universes)
+        for name in _UREG.all_names():
+            snap = Path(args.output) / name / "last_snapshot.csv"
+            ret  = Path(args.output) / name / "monthly_returns.csv"
+            if snap.exists() or ret.exists():
+                active_universes.add(name)
+        active_universes = sorted(active_universes)
+
         full_scheduler = RebalanceScheduler(
             cfg=cfg,
-            universes=all_universe_names,
+            universes=active_universes,
             output_dir=args.output,
         )
-        raw_weights = full_scheduler._sharpe_weights()
-
-        # Renormalise to only the universes being traded in this run
-        active_weights = {u: raw_weights.get(u, 0.0) for u in universes}
-        total_active   = sum(active_weights.values())
-        if total_active > 1e-9:
-            nav_weights = {u: w / total_active for u, w in active_weights.items()}
-        else:
-            nav_weights = {u: 1.0 / len(universes) for u in universes}
+        nav_weights = full_scheduler._sharpe_weights()
+        # Use raw weights directly — each universe keeps its global fraction.
+        # No renormalisation: running a subset doesn't inflate their share.
 
         logger.info(
-            "NAV allocation (renormalised to traded universes): %s",
-            "  ".join(f"{u.upper()}={w*100:.1f}%" for u, w in nav_weights.items()),
+            "NAV allocation (global weights, %d active universes): %s",
+            len(active_universes),
+            "  ".join(f"{u.upper()}={nav_weights.get(u,0)*100:.1f}%" for u in universes),
         )
 
         # as_of must be the last business day of the most recently completed month
