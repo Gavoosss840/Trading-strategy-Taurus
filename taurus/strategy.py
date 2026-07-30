@@ -441,13 +441,25 @@ class TaurusStrategy:
             q60 = mom_df["mom_raw"].quantile(0.60)
             short_final = short_candidates.intersection(mom_df[mom_df["mom_raw"] <= q60].index)
 
-        if len(long_final) == 0:
+        if len(long_final) == 0 and not alpha_df.empty:
             q75 = alpha_df["alpha_tstat"].quantile(0.75)
-            long_final = alpha_df[alpha_df["alpha_tstat"] >= q75].index
+            q50_m = mom_df["mom_raw"].quantile(0.50) if not mom_df.empty else -np.inf
+            long_fallback = alpha_df[alpha_df["alpha_tstat"] >= q75].index
+            if not mom_df.empty:
+                long_fallback = long_fallback.intersection(
+                    mom_df[mom_df["mom_raw"] >= q50_m].index
+                )
+            long_final = long_fallback
 
-        if len(short_final) == 0:
+        if len(short_final) == 0 and not alpha_df.empty:
             q25 = alpha_df["alpha_tstat"].quantile(0.25)
-            short_final = alpha_df[alpha_df["alpha_tstat"] <= q25].index
+            q50_m = mom_df["mom_raw"].quantile(0.50) if not mom_df.empty else np.inf
+            short_fallback = alpha_df[alpha_df["alpha_tstat"] <= q25].index
+            if not mom_df.empty:
+                short_fallback = short_fallback.intersection(
+                    mom_df[mom_df["mom_raw"] <= q50_m].index
+                )
+            short_final = short_fallback
 
         composite = pd.Series(dtype=float)   # empty for binary mode
         return long_final, short_final, composite

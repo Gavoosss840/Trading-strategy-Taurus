@@ -51,8 +51,8 @@ class TaurusConfig:
     lookback_months: int = 60            # Rolling OLS window
     min_obs: int = 36                    # Minimum observations for fit
     alpha_tstat_threshold: float = 2.0   # |t| > threshold (Student-t when return_df set)
-    use_umd_factor: bool = True          # FF6: include UMD momentum factor in regression
-                                         # Removes momentum from alpha → purer signal
+    use_umd_factor: bool = False         # FF6: include UMD momentum factor in regression
+                                         # When True, removes momentum from alpha (weaker signal)
 
     # ------------------------------------------------------------------ #
     #  Return distribution  (Student-t fat tails)                         #
@@ -69,8 +69,8 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     leverage_gap_threshold: float = 0.25     # 25 % divergence to flag
     min_interest_coverage:  float = 1.5      # IC below → always flag overleveraged
-    industry_distress_costs: bool = True     # Sector-specific distress rates (vs flat 20%)
-    variable_credit_spread:  bool = True     # Leverage-based spread (vs flat +2%)
+    industry_distress_costs: bool = False    # Sector-specific distress rates (vs flat 20%)
+    variable_credit_spread:  bool = False    # Leverage-based spread (vs flat +2%)
 
     # ------------------------------------------------------------------ #
     #  Momentum filter                                                    #
@@ -84,9 +84,9 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     #  Signal combination                                                 #
     # ------------------------------------------------------------------ #
-    # "composite": continuous z-score blend — all information used.
-    # "binary": legacy AND-filter cascade (lower Sharpe, kept for comparison).
-    signal_method: str  = "composite"
+    # "binary": AND-filter cascade (alpha AND MM AND momentum — original proven strategy).
+    # "composite": continuous z-score blend (experimental, kept for comparison).
+    signal_method: str  = "binary"
     w_alpha:       float = 0.40          # Weight for FF alpha t-stat z-score
     w_mm:          float = 0.30          # Weight for MM divergence z-score
     w_momentum:    float = 0.30          # Weight for momentum z-score
@@ -101,10 +101,9 @@ class TaurusConfig:
     max_sector_weight:   float = 0.30    # 30 % sector cap per leg
 
     # Optimizer:
+    #   "max_sharpe"   — classical tangency portfolio (original Taurus optimizer).
     #   "min_variance" — minimises portfolio variance with alpha tilt (AQR-style).
-    #                    Stable out-of-sample; outperforms max-Sharpe in practice.
-    #   "max_sharpe"   — classical tangency portfolio (input-sensitive, legacy).
-    optimizer_method:  str   = "min_variance"
+    optimizer_method:  str   = "max_sharpe"
     alpha_tilt_strength: float = 0.30   # Fraction of weight driven by composite score
     turnover_penalty:  float = 0.002    # λ penalising |w_new - w_old|₁ in optimizer
 
@@ -114,9 +113,9 @@ class TaurusConfig:
     risk_free_rate_annual: float = 0.045
     target_net_beta: float = 0.0         # Beta-neutral by default
     beta_tolerance:  float = 0.05        # Acceptable residual beta
-    blume_shrinkage: bool  = True        # Shrink OLS betas: 0.67×β_raw + 0.33×1.0
+    blume_shrinkage: bool  = False       # Shrink OLS betas: 0.67×β_raw + 0.33×1.0
     cov_shrinkage:   bool  = True        # Ledoit-Wolf shrinkage (when EWMA off)
-    cov_halflife:    int   = 36          # EWMA half-life months (0 → flat/LW)
+    cov_halflife:    int   = 0           # EWMA half-life months (0 → Ledoit-Wolf)
     cov_min_eigenvalue: float = 1e-6     # Floor eigenvalue (PSD fix)
     optimizer_max_iter: int = 1_000
 

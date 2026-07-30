@@ -175,8 +175,8 @@ git add -A && git commit -m "message" && git push -u origin claude/optimize-pyth
 | `trailing_stop_pct` | 10% | Trailing stop depuis le pic |
 | `circuit_breaker_pct` | 15% | Coupe tout si portefeuille -15% depuis dernier rebalancement |
 | `lookback_months` | 60 | Fenêtre régression FF5/FF6 |
-| `optimizer_method` | `min_variance` | Optimiseur : min-variance + alpha tilt |
-| `signal_method` | `composite` | Signal : z-score composite (alpha + MM + momentum) |
-| `use_umd_factor` | `True` | FF6 : ajoute le facteur momentum dans la régression |
+| `optimizer_method` | `max_sharpe` | Optimiseur : tangency portfolio (max-Sharpe) |
+| `signal_method` | `binary` | Signal : AND-filter (alpha AND MM AND momentum) |
+| `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
 | `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
-| `cov_halflife` | 36 | Demi-vie EWMA covariance (mois) |
+| `cov_halflife` | 0 | Covariance Ledoit-Wolf (0 = pas d'EWMA) |

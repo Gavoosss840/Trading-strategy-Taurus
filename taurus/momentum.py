@@ -131,7 +131,7 @@ def momentum_signal(
     if dampen and market_returns is not None and len(market_returns) >= 13:
         mkt = market_returns.reindex(idx[:as_of_loc + 1]).dropna()
         if len(mkt) >= 13:
-            vol_1m  = float(mkt.iloc[-1:].std() * np.sqrt(12))   # 1-month point vol
+            vol_1m  = float(abs(mkt.iloc[-1]) * np.sqrt(12))     # 1-month point vol
             vol_12m = float(mkt.iloc[-12:].std() * np.sqrt(12))  # 12-month rolling vol
             if vol_12m > 0 and vol_1m > 2.0 * vol_12m:
                 crash_regime = True
