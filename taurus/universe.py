@@ -153,7 +153,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         futures_currency="USD",
         futures_multiplier=20.0,
         ibkr_exchange="SMART",
-        wikipedia_url="https://en.wikipedia.org/wiki/Nasdaq-100",
+        wikipedia_url="https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies",
         wikipedia_table_id="constituents",
         min_market_cap_usd=5e9,
         fractional_shares=False,            # IBKR API rejects fractional quantities (Error 10243)
@@ -292,11 +292,19 @@ _FALLBACKS: Dict[str, List[str]] = {
     ],
 
     "nasdaq100": [
+        # ~100-stock fallback covering current + recent NASDAQ-100 constituents
         "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA",
         "AVGO", "COST", "NFLX", "AMD", "ADBE", "QCOM", "INTU", "CSCO",
         "TXN", "AMAT", "ISRG", "BKNG", "MU", "LRCX", "KLAC", "PANW",
         "REGN", "MELI", "ASML", "SNPS", "CDNS", "MAR", "ORLY", "CTAS",
         "FTNT", "ABNB", "DXCM", "CEG", "ROP", "PCAR", "MNST", "FAST",
+        "AMGN", "ADI", "ADP", "HON", "CMCSA", "INTC", "PEP", "PYPL",
+        "GILD", "SBUX", "MDLZ", "VRTX", "TMUS", "CSX", "MRVL", "MCHP",
+        "NXPI", "KDP", "KHC", "EA", "WMT", "ROST", "IDXX", "WBD",
+        "PAYX", "XEL", "AEP", "EXC", "ODFL", "CPRT", "FANG", "BKR",
+        "ADSK", "LIN", "PDD", "TTWO", "DDOG", "CRWD", "WDAY", "GEHC",
+        "MPWR", "TER", "PLTR", "DASH", "AXON", "ARM", "APP", "MSTR",
+        "WDC", "STX", "SHOP", "LITE", "CCEP", "FER", "HONA", "TRI",
     ],
 
     "cac40": [
