@@ -91,6 +91,7 @@ def momentum_signal(
     # ── Vol-adjusted momentum (Sharpe momentum) ──────────────────────────── #
     # Use returns over the same window to estimate each stock's trailing vol.
     vol_adjust = getattr(cfg, "vol_adjust_momentum", True)
+    trailing_vol = pd.Series(np.nan, index=mom_raw.index)
     if vol_adjust:
         ret_window = prices.iloc[start_loc : end_loc + 1].pct_change().dropna()
         if len(ret_window) >= 6:
@@ -100,8 +101,7 @@ def momentum_signal(
         else:
             mom_sharpe = mom_raw.copy()
     else:
-        trailing_vol = pd.Series(np.nan, index=mom_raw.index)
-        mom_sharpe   = mom_raw.copy()
+        mom_sharpe = mom_raw.copy()
 
     # ── Primary sorting score ─────────────────────────────────────────────── #
     # Use vol-adjusted if enabled, raw otherwise
