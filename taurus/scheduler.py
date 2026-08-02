@@ -64,6 +64,24 @@ def _should_rebalance(last_rebalance: Optional[date], check_date: date) -> bool:
     return True
 
 
+def period_end_label(dt: pd.Timestamp) -> pd.Timestamp:
+    """
+    Map a run date to the calendar month-end label of the period that just
+    ENDED — the same convention the backtest uses for monthly_returns.csv
+    (prices stamped to_period("M").to_timestamp("M")).
+
+    A run on the 1st-5th of month M closes the position period of month M-1,
+    so those dates are attributed to the previous month-end.  Labelling by
+    period START (the old behaviour) collided with the backtest's month-end
+    labels: the first live month after seeding was silently discarded by the
+    duplicate guard and every later month sat one month early in the CSV.
+    """
+    dt = pd.Timestamp(dt)
+    if dt.day <= 5:
+        return (dt - pd.DateOffset(months=1)).to_period("M").to_timestamp("M")
+    return dt.to_period("M").to_timestamp("M")
+
+
 # --------------------------------------------------------------------------- #
 #  Scheduler                                                                   #
 # --------------------------------------------------------------------------- #
@@ -72,7 +90,11 @@ def _should_rebalance(last_rebalance: Optional[date], check_date: date) -> bool:
 #  Live MTD (month-to-date) return computation                                 #
 # --------------------------------------------------------------------------- #
 
-def compute_live_mtd_returns(output_dir: str, universes: List[str]) -> dict:
+def compute_live_mtd_returns(
+    output_dir: str,
+    universes: List[str],
+    gross_leverage: float = 1.0,
+) -> dict:
     """
     For each universe with a last_snapshot.csv, compute the portfolio return
     from the snapshot date to today using current market prices.
@@ -130,12 +152,19 @@ def compute_live_mtd_returns(output_dir: str, universes: List[str]) -> dict:
             first_prices = close.bfill().iloc[0]
             last_prices = close.ffill().iloc[-1]
             rets = (last_prices - first_prices) / first_prices.replace(0, float("nan"))
+            # Unit-flip guard (see _compute_and_append_monthly_return)
+            rets = rets.clip(lower=-0.95, upper=1.5)
 
-            common = weights.index.intersection(rets.index)
+            common = weights.index.intersection(rets.dropna().index)
             if common.empty:
                 continue
 
             port_return = float((weights[common] * rets[common]).sum())
+            coverage = float(weights[common].abs().sum() / weights.abs().sum())
+            if 0.5 <= coverage < 1.0:
+                port_return /= coverage
+            # Same NAV basis as the backtest series ((lev/2) per leg)
+            port_return *= gross_leverage / 2.0
             last_price_date = close.index[-1]
 
             results[name] = (last_price_date, port_return, len(common), len(tickers))
@@ -265,7 +294,9 @@ class RebalanceScheduler:
             if len(r) < 3:
                 sharpes[name] = 0.0
             else:
-                ann = (1 + r.mean()) ** 12 - 1
+                # Geometric annualisation of realised compounded returns
+                # (arithmetic-mean compounding overstates high-vol universes)
+                ann = float((1 + r).prod() ** (12 / len(r)) - 1)
                 vol = r.std() * np.sqrt(12)
                 sharpes[name] = (ann - rf) / vol if vol > 0 else 0.0
 
@@ -296,6 +327,16 @@ class RebalanceScheduler:
         European markets open ~09:00 CET, US markets open 09:30 ET.
         We run European universes first, then US.
         """
+        # Lock in the just-ended month's realised return for EVERY universe
+        # BEFORE computing Sharpe weights — otherwise the weights lag the
+        # backtest convention by one month.  (The per-universe call inside
+        # _run_single_universe becomes a no-op via the duplicate guard.)
+        for universe_name in self.universes:
+            try:
+                self._compute_and_append_monthly_return(universe_name, as_of)
+            except Exception as e:
+                logger.warning("[%s] Pre-weight return append failed: %s", universe_name, e)
+
         nav_weights = self._sharpe_weights()
 
         # Order: Asia/Japan first (markets open earliest), then Europe, then US
@@ -511,8 +552,11 @@ class RebalanceScheduler:
             if not tickers:
                 return
 
-            # Duplicate guard: don't append the same month twice
-            month_label = prev_date.strftime("%Y-%m-%d")
+            # Duplicate guard: don't append the same month twice.
+            # Label by the month-end of the period that just ENDED (backtest
+            # convention) — labelling by period start shifted every live month
+            # one month early and dropped the first live month after seeding.
+            month_label = period_end_label(as_of).strftime("%Y-%m-%d")
             if ret_path.exists():
                 existing = pd.read_csv(ret_path, index_col=0, parse_dates=True)
                 existing.columns = ["return"]
@@ -551,12 +595,36 @@ class RebalanceScheduler:
             last_prices  = close.ffill().iloc[-1]
             rets = (last_prices - first_prices) / first_prices.replace(0, float("nan"))
 
-            common = weights.index.intersection(rets.index)
+            # Sanity clamp: yfinance GBp/GBP unit flips (.L tickers) can inject
+            # ~±99% or +9900% phantom moves.  Winsorise and log outliers.
+            outliers = rets[(rets < -0.95) | (rets > 1.5)].dropna()
+            if not outliers.empty:
+                logger.warning(
+                    "[%s] Winsorising %d outlier returns (unit-flip guard): %s",
+                    universe_name, len(outliers),
+                    ", ".join(f"{t}={r:+.0%}" for t, r in outliers.items()),
+                )
+                rets = rets.clip(lower=-0.95, upper=1.5)
+
+            common = weights.index.intersection(rets.dropna().index)
             if common.empty:
                 logger.warning("[%s] No ticker overlap for return computation.", universe_name)
                 return
 
             port_return = float((weights[common] * rets[common]).sum())
+
+            # Renormalise for unmatched tickers so partial price coverage
+            # doesn't understate the period return (missing names assumed to
+            # perform like the matched book on average).
+            coverage = float(weights[common].abs().sum() / weights.abs().sum())
+            if 0.5 <= coverage < 1.0:
+                port_return /= coverage
+
+            # Scale to the backtest's NAV basis: signed snapshot weights are in
+            # leg-weight units (gross ≈ 2), the backtest series is (lev/2)·long
+            # − (lev/2)·short.  Without this the live months sit at 2× the
+            # backtest scale in the same CSV.
+            port_return *= self.cfg.gross_leverage / 2.0
 
             new_row  = pd.DataFrame({"return": [port_return]}, index=[pd.Timestamp(month_label)])
             if existing.empty:

@@ -203,16 +203,11 @@ class TaurusStrategy:
         valid_cols = window_returns.columns[
             window_returns.notna().sum() >= cfg.min_obs
         ]
-        window_returns = window_returns[valid_cols]
-        # Impute NaN with cross-sectional median for that month before OLS.
-        # A recently-added index constituent may have NaN in earlier months;
-        # dropna(how='any') would then truncate the whole regression window
-        # to the shortest history in valid_cols (e.g. 35 months → below min_obs).
-        # Cross-sectional median is the standard academic substitute for missing
-        # returns in factor-model panels (no look-ahead, unbiased in expectation).
-        _monthly_median = window_returns.median(axis=1)
-        window_returns = window_returns.apply(lambda col: col.fillna(_monthly_median))
-        window_returns = window_returns.dropna()  # drop only truly empty rows
+        # Keep NaN as-is: compute_ff5_alpha regresses each partial-history
+        # stock on its own valid rows.  (Cross-sectional median imputation was
+        # removed — imputed months are near-perfectly explained by the market
+        # factor, which deflates residual variance and inflates alpha t-stats.)
+        window_returns = window_returns[valid_cols].dropna(how="all")
 
         # ── 2. FF5/FF6 regression → SML alpha ────────────────────────────── #
         logger.info("[%s] Running FF5/FF6 regression...", as_of.date())
@@ -268,12 +263,15 @@ class TaurusStrategy:
             long_scores  = alpha_df["alpha_annual"].reindex(long_final,  fill_value=0.0)
             short_scores = (-alpha_df["alpha_annual"]).reindex(short_final, fill_value=0.0)
 
+        # CRITICAL: use window_returns (truncated at as_of), NOT self._returns —
+        # the full-sample frame contains post-as_of months, so covariance and
+        # the eligibility filter would leak future information into the backtest.
         long_weights = build_leg(
-            long_final, long_scores, returns, sector_map, cfg, cfg.n_longs,
+            long_final, long_scores, window_returns, sector_map, cfg, cfg.n_longs,
             prev_weights=self._prev_long_w,
         )
         short_weights = build_leg(
-            short_final, short_scores, returns, sector_map, cfg, cfg.n_shorts,
+            short_final, short_scores, window_returns, sector_map, cfg, cfg.n_shorts,
             prev_weights=self._prev_short_w,
         )
 
@@ -562,8 +560,14 @@ class BacktestResult:
 
         lev  = self.cfg.gross_leverage
         half = lev / 2.0
-        margin_cost_m   = (self.cfg.margin_cost_annual + self.cfg.borrow_cost_annual) / 12
-        leverage_cost_m = (lev - 1.0) * margin_cost_m
+        # Financing decomposition:
+        #  • stock-borrow fee accrues on the SHORT leg notional (lev/2 × NAV)
+        #    at ANY leverage — it does not vanish at lev = 1;
+        #  • margin interest accrues only on cash borrowed above NAV (lev − 1).
+        financing_cost_m = (
+            half * self.cfg.borrow_cost_annual / 12
+            + max(lev - 1.0, 0.0) * self.cfg.margin_cost_annual / 12
+        )
 
         for i, snap in enumerate(self.snapshots):
             hold_start = snap.date
@@ -583,13 +587,16 @@ class BacktestResult:
                 else 0.0
             )
 
+            has_positions = len(snap.long_weights) > 0 or len(snap.short_weights) > 0
+
             for month_date, month_ret in month_range.iterrows():
                 long_ret  = (snap.long_weights * month_ret.reindex(
                     snap.long_weights.index,  fill_value=0)).sum()
                 short_ret = (snap.short_weights * month_ret.reindex(
                     snap.short_weights.index, fill_value=0)).sum()
                 gross_ret = half * long_ret - half * short_ret
-                gross_ret -= leverage_cost_m
+                if has_positions:
+                    gross_ret -= financing_cost_m
 
                 # Futures P&L: use true index return (not stock average)
                 if snap.futures_weight != 0.0:
@@ -599,10 +606,13 @@ class BacktestResult:
 
                 pnl_records.append({"date": month_date, "return": gross_ret})
 
-            # Turnover cost at rebalance
+            # Turnover cost at rebalance.  _compute_turnover returns Σ|Δw| per
+            # leg = total traded notional in leg-weight units (buys AND sells
+            # each pay the one-way cost).  Scale by half (= lev/2) to convert
+            # leg-weight units into fractions of NAV.
             turnover = _compute_turnover(snap.long_weights, prev_lw) + \
                        _compute_turnover(snap.short_weights, prev_sw)
-            cost = turnover * cost_bps
+            cost = turnover * half * cost_bps
             if pnl_records:
                 pnl_records[-1]["return"] -= cost
 
@@ -628,9 +638,13 @@ class BacktestResult:
         drawdown = (cum / cum.cummax() - 1).min()
         calmar   = ann / abs(drawdown) if drawdown < 0 else np.nan
 
-        # Sortino ratio (downside deviation)
-        neg_ret  = ret[ret < 0]
-        down_vol = neg_ret.std() * np.sqrt(12) if len(neg_ret) > 1 else np.nan
+        # Sortino ratio — proper downside deviation: sqrt(mean(min(r−MAR,0)²))
+        # over ALL observations (std of the negative subset shrinks both the
+        # denominator count and the mean, inflating the ratio ~1.5-2×).
+        rf_m     = self.cfg.rf_monthly
+        downside = np.minimum(ret - rf_m, 0.0)
+        down_vol = float(np.sqrt((downside ** 2).mean()) * np.sqrt(12)) \
+                   if len(ret) > 1 else np.nan
         sortino  = (ann - self.cfg.risk_free_rate_annual) / down_vol \
                    if (down_vol is not None and down_vol > 0) else np.nan
 
@@ -661,8 +675,14 @@ class BacktestResult:
 
 
 def _compute_turnover(new: pd.Series, old: pd.Series) -> float:
-    """One-way turnover between two weight vectors."""
+    """
+    Total traded notional between two weight vectors: Σ|Δw|.
+
+    NOT halved: with a one-way cost rate (bps per dollar traded), both the
+    sell of the old position and the buy of the new one pay the cost, so the
+    full Σ|Δw| is the correct cost base.
+    """
     all_tickers = new.index.union(old.index)
     n = new.reindex(all_tickers, fill_value=0)
     o = old.reindex(all_tickers, fill_value=0)
-    return (n - o).abs().sum() / 2.0
+    return float((n - o).abs().sum())

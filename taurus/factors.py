@@ -142,9 +142,6 @@ def compute_ff5_alpha(
         and fac["UMD"].notna().any()
     )
 
-    # ── Excess returns ──────────────────────────────────────────────────── #
-    Y = ret.values - rf[:, None]             # (T, N)
-
     # ── Design matrix ──────────────────────────────────────────────────── #
     T = len(aligned_idx)
     if use_umd:
@@ -154,60 +151,97 @@ def compute_ff5_alpha(
     else:
         X = np.column_stack([np.ones(T), mkt_rf, smb, hml, rmw, cma])        # (T, 6)
         model_label = "FF5"
+    K = X.shape[1]
 
-    # ── Vectorised OLS ─────────────────────────────────────────────────── #
-    beta, residuals, XtX_inv = _ols_vectorised(X, Y)
-    se_alpha = _hc1_se_intercept(X, residuals, XtX_inv)
+    def _fit(Xd: np.ndarray, Yd: np.ndarray):
+        """OLS + HC1 SE + R² for a block of columns sharing the same rows."""
+        beta_b, resid, XtX_inv = _ols_vectorised(Xd, Yd)
+        se_b   = _hc1_se_intercept(Xd, resid, XtX_inv)
+        ss_res = (resid ** 2).sum(axis=0)
+        ss_tot = ((Yd - Yd.mean(axis=0)) ** 2).sum(axis=0)
+        r2_b   = 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, np.nan)
+        return beta_b, se_b, r2_b
 
-    alpha_m = beta[0]                         # (N,) monthly
+    # ── Fit: vectorised for full-history stocks, per-stock on own valid    #
+    #    rows for partial-history stocks.  (NO cross-sectional imputation — #
+    #    imputed months are near-collinear with the market factor and       #
+    #    artificially inflate alpha t-stats.)                               #
+    complete_cols = ret.columns[ret.notna().all()].tolist()
+    partial_cols  = [c for c in ret.columns if c not in set(complete_cols)]
+
+    rows: dict = {}
+
+    if complete_cols:
+        Yc = ret[complete_cols].values - rf[:, None]
+        beta_c, se_c, r2_c = _fit(X, Yc)
+        for j, tkr in enumerate(complete_cols):
+            rows[tkr] = (beta_c[:, j], se_c[j], r2_c[j], T)
+
+    n_skipped = 0
+    for tkr in partial_cols:
+        mask  = ret[tkr].notna().values
+        n_obs = int(mask.sum())
+        if n_obs < 24 or n_obs <= K + 2:
+            n_skipped += 1
+            continue
+        Xs = X[mask]
+        ys = (ret[tkr].values[mask] - rf[mask])[:, None]
+        beta_s, se_s, r2_s = _fit(Xs, ys)
+        rows[tkr] = (beta_s[:, 0], se_s[0], r2_s[0], n_obs)
+
+    if n_skipped:
+        logger.info("%d partial-history stocks below 24 obs — excluded.", n_skipped)
+
+    if not rows:
+        return pd.DataFrame()
+
+    tickers   = [c for c in ret.columns if c in rows]
+    beta_mat  = np.column_stack([rows[t][0] for t in tickers])   # (K, N)
+    se_alpha  = np.array([rows[t][1] for t in tickers])
+    r2        = np.array([rows[t][2] for t in tickers])
+    n_obs_arr = np.array([rows[t][3] for t in tickers])
+
+    alpha_m = beta_mat[0]                     # (N,) monthly
     alpha_a = (1 + alpha_m) ** 12 - 1        # annualised
 
-    t_stats = alpha_m / np.where(se_alpha > 0, se_alpha, np.nan)
+    # Degenerate columns (halted/stale prices → se ≈ 0) → NaN, not |t| = ∞
+    t_stats = np.where(se_alpha > 1e-7, alpha_m / se_alpha, np.nan)
 
-    # ── R² ─────────────────────────────────────────────────────────────── #
-    ss_res = (residuals ** 2).sum(axis=0)
-    ss_tot = ((Y - Y.mean(axis=0)) ** 2).sum(axis=0)
-    r2 = 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, np.nan)
-
-    # ── Assemble ─────────────────────────────────────────────────────────── #
-    tickers = ret.columns.tolist()
     out = {
         "alpha_monthly": alpha_m,
         "alpha_annual":  alpha_a,
         "alpha_tstat":   t_stats,
-        "beta_mkt":  beta[1],
-        "beta_smb":  beta[2],
-        "beta_hml":  beta[3],
-        "beta_rmw":  beta[4],
-        "beta_cma":  beta[5],
+        "beta_mkt":  beta_mat[1],
+        "beta_smb":  beta_mat[2],
+        "beta_hml":  beta_mat[3],
+        "beta_rmw":  beta_mat[4],
+        "beta_cma":  beta_mat[5],
         "r_squared": r2,
+        "n_obs":     n_obs_arr,
     }
     if use_umd:
-        out["beta_umd"] = beta[6]
+        out["beta_umd"] = beta_mat[6]
 
     result = pd.DataFrame(out, index=tickers)
 
-    # ── Signal: |t| ≥ threshold (Student-t critical value) ─────────────── #
-    K = X.shape[1]
-    df_resid = T - K
+    # ── Signal: |t| ≥ per-stock critical value with df = n_obs − K ─────── #
+    # The sampling distribution of an OLS t-stat has df = T − K residual
+    # degrees of freedom.  (Previously min(df_resid, ν=5) was used — fat-tailed
+    # RETURNS do not change the t-stat's reference distribution; that misuse
+    # raised the threshold to 2.57 and suppressed legitimate signals.)
+    from scipy.stats import t as _t
+    df_resid   = np.maximum(n_obs_arr - K, 1)
+    t_crit_arr = _t.ppf(0.975, df=df_resid)
 
-    return_df = getattr(cfg, "return_df", None)
-    if return_df is not None and return_df > 2:
-        from scipy.stats import t as _t
-        eff_df     = min(df_resid, return_df)
-        t_crit     = float(_t.ppf(0.975, df=eff_df))
-        dist_label = f"Student-t(ν={eff_df:.0f})"
-    else:
-        t_crit     = cfg.alpha_tstat_threshold
-        dist_label = "Normal (ν→∞)"
-
-    result["signal"]     = result["alpha_tstat"].abs() >= t_crit
+    result["signal"]     = np.abs(result["alpha_tstat"].values) >= t_crit_arr
     result["alpha_sign"] = np.sign(result["alpha_monthly"])
 
     logger.info(
-        "%s regression: %d stocks, %d with |t|≥%.3f [%s, p<5%% two-sided] (%.0f%%).",
-        model_label, len(tickers), result["signal"].sum(),
-        t_crit, dist_label, 100 * result["signal"].mean(),
+        "%s regression: %d stocks (%d full, %d partial), %d with |t|≥crit "
+        "[t(df=n_obs−%d), p<5%% two-sided] (%.0f%%).",
+        model_label, len(tickers), len(complete_cols),
+        len(tickers) - len(complete_cols),
+        int(result["signal"].sum()), K, 100 * result["signal"].mean(),
     )
     return result
 
@@ -227,7 +261,9 @@ def rolling_alpha_signal(
     Returns a DataFrame with a MultiIndex (date, ticker) and the same
     columns as `compute_ff5_alpha`.
     """
-    returns = prices.pct_change().dropna(how="all")
+    # fill_method=None: default pad-fill would turn price gaps into phantom
+    # 0% returns before the regression ever sees them.
+    returns = prices.pct_change(fill_method=None).dropna(how="all")
     dates   = returns.index
     window  = cfg.lookback_months
 
@@ -243,9 +279,8 @@ def rolling_alpha_signal(
         start_loc = max(0, loc - window + 1)
         window_ret = returns.iloc[start_loc : loc + 1]
         valid_cols = window_ret.columns[window_ret.notna().sum() >= cfg.min_obs]
-        window_ret = window_ret[valid_cols]
-        _med = window_ret.median(axis=1)
-        window_ret = window_ret.apply(lambda col: col.fillna(_med)).dropna()
+        # NaN handled per-stock inside compute_ff5_alpha (no imputation)
+        window_ret = window_ret[valid_cols].dropna(how="all")
 
         alpha_df = compute_ff5_alpha(window_ret, factors, cfg)
         if alpha_df.empty:

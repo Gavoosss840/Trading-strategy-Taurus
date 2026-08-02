@@ -105,7 +105,9 @@ def estimate_covariance(
     if halflife > 0 and R.shape[0] >= 12:
         cov = _ewma_cov(R, halflife)
         logger.debug("Covariance: EWMA (halflife=%d months).", halflife)
-    elif cfg.cov_shrinkage and _HAS_SKLEARN and R.shape[0] > N:
+    elif cfg.cov_shrinkage and _HAS_SKLEARN and R.shape[0] >= 12:
+        # Ledoit-Wolf is designed precisely for T ≤ N (ill-conditioned) cases —
+        # do NOT gate it on T > N.
         lw = LedoitWolf(assume_centered=False)
         lw.fit(R)
         cov = lw.covariance_
@@ -114,17 +116,20 @@ def estimate_covariance(
         cov = np.cov(R.T, ddof=1)
         logger.debug("Covariance: sample (no shrinkage).")
 
-    # Enforce PSD: clip eigenvalues at floor
+    cov = np.atleast_2d(cov)   # N=1 → np.cov returns a 0-d scalar
+
+    # Enforce PSD with a floor RELATIVE to the average variance: an absolute
+    # 1e-6 floor creates near-riskless phantom directions that a variance
+    # minimiser will exploit.
+    mean_var = float(np.mean(np.diag(cov))) if cov.size else 0.0
+    floor    = max(cfg.cov_min_eigenvalue, 1e-4 * mean_var)
     eigvals, eigvecs = np.linalg.eigh(cov)
-    eigvals  = np.maximum(eigvals, cfg.cov_min_eigenvalue)
+    eigvals  = np.maximum(eigvals, floor)
     cov_psd  = (eigvecs * eigvals) @ eigvecs.T
 
-    # Student-t fat-tail variance inflation: Var(t_ν) = σ² × ν/(ν-2)
-    return_df = getattr(cfg, "return_df", None)
-    if return_df is not None and return_df > 2:
-        inflation = return_df / (return_df - 2.0)
-        cov_psd   = cov_psd * inflation
-        logger.debug("Covariance inflated by ν/(ν-2)=%.4f (Student-t, ν=%.1f).", inflation, return_df)
+    # NOTE: no Student-t ν/(ν-2) inflation here — the empirical covariance of
+    # realised returns already contains fat-tail variance; inflating it again
+    # double-counts tails (+67% at ν=5).
 
     return cov_psd
 
@@ -231,7 +236,10 @@ def max_sharpe_weights(
     tickers = expected_returns.index.tolist()
     N       = len(tickers)
     rf_m    = cfg.rf_monthly
-    mu_m    = (1 + expected_returns.values) ** (1 / 12) - 1   # (N,)
+    # Clip to avoid a negative base under the fractional power: a score ≤ -1
+    # would produce NaN and silently break the optimisation.
+    er      = np.clip(expected_returns.values.astype(float), -0.90, 5.0)
+    mu_m    = (1 + er) ** (1 / 12) - 1   # (N,)
 
     def neg_sharpe(w: np.ndarray) -> float:
         port_ret = w @ mu_m - rf_m
@@ -287,25 +295,40 @@ def apply_sector_constraints(
     sector_map: Dict[str, str],
     cfg: TaurusConfig = DEFAULT_CONFIG,
 ) -> pd.Series:
-    """Trim sector weights exceeding max_sector_weight; redistribute remainder."""
-    w = weights.copy()
-    for _ in range(20):
-        changed = False
-        for sector in set(sector_map.values()):
+    """
+    Trim sector weights exceeding the cap, iterating trim → renormalise to a
+    fixed point (a single trim followed by one global renormalisation pushes
+    just-capped sectors back above the limit).
+
+    If the cap is infeasible (n_sectors × cap < 1), it is relaxed to 1/n_sectors.
+    """
+    w = weights.clip(lower=0)
+    if w.sum() <= 0:
+        return w
+    w = w / w.sum()
+
+    sectors_present = {sector_map[t] for t in w.index if t in sector_map}
+    n_sec = max(len(sectors_present), 1)
+    cap   = max(cfg.max_sector_weight, 1.0 / n_sec + 1e-6)
+
+    for _ in range(50):
+        violated = False
+        for sector in sectors_present:
             members  = [t for t, s in sector_map.items() if s == sector and t in w.index]
             if not members:
                 continue
             sector_w = w[members].sum()
-            if sector_w > cfg.max_sector_weight + 1e-8:
-                scale       = cfg.max_sector_weight / sector_w
-                w[members] *= scale
-                changed     = True
-        if not changed:
+            if sector_w > cap + 1e-8:
+                w[members] *= cap / sector_w
+                violated    = True
+        if not violated:
             break
+        total = w.sum()
+        if total > 0:
+            w = w / total   # renormalise, then re-check caps next iteration
 
-    w = w.clip(lower=0)
     if w.sum() > 0:
-        w /= w.sum()
+        w = w / w.sum()
     return w
 
 
@@ -326,12 +349,21 @@ def estimate_betas(
     beta-neutralisation error and improves out-of-sample hedge quality.
     """
     R          = returns.dropna(how="all")
-    common_idx = R.index.intersection(market_returns.index)
-    R          = R.loc[common_idx].dropna(axis=1)
-    mkt        = market_returns.loc[common_idx].values
+    # Drop NaN market months FIRST (FF factors publish with a lag; a NaN row
+    # would poison the whole lstsq and produce all-NaN betas).
+    mkt_clean  = market_returns.dropna()
+    common_idx = R.index.intersection(mkt_clean.index)
+    R          = R.loc[common_idx]
+    valid_cols = R.columns[R.notna().all()]
+    Rv         = R[valid_cols]
+    mkt        = mkt_clean.loc[common_idx].values
+
+    if len(common_idx) < 12 or len(valid_cols) == 0:
+        logger.warning("estimate_betas: insufficient clean data — defaulting to β=1.")
+        return pd.Series(1.0, index=returns.columns)
 
     X = np.column_stack([np.ones(len(mkt)), mkt])   # (T, 2)
-    Y = R.values                                      # (T, N)
+    Y = Rv.values                                     # (T, N)
 
     try:
         beta_all = (np.linalg.lstsq(X, Y, rcond=None)[0])[1]   # (N,)
@@ -343,7 +375,10 @@ def estimate_betas(
         beta_all = 0.67 * beta_all + 0.33
         logger.debug("Blume beta shrinkage applied.")
 
-    return pd.Series(beta_all, index=R.columns)
+    betas = pd.Series(beta_all, index=valid_cols)
+    # Stocks with gaps get β=1.0 (market beta) instead of being dropped —
+    # a dropped ticker would silently be hedged as β=0 downstream.
+    return betas.reindex(returns.columns, fill_value=1.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +393,13 @@ def beta_neutralise(
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Rescale long and short leg weights so β_long_leg ≈ β_short_leg (net β ≈ 0).
+
+    The returned legs are intentionally NOT renormalised to sum to 1: the long
+    leg sums to k_L and the short leg to k_S (k_L + k_S = 2, gross preserved).
+    Downstream consumers (backtest P&L and execution sizing) multiply weights
+    by gross_leverage/2, so the scaling flows into actual position sizes.
+    Renormalising here would cancel the scalars exactly and leave net beta
+    unchanged.
     """
     long_tickers  = long_weights.index.intersection(betas.index)
     short_tickers = short_weights.index.intersection(betas.index)
@@ -369,25 +411,28 @@ def beta_neutralise(
     beta_L = (long_weights[long_tickers]  * betas[long_tickers]).sum()
     beta_S = (short_weights[short_tickers] * betas[short_tickers]).sum()
 
-    if abs(beta_L + beta_S) < 1e-8:
-        logger.warning("Beta sum near zero; returning equal-weighted legs.")
+    denom = abs(beta_L) + abs(beta_S)
+    if denom < 1e-8:
+        logger.info("Both leg betas ≈ 0; no neutralisation needed.")
         return long_weights, short_weights
 
-    k_L = 2.0 * abs(beta_S) / (abs(beta_L) + abs(beta_S))
-    k_S = 2.0 * abs(beta_L) / (abs(beta_L) + abs(beta_S))
+    k_L = 2.0 * abs(beta_S) / denom
+    k_S = 2.0 * abs(beta_L) / denom
+
+    # Bound the leg scalars so noisy beta estimates cannot produce extreme
+    # gross tilts (trade exact neutrality for bounded leverage per leg).
+    k_L = float(np.clip(k_L, 0.6, 1.4))
+    k_S = float(np.clip(k_S, 0.6, 1.4))
 
     lw = long_weights  * k_L
     sw = short_weights * k_S
-
-    lw = lw / lw.sum() if lw.sum() > 0 else lw
-    sw = sw / sw.sum() if sw.sum() > 0 else sw
 
     net_beta = (lw[long_tickers] * betas[long_tickers]).sum() - \
                (sw[short_tickers] * betas[short_tickers]).sum()
 
     logger.info(
-        "Beta neutralisation: β_L=%.3f, β_S=%.3f → net β=%.4f (target=%.2f).",
-        beta_L, beta_S, net_beta, cfg.target_net_beta,
+        "Beta neutralisation: β_L=%.3f, β_S=%.3f → k_L=%.3f, k_S=%.3f, net β=%.4f (target=%.2f).",
+        beta_L, beta_S, k_L, k_S, net_beta, cfg.target_net_beta,
     )
     return lw, sw
 
@@ -465,7 +510,10 @@ def build_leg(
     if len(tickers) == 0:
         return pd.Series(dtype=float)
 
-    ret_sub = returns[tickers].dropna()
+    # Fill per-stock gaps with the column median (covariance estimation only)
+    # so one gappy ticker doesn't truncate the sample for the whole leg.
+    ret_sub = returns[tickers]
+    ret_sub = ret_sub.fillna(ret_sub.median())
     scores  = alpha_scores[tickers].fillna(0.0).values
     cov     = estimate_covariance(ret_sub, cfg) * 12   # annualise
 
@@ -484,12 +532,16 @@ def build_leg(
         mu      = pd.Series(alpha_scores[tickers].fillna(0.0).values, index=tickers)
         weights = max_sharpe_weights(mu, cov, cfg)
 
-    # Hard per-position cap then renormalise
+    # Hard per-position cap, iterated: a single clip + renormalise can push
+    # weights back above the cap, so repeat until the cap holds.
     actual_max_w = max(cfg.max_position_weight, 1.0 / max(len(tickers), 1))
     actual_max_w = min(actual_max_w, 0.25)
-    weights      = weights.clip(upper=actual_max_w)
-    if weights.sum() > 0:
-        weights /= weights.sum()
+    for _ in range(20):
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        if (weights <= actual_max_w + 1e-9).all():
+            break
+        weights = weights.clip(upper=actual_max_w)
 
     weights = apply_sector_constraints(weights, sector_map, cfg)
     return weights

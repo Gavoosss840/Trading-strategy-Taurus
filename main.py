@@ -297,7 +297,9 @@ def run_backtest(args, cfg) -> None:
                 if len(r) < 3:
                     sharpes[name] = 0.0
                 else:
-                    ann = (1 + r.mean()) ** 12 - 1
+                    # Geometric annualisation (arithmetic-mean compounding
+                    # systematically flatters high-vol universes)
+                    ann = float((1 + r).prod() ** (12 / len(r)) - 1)
                     vol = r.std() * np.sqrt(12)
                     sharpes[name] = (ann - cfg.risk_free_rate_annual) / vol if vol > 0 else 0.0
 
@@ -308,11 +310,19 @@ def run_backtest(args, cfg) -> None:
             else:
                 w = {k: v / total for k, v in raw.items()}
 
-            row_ret = sum(
-                w[name] * df_ret.loc[t, name]
-                for name in df_ret.columns
-                if not pd.isna(df_ret.loc[t, name])
-            )
+            # Renormalise over the universes that actually have data this
+            # month — otherwise months where a universe is missing hold the
+            # residual as phantom 0%-return cash (inconsistent with live,
+            # which always deploys 100% of NAV across traded universes).
+            avail = [n for n in df_ret.columns if not pd.isna(df_ret.loc[t, n])]
+            if not avail:
+                combined_monthly.append(0.0)
+                continue
+            w_avail = sum(w[n] for n in avail)
+            if w_avail > 1e-9:
+                row_ret = sum(w[n] * df_ret.loc[t, n] for n in avail) / w_avail
+            else:
+                row_ret = sum(df_ret.loc[t, n] for n in avail) / len(avail)
             combined_monthly.append(row_ret)
             final_weights = w   # keep last for display
 
@@ -464,7 +474,8 @@ def run_report(args, cfg) -> None:
 
     # ── Append live MTD returns (current period, not saved to CSV) ────────── #
     from taurus.scheduler import compute_live_mtd_returns
-    mtd_data = compute_live_mtd_returns(str(output), universes)
+    mtd_data = compute_live_mtd_returns(str(output), universes,
+                                        gross_leverage=cfg.gross_leverage)
     for name, (mtd_date, mtd_ret, n_matched, n_total) in mtd_data.items():
         mtd_entry = pd.Series([mtd_ret], index=[mtd_date], name=name)
         if name in ret_map:
@@ -1390,7 +1401,11 @@ def run_backfill_returns(args, cfg) -> None:
 
             prev_date = pd.Timestamp(prev_snap["as_of"].iloc[0])
             next_date = pd.Timestamp(next_snap["as_of"].iloc[0])
-            date_label = prev_date.strftime("%Y-%m-%d")
+            # Label by the month-end of the period that ENDED (backtest
+            # convention) — labelling by period start shifts every month −1
+            # and collides with existing backtest labels.
+            from taurus.scheduler import period_end_label as _pel
+            date_label = _pel(next_date).strftime("%Y-%m-%d")
 
             if date_label in existing_dates:
                 logger.info("[%s] %s already in monthly_returns — skipping.", universe_name, date_label)
@@ -1427,11 +1442,17 @@ def run_backfill_returns(args, cfg) -> None:
                 last_prices  = close.ffill().iloc[-1]
                 rets = (last_prices - first_prices) / first_prices.replace(0, float("nan"))
 
-                common = weights.index.intersection(rets.index)
+                rets = rets.clip(lower=-0.95, upper=1.5)   # unit-flip guard
+                common = weights.index.intersection(rets.dropna().index)
                 if common.empty:
                     continue
 
                 port_return = float((weights[common] * rets[common]).sum())
+                coverage = float(weights[common].abs().sum() / weights.abs().sum())
+                if 0.5 <= coverage < 1.0:
+                    port_return /= coverage
+                # Match the backtest's (lev/2)-per-leg NAV basis
+                port_return *= cfg.gross_leverage / 2.0
                 new_rows.append({"date": pd.Timestamp(date_label), "return": port_return})
 
                 logger.info(

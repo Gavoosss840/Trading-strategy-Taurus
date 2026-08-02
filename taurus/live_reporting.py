@@ -131,6 +131,12 @@ def compute_live_monthly_returns(output_dir: str = "output") -> pd.Series:
         return dt.to_period("M").to_timestamp("M")
 
     returns.index = pd.DatetimeIndex(returns.index.map(_nav_date_to_period))
+    # Two NAV dates can map to the same month (e.g. a Jul 31 rebalance and an
+    # Aug 3 late run both → "Jul"): compound duplicates into one monthly
+    # return instead of letting them double-count in cumprod/heatmap/blends.
+    if returns.index.has_duplicates:
+        returns = (1 + returns).groupby(returns.index).prod() - 1
+        returns.index = pd.DatetimeIndex(returns.index)
     returns.name = "live_returns"
     return returns
 
@@ -179,10 +185,24 @@ def blend_returns_with_live(
     if not backtest_returns:
         return live if not live.empty else pd.Series(dtype=float, name="combined")
 
-    # Equal-weighted backtest combined (same as _combined_returns in reporting.py)
-    df = pd.concat(backtest_returns, axis=1).dropna(how="all")
-    bt_combined = df.mean(axis=1)
-    bt_combined.name = "combined"
+    # Prefer the Sharpe-weighted combined series saved by the backtest
+    # (output/combined_monthly_returns.csv) — the headline combined is
+    # Sharpe-weighted, so the blend must be too.  Fall back to equal-weight
+    # only when no saved series exists.
+    comb_path = Path(output_dir) / "combined_monthly_returns.csv"
+    bt_combined = None
+    if comb_path.exists():
+        try:
+            bt_combined = pd.read_csv(comb_path, index_col=0, parse_dates=True).squeeze("columns")
+            bt_combined.name = "combined"
+            logger.info("Blend uses Sharpe-weighted combined series (%d months).", len(bt_combined))
+        except Exception as e:
+            logger.warning("Could not load combined_monthly_returns.csv: %s", e)
+            bt_combined = None
+    if bt_combined is None:
+        df = pd.concat(backtest_returns, axis=1).dropna(how="all")
+        bt_combined = df.mean(axis=1)
+        bt_combined.name = "combined"
 
     if live.empty:
         return bt_combined   # no live data yet → pure backtest

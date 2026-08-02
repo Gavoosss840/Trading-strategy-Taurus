@@ -75,7 +75,9 @@ def momentum_signal(
         logger.debug("as_of %s is before price history start.", as_of)
         return pd.DataFrame()
 
-    # Momentum measurement: from (as_of - window - skip) to (as_of - skip)
+    # Momentum measurement: P[t-skip] / P[t-skip-window+1] − 1
+    # With skip=1, window=12: cumulative return over months t−11…t−1,
+    # skipping month t (standard Jegadeesh-Titman 12-1).
     end_loc   = as_of_loc - skip
     start_loc = end_loc - window + 1
 
@@ -93,10 +95,22 @@ def momentum_signal(
     vol_adjust = getattr(cfg, "vol_adjust_momentum", True)
     trailing_vol = pd.Series(np.nan, index=mom_raw.index)
     if vol_adjust:
-        ret_window = prices.iloc[start_loc : end_loc + 1].pct_change().dropna()
-        if len(ret_window) >= 6:
-            trailing_vol = ret_window.std() * np.sqrt(12)   # annualised
-            trailing_vol = trailing_vol.replace(0, np.nan)
+        # fill_method=None: pad-fill would turn price gaps into phantom 0%
+        # returns.  Per-stock validity (dropna(how="all") + per-column count):
+        # a single gappy ticker must not shrink the sample for the whole
+        # universe (row-wise dropna() coupled all stocks together).
+        ret_window = (
+            prices.iloc[start_loc : end_loc + 1]
+            .pct_change(fill_method=None)
+            .dropna(how="all")
+        )
+        counts = ret_window.notna().sum()
+        vols   = (ret_window.std() * np.sqrt(12)).where(counts >= 6)  # annualised
+        vols   = vols.replace(0, np.nan)
+        if vols.notna().any():
+            # Stocks without a reliable vol estimate get the median vol so
+            # their score stays on the same scale as the cross-section.
+            trailing_vol = vols.fillna(vols.median()).reindex(mom_raw.index)
             mom_sharpe   = mom_raw / trailing_vol
         else:
             mom_sharpe = mom_raw.copy()
@@ -131,8 +145,12 @@ def momentum_signal(
     if dampen and market_returns is not None and len(market_returns) >= 13:
         mkt = market_returns.reindex(idx[:as_of_loc + 1]).dropna()
         if len(mkt) >= 13:
-            vol_1m  = float(abs(mkt.iloc[-1]) * np.sqrt(12))     # 1-month point vol
-            vol_12m = float(mkt.iloc[-12:].std() * np.sqrt(12))  # 12-month rolling vol
+            # |r| → σ bias correction: under normality E|r| = σ·√(2/π) ≈ 0.80σ,
+            # so scale by √(π/2) to make the 2× trigger fire at its intended level.
+            vol_1m  = float(abs(mkt.iloc[-1]) * np.sqrt(np.pi / 2.0) * np.sqrt(12))
+            # Trailing baseline EXCLUDES the month being tested — including the
+            # spike month inflates the denominator exactly when a crash happens.
+            vol_12m = float(mkt.iloc[-13:-1].std() * np.sqrt(12))
             if vol_12m > 0 and vol_1m > 2.0 * vol_12m:
                 crash_regime = True
                 logger.info(

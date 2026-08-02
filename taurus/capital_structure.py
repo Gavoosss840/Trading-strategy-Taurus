@@ -130,25 +130,37 @@ def _mm_valuation(
     net_debt = max(total_debt - cash, 0)
     ev = market_cap + net_debt
 
+    # ── Leverage ratio (robust) ───────────────────────────────────────────── #
+    # Buyback-heavy firms often report negative book equity; dividing by
+    # max(equity, 1) then yields leverage_ratio ≈ total_debt in absolute
+    # currency units (e.g. 5e10) → astronomical agency costs and a guaranteed
+    # spurious SHORT flag.  Fall back to market cap as the equity base and cap
+    # the ratio.
+    equity_base    = total_equity if total_equity > 0 else market_cap
+    leverage_ratio = min(total_debt / max(equity_base, 1), 10.0)
+
     # ── 1. PV of Tax Shield ───────────────────────────────────────────────── #
-    if interest_expense == 0 and total_debt > 0:
-        interest_expense = total_debt * 0.05   # impute 5% coupon
+    spread          = _credit_spread(leverage_ratio, cfg)
+    if interest_expense <= 0 and total_debt > 0:
+        # Impute a coupon at the firm's estimated cost of debt (consistent
+        # with the shield discount rate → PV ≈ τ·D, the MM perpetuity value)
+        interest_expense = total_debt * (rf + spread)
 
-    annual_tax_shield = tax_rate * interest_expense
-
-    # Leverage-based credit spread instead of flat +200 bps
-    leverage_ratio = total_debt / max(total_equity, 1)
-    spread         = _credit_spread(leverage_ratio, cfg)
-    shield_discount = rf + spread
-    pv_tax_shield   = annual_tax_shield / shield_discount if shield_discount > 0 else 0
+    annual_tax_shield = tax_rate * max(interest_expense, 0.0)
+    shield_discount   = rf + spread
+    pv_tax_shield     = annual_tax_shield / shield_discount if shield_discount > 0 else 0
 
     # ── 2. Unlevered value ────────────────────────────────────────────────── #
     VU = market_cap + net_debt - pv_tax_shield
 
     # ── 3. Financial distress costs (Merton model) ──────────────────────── #
+    # Consistent GROSS-debt convention throughout: firm value = E + D_gross,
+    # default barrier = D_gross, asset vol de-levered with E/(E + D_gross).
+    # (Previously V used net debt while the barrier and de-levering used gross
+    # debt — internally inconsistent.)
     E       = max(market_cap, 1)
     D       = max(total_debt, 1)
-    V_firm  = max(ev, 1)
+    V_firm  = E + D
 
     sigma_assets = sigma_equity * (E / (E + D))   # de-lever equity vol
     mu = rf
@@ -162,7 +174,9 @@ def _mm_valuation(
             prob_default = float(_t_dist.cdf(-d2, df=return_df))
         else:
             prob_default = float(norm.cdf(-d2))
-    except Exception:
+    except Exception as _exc:
+        # Fails toward "no distress" — log it so silent zeroing is visible
+        logger.debug("Merton d2 failed (%s); prob_default=0.", _exc)
         prob_default = 0.0
 
     # Industry-specific distress cost rate
@@ -173,7 +187,9 @@ def _mm_valuation(
     agency_score = 0.0
     if leverage_ratio > 2.0:
         agency_score += (leverage_ratio - 2.0) * 0.05
-    fcf_yield = abs(fcf) / market_cap if market_cap > 0 else 0
+    # Jensen's free-cash-flow agency cost applies to POSITIVE FCF only —
+    # abs() would penalise cash-burning firms for the wrong reason.
+    fcf_yield = max(fcf, 0.0) / market_cap if market_cap > 0 else 0
     if fcf_yield > 0.10:
         agency_score += (fcf_yield - 0.10) * 0.5
     pv_agency = agency_score * market_cap
@@ -181,7 +197,14 @@ def _mm_valuation(
     # ── 5. Levered theoretical value ──────────────────────────────────────── #
     VL = VU + pv_tax_shield - pv_distress - pv_agency
 
-    divergence     = (VL - market_cap) / market_cap if market_cap > 0 else 0.0
+    # ── Divergence: EQUITY level vs EQUITY level ──────────────────────────── #
+    # VL is a firm/enterprise value (contains net debt); market_cap is
+    # equity-only.  Comparing them directly makes divergence ≈ net_debt/MC:
+    # the signal then measures LEVERAGE, not mispricing, and flags the most
+    # indebted firms as the strongest LONGs (inverted economics).  Subtract
+    # net debt to obtain the implied equity value before comparing.
+    VL_equity      = VL - net_debt
+    divergence     = (VL_equity - market_cap) / market_cap if market_cap > 0 else 0.0
     divergence_pct = divergence * 100.0
 
     return {
@@ -273,11 +296,21 @@ def mm_capital_structure_screen(
     result_df["underleveraged"] = result_df["divergence_pct"] >  threshold
     result_df["overleveraged"]  = result_df["divergence_pct"] < -threshold
 
-    # Interest coverage guard
-    ic = (df["ebit"] / df["interest_expense"].where(df["interest_expense"] > 0)
+    # Interest coverage guard — impute the same coupon the valuation uses so a
+    # debt-carrying firm with unreported interest can't dodge the check, and
+    # flag negative-EBIT firms that carry debt regardless of interest data.
+    _imputed_interest = df["interest_expense"].where(
+        df["interest_expense"] > 0,
+        df["total_debt"].clip(lower=0) * 0.05,
+    )
+    ic = (df["ebit"] / _imputed_interest.where(_imputed_interest > 0)
           ).reindex(result_df.index).fillna(np.inf)
     result_df["ic_ratio"]    = ic
     result_df["overleveraged"] |= (ic < cfg.min_interest_coverage)
+    _neg_ebit_with_debt = (
+        (df["ebit"] < 0) & (df["total_debt"] > 0)
+    ).reindex(result_df.index).fillna(False)
+    result_df["overleveraged"] |= _neg_ebit_with_debt
 
     n_under = result_df["underleveraged"].sum()
     n_over  = result_df["overleveraged"].sum()
