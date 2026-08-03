@@ -20,7 +20,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -62,6 +62,103 @@ def _should_rebalance(last_rebalance: Optional[date], check_date: date) -> bool:
             and last_rebalance.year == check_date.year:
         return False
     return True
+
+
+def _apply_weight_cap(weights: Dict[str, float], cap: float) -> Dict[str, float]:
+    """
+    Cap each weight at `cap`, redistributing the excess pro-rata to the
+    universes still below the cap, iterating until every weight respects it.
+    If the cap is infeasible (cap × n ≤ 1) it degrades to equal-weight.
+    """
+    if not weights or cap <= 0 or cap >= 1.0:
+        return weights
+
+    names = list(weights)
+    if cap * len(names) <= 1.0 + 1e-12:
+        return {k: 1.0 / len(names) for k in names}
+
+    out = dict(weights)
+    for _ in range(100):
+        over = {k: v - cap for k, v in out.items() if v > cap + 1e-12}
+        if not over:
+            break
+        spill = sum(over.values())
+        for k in over:
+            out[k] = cap
+        room = {k: v for k, v in out.items() if v < cap - 1e-12}
+        if not room:
+            break
+        room_total = sum(room.values())
+        if room_total > 1e-12:
+            for k in room:
+                out[k] += spill * room[k] / room_total
+        else:
+            for k in room:
+                out[k] += spill / len(room)
+
+    total = sum(out.values())
+    return {k: v / total for k, v in out.items()} if total > 0 else out
+
+
+def sharpe_allocation_weights(
+    returns: Dict[str, pd.Series],
+    universes: List[str],
+    rf_annual: float = 0.045,
+    window: int = 0,
+    min_months: int = 6,
+    max_weight: float = 0.35,
+) -> Dict[str, float]:
+    """
+    Sharpe-weighted NAV allocation across universes — the single source of
+    truth shared by the back-test (main.py) and live trading (scheduler),
+    so the two can never drift apart.
+
+    Parameters
+    ----------
+    returns    : {universe: monthly return Series}
+    window     : 0 → SINCE INCEPTION (expanding: use every stored month).
+                 >0 → rolling window of that many months.
+    min_months : a universe with less history than this scores Sharpe 0.
+    max_weight : per-universe cap (0 disables).
+
+    Weights ∝ max(Sharpe, 0), normalised, then capped.  Falls back to
+    equal-weight when fewer than two universes have usable history or when
+    every Sharpe is ≤ 0.
+    """
+    import numpy as np
+
+    n = len(universes)
+    if n == 0:
+        return {}
+    equal = {u: 1.0 / n for u in universes}
+
+    sharpes: Dict[str, float] = {}
+    n_valid = 0
+    for u in universes:
+        s = returns.get(u)
+        if s is None:
+            sharpes[u] = 0.0
+            continue
+        r = pd.Series(s).dropna()
+        if window and window > 0:
+            r = r.tail(window)
+        if len(r) < min_months:
+            sharpes[u] = 0.0
+            continue
+        n_valid += 1
+        ann = float((1 + r).prod() ** (12 / len(r)) - 1)   # geometric
+        vol = float(r.std() * np.sqrt(12))
+        sharpes[u] = (ann - rf_annual) / vol if vol > 0 else 0.0
+
+    if n_valid < 2:
+        return equal
+
+    raw   = {u: max(v, 0.0) for u, v in sharpes.items()}
+    total = sum(raw.values())
+    if total < 1e-9:
+        return equal
+
+    return _apply_weight_cap({u: v / total for u, v in raw.items()}, max_weight)
 
 
 def period_end_label(dt: pd.Timestamp) -> pd.Timestamp:
@@ -265,57 +362,45 @@ class RebalanceScheduler:
 
     # ── Rebalance all universes ──────────────────────────────────────────── #
 
-    def _sharpe_weights(self, window: int = 12) -> dict:
+    def _sharpe_weights(self, window: Optional[int] = None) -> dict:
         """
-        Compute Sharpe-weighted NAV allocation fractions from stored monthly
-        returns.  Weights are proportional to max(Sharpe, 0) over the last
-        `window` months; falls back to equal-weight if all Sharpes are ≤ 0.
+        Sharpe-weighted NAV allocation from each universe's stored
+        monthly_returns.csv (back-test history + every live month appended
+        since).  Defaults to cfg.sharpe_window_months, which is 0 =
+        SINCE INCEPTION: the estimate uses all history and gets sharper with
+        every additional month of live track record.
         """
-        import numpy as np
+        if window is None:
+            window = getattr(self.cfg, "sharpe_window_months", 0)
 
         returns = {}
         for name in self.universes:
             path = Path(self.output_dir) / name / "monthly_returns.csv"
             if path.exists():
                 try:
-                    s = pd.read_csv(path, index_col=0, parse_dates=True).squeeze()
-                    returns[name] = s.tail(window)
-                except Exception:
-                    pass
+                    returns[name] = pd.read_csv(
+                        path, index_col=0, parse_dates=True
+                    ).squeeze("columns")
+                except Exception as e:
+                    logger.warning("[%s] Could not read monthly_returns.csv: %s", name, e)
 
-        if len(returns) < 2:
-            n = len(self.universes)
-            return {u: 1.0 / n for u in self.universes}
+        weights = sharpe_allocation_weights(
+            returns, self.universes,
+            rf_annual=self.cfg.risk_free_rate_annual,
+            window=window,
+            min_months=getattr(self.cfg, "sharpe_min_months", 6),
+            max_weight=getattr(self.cfg, "max_universe_weight", 0.35),
+        )
 
-        sharpes = {}
-        rf = self.cfg.risk_free_rate_annual
-        for name, r in returns.items():
-            r = r.dropna()
-            if len(r) < 3:
-                sharpes[name] = 0.0
-            else:
-                # Geometric annualisation of realised compounded returns
-                # (arithmetic-mean compounding overstates high-vol universes)
-                ann = float((1 + r).prod() ** (12 / len(r)) - 1)
-                vol = r.std() * np.sqrt(12)
-                sharpes[name] = (ann - rf) / vol if vol > 0 else 0.0
-
-        # Universes with no stored history default to 0
-        for name in self.universes:
-            if name not in sharpes:
-                sharpes[name] = 0.0
-
-        raw = {k: max(v, 0.0) for k, v in sharpes.items()}
-        total = sum(raw.values())
-        if total < 1e-9:
-            n = len(self.universes)
-            weights = {k: 1.0 / n for k in self.universes}
-        else:
-            weights = {k: v / total for k, v in raw.items()}
-
+        n_hist = {k: int(pd.Series(v).dropna().shape[0]) for k, v in returns.items()}
         logger.info(
-            "Sharpe-weighted NAV allocation: %s",
-            "  ".join(f"{k.upper()}={v*100:.1f}%" for k, v in weights.items()),
+            "Sharpe-weighted NAV allocation (%s, cap=%.0f%%): %s",
+            "since inception" if not window else f"rolling {window}M",
+            getattr(self.cfg, "max_universe_weight", 0.35) * 100,
+            "  ".join(
+                f"{k.upper()}={v*100:.1f}%[{n_hist.get(k,0)}m]"
+                for k, v in sorted(weights.items(), key=lambda x: -x[1])
+            ),
         )
         return weights
 

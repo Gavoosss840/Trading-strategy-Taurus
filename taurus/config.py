@@ -92,6 +92,21 @@ class TaurusConfig:
     w_momentum:    float = 0.30          # Weight for momentum z-score
 
     # ------------------------------------------------------------------ #
+    #  Multi-universe NAV allocation (Sharpe-weighted)                    #
+    # ------------------------------------------------------------------ #
+    # Weights are proportional to max(Sharpe, 0) computed on each universe's
+    # stored monthly_returns.csv.
+    #
+    # sharpe_window_months = 0  → SINCE INCEPTION (expanding window): every
+    #   month of history counts, and each new live rebalance permanently
+    #   enriches the estimate.  A short rolling window (e.g. 12) makes the
+    #   Sharpe estimate too noisy (SE ≈ ±1.2 at 12 obs) and lets one lucky
+    #   streak capture nearly the whole book.
+    sharpe_window_months: int   = 0      # 0 = since inception; >0 = rolling
+    sharpe_min_months:    int   = 6      # below this → equal-weight
+    max_universe_weight:  float = 0.35   # safety cap per universe (0 = off)
+
+    # ------------------------------------------------------------------ #
     #  Portfolio construction                                             #
     # ------------------------------------------------------------------ #
     n_longs:  int   = 25

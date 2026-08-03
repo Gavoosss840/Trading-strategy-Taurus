@@ -282,33 +282,32 @@ def run_backtest(args, cfg) -> None:
     if len(all_results) > 1:
         import numpy as np
 
+        from taurus.scheduler import sharpe_allocation_weights
+
         ret_map = {name: result.portfolio_returns() for name, result in all_results.items()}
         df_ret  = pd.concat(ret_map, axis=1).sort_index()
 
         combined_monthly = []
         final_weights    = {name: 1.0 / len(all_results) for name in all_results}
-        window           = 12
+        # 0 = since inception (expanding window): the allocation at month t
+        # uses EVERY month before t, so each new rebalance permanently
+        # enriches the estimate.  Identical function to the live path.
+        window     = getattr(cfg, "sharpe_window_months", 0)
+        min_months = getattr(cfg, "sharpe_min_months", 6)
+        max_w      = getattr(cfg, "max_universe_weight", 0.35)
+        universe_names = list(df_ret.columns)
 
         for i, t in enumerate(df_ret.index):
-            hist = df_ret.iloc[max(0, i - window): i]
-            sharpes = {}
-            for name in df_ret.columns:
-                r = hist[name].dropna()
-                if len(r) < 3:
-                    sharpes[name] = 0.0
-                else:
-                    # Geometric annualisation (arithmetic-mean compounding
-                    # systematically flatters high-vol universes)
-                    ann = float((1 + r).prod() ** (12 / len(r)) - 1)
-                    vol = r.std() * np.sqrt(12)
-                    sharpes[name] = (ann - cfg.risk_free_rate_annual) / vol if vol > 0 else 0.0
-
-            raw   = {k: max(v, 0.0) for k, v in sharpes.items()}
-            total = sum(raw.values())
-            if total < 1e-9:
-                w = {k: 1.0 / len(df_ret.columns) for k in df_ret.columns}
-            else:
-                w = {k: v / total for k, v in raw.items()}
+            # Strictly prior months only → no look-ahead.
+            hist = df_ret.iloc[:i] if not window else df_ret.iloc[max(0, i - window): i]
+            w = sharpe_allocation_weights(
+                {n: hist[n] for n in universe_names},
+                universe_names,
+                rf_annual=cfg.risk_free_rate_annual,
+                window=0,               # hist is already sliced
+                min_months=min_months,
+                max_weight=max_w,
+            )
 
             # Renormalise over the universes that actually have data this
             # month — otherwise months where a universe is missing hold the
