@@ -137,7 +137,19 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     #  Leverage                                                           #
     # ------------------------------------------------------------------ #
-    gross_leverage:       float = 1.0
+    # Gross exposure as a multiple of NAV: each leg is sized at
+    # gross_leverage/2 × NAV (execution.py) — this IS the leverage; nothing is
+    # configured on the IBKR side, the margin account simply funds the larger
+    # orders.  Calibrated on 10y backtests of the 5-universe book:
+    #   1.00 → 14.89% ann, Sharpe 1.25, maxDD  -8.30%, Calmar 1.79
+    #   1.25 → 16.59% ann, Sharpe 1.22, maxDD  -8.72%, Calmar 1.90  ← retained
+    #   1.50 → 18.64% ann, Sharpe 1.19, maxDD -10.76%, Calmar 1.73
+    #   2.00 → 22.75% ann, Sharpe 1.14, maxDD -14.85%, Calmar 1.53
+    # 1.25 is the only level that improves Calmar over 1.0 (drawdown barely
+    # moves, +1.70pt of return) and still survives a degraded scenario
+    # (vol ×1.3, alpha ×0.75 → maxDD -12.64%, inside the -15% circuit breaker).
+    # Reg-T initial margin at 1.25 = 62.5% of NAV → 37.5% free buffer.
+    gross_leverage:       float = 1.25
     margin_cost_annual:   float = 0.058  # 5.8%/an (fed funds + spread)
     borrow_cost_annual:   float = 0.010  # 1.0%/an avg stock borrow fee
 
