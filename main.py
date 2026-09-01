@@ -1286,15 +1286,6 @@ def run_force_rebalance(args, cfg) -> None:
             universes=active_universes,
             output_dir=args.output,
         )
-        nav_weights = full_scheduler._sharpe_weights()
-        # Use raw weights directly — each universe keeps its global fraction.
-        # No renormalisation: running a subset doesn't inflate their share.
-
-        logger.info(
-            "NAV allocation (global weights, %d active universes): %s",
-            len(active_universes),
-            "  ".join(f"{u.upper()}={nav_weights.get(u,0)*100:.1f}%" for u in universes),
-        )
 
         # as_of must be the last business day of the most recently completed month
         # so the date exists in the monthly price data.
@@ -1307,6 +1298,27 @@ def run_force_rebalance(args, cfg) -> None:
         prev_month = (first_of_current_month - pd.Timedelta(days=1)).replace(day=1).date()
         as_of     = pd.Timestamp(_last_business_day_of_month(prev_month))
         logger.info("Force-rebalance as_of = %s (last completed month-end)", as_of.date())
+
+        # Lock in the realised return of the month that just ENDED for EVERY
+        # active universe BEFORE computing Sharpe weights — otherwise the
+        # allocation ignores the latest month and lags the back-test by one
+        # period.  (_run_single_universe calls this again per universe; the
+        # duplicate guard makes the second call a no-op.)
+        for name in active_universes:
+            try:
+                full_scheduler._compute_and_append_monthly_return(name, as_of)
+            except Exception as e:
+                logger.warning("[%s] Pre-weight return append failed: %s", name, e)
+
+        nav_weights = full_scheduler._sharpe_weights()
+        # Use raw weights directly — each universe keeps its global fraction.
+        # No renormalisation: running a subset doesn't inflate their share.
+
+        logger.info(
+            "NAV allocation (global weights, %d active universes): %s",
+            len(active_universes),
+            "  ".join(f"{u.upper()}={nav_weights.get(u,0)*100:.1f}%" for u in universes),
+        )
 
         for universe_name in universes:
             try:
