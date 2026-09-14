@@ -219,8 +219,13 @@ class TaurusStrategy:
         # ── 3. MM valuation screen ────────────────────────────────────────── #
         logger.info("[%s] Running MM valuation screen...", as_of.date())
         live_fund = fund.loc[fund.index.intersection(alpha_df.index)]
-        mm_df     = mm_capital_structure_screen(live_fund, cfg, returns=window_returns) \
-                    if not live_fund.empty else pd.DataFrame()
+        # beta_mkt comes from the regression just run: same stock, same window,
+        # so the un-levered discount rate is consistent with the alpha beside it.
+        mm_df     = mm_capital_structure_screen(
+                        live_fund, cfg,
+                        returns=window_returns,
+                        betas=alpha_df["beta_mkt"],
+                    ) if not live_fund.empty else pd.DataFrame()
 
         # ── 4. Momentum signal ────────────────────────────────────────────── #
         logger.info("[%s] Computing momentum signal...", as_of.date())
@@ -340,7 +345,16 @@ class TaurusStrategy:
 
         # ── MM divergence z-score ─────────────────────────────────────────── #
         if not mm_df.empty and "divergence_pct" in mm_df.columns:
-            z_mm = _zscore(mm_df["divergence_pct"]).reindex(common_idx, fill_value=0.0)
+            # fillna AFTER reindex: reindex's fill_value only covers absent
+            # index labels, not NaN values already present.  A stock the MM
+            # screen could not value (non-positive EBIT) must score 0 on this
+            # pillar — leaving NaN would poison its whole composite and drop it
+            # from both legs even when its alpha and momentum are valid.
+            z_mm = (
+                _zscore(mm_df["divergence_pct"])
+                .reindex(common_idx)
+                .fillna(0.0)
+            )
         else:
             z_mm = pd.Series(0.0, index=common_idx)
 
@@ -399,6 +413,11 @@ class TaurusStrategy:
         Original binary filter: alpha signal AND MM signal AND momentum.
         Kept for comparison / fallback.  Lower Sharpe than composite.
         """
+        # Before the APV fix in capital_structure.py, `underleveraged` was
+        # unreachable (divergence was always ≤ 0), so under_tickers was always
+        # empty, mm_underval_ratio was always 0, and the long leg always fell
+        # through to the alpha-quantile branch below.  The MM screen now feeds
+        # both legs as designed — expect the long leg to change materially.
         under_tickers = mm_df[mm_df["underleveraged"]].index if not mm_df.empty else pd.Index([])
         over_tickers  = mm_df[mm_df["overleveraged"]].index  if not mm_df.empty else pd.Index([])
         MM_MIN_RATIO  = 0.10

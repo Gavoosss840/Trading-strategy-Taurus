@@ -72,6 +72,16 @@ class TaurusConfig:
     industry_distress_costs: bool = False    # Sector-specific distress rates (vs flat 20%)
     variable_credit_spread:  bool = False    # Leverage-based spread (vs flat +2%)
 
+    # ── Unlevered firm value (APV) ──────────────────────────────────────── #
+    # VU is discounted from fundamentals, not backed out of market cap — see
+    # the module docstring of capital_structure.py for why the previous
+    # formulation was circular.  These three exogenous inputs drive the
+    # perpetuity; the fair value is highly sensitive to them.
+    equity_risk_premium:  float = 0.05   # US long-run equity risk premium
+    terminal_growth:      float = 0.025  # perpetual growth of NOPAT
+    min_discount_spread:  float = 0.02   # floor on (r_U − g); keeps VU finite
+    default_unlevered_beta: float = 1.0  # fallback when beta is unavailable
+
     # ------------------------------------------------------------------ #
     #  Momentum filter                                                    #
     # ------------------------------------------------------------------ #

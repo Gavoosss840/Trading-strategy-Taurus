@@ -165,6 +165,48 @@ git add -A && git commit -m "message" && git push -u origin claude/optimize-pyth
 
 ---
 
+## Valorisation Modigliani-Miller — changement de comportement
+
+L'écran MM calculait la valeur de la firme non endettée à partir de la
+capitalisation boursière :
+
+```
+VU = capitalisation + dette nette − bouclier fiscal
+VL = VU + bouclier fiscal − détresse − agence
+```
+
+Le bouclier fiscal s'annulant entre les deux lignes, il restait
+`VL_equity = capitalisation − détresse − agence`, donc une divergence égale à
+`−(détresse + agence) / capitalisation` : **toujours négative ou nulle**. Le
+signal d'achat `divergence > +25 %` était inatteignable.
+
+Conséquences, désormais corrigées :
+
+| Étage | Avant | Après |
+|---|---|---|
+| `underleveraged` | jamais vrai | atteignable |
+| `_binary_signal`, jambe longue | repli sur le quantile d'alpha à chaque rebalancement | branche MM utilisée |
+| `_composite_signal`, `z_mm` | mesure surtout le risque de faillite | mesure la valorisation |
+| Take-profit (`execution.py`) | divergence ≈ 0 → plancher de 5 % partout | niveau propre à chaque titre, 5 % à 80 % |
+
+La valeur non endettée est maintenant actualisée depuis les fondamentaux
+(NOPAT en perpétuité, bêta dé-leviérisé issu de la régression FF5). Les trois
+frottements — bouclier fiscal, détresse de Merton, agence — sont inchangés.
+
+> **À faire avant le prochain rebalancement réel** : relancer un back-test.
+> La composition de la jambe longue et les niveaux de take-profit changent
+> nettement ; les performances historiques publiées ont été mesurées sous
+> l'ancienne formulation.
+
+Une société au résultat d'exploitation négatif ou nul n'est pas valorisable par
+perpétuité : sa divergence vaut `NaN` (et non 0, qui se lirait « au juste
+prix »). Elle n'est retenue dans aucune des deux jambes au titre de la
+valorisation, reste notée neutre sur ce pilier dans le mode composite, et les
+deux garde-fous de solvabilité — couverture des intérêts sous 1,5× et EBIT
+négatif avec dette — continuent de s'appliquer.
+
+---
+
 ## Paramètres clés (config.py)
 
 | Paramètre | Valeur | Description |
@@ -175,6 +217,9 @@ git add -A && git commit -m "message" && git push -u origin claude/optimize-pyth
 | `trailing_stop_pct` | 10% | Trailing stop depuis le pic |
 | `circuit_breaker_pct` | 15% | Coupe tout si portefeuille -15% depuis dernier rebalancement |
 | `lookback_months` | 60 | Fenêtre régression FF5/FF6 |
+| `equity_risk_premium` | 5,0% | Prime de risque actions — valorisation MM (APV) |
+| `terminal_growth` | 2,5% | Croissance perpétuelle du NOPAT — valorisation MM |
+| `min_discount_spread` | 2,0% | Écart plancher entre r_U et g (perpétuité finie) |
 | `optimizer_method` | `max_sharpe` | Optimiseur : tangency portfolio (max-Sharpe) |
 | `signal_method` | `binary` | Signal : AND-filter (alpha AND MM AND momentum) |
 | `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
