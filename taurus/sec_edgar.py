@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from .sectors import sector_from_sic
+
 logger = logging.getLogger(__name__)
 
 EDGAR_BASE  = "https://data.sec.gov"
@@ -51,6 +53,32 @@ def _load_cik_map() -> dict[str, str]:
 def ticker_to_cik(ticker: str) -> Optional[str]:
     cik_map = _load_cik_map()
     return cik_map.get(ticker.upper())
+
+
+# --------------------------------------------------------------------------- #
+#  Secteur (code SIC du dépôt)                                                 #
+# --------------------------------------------------------------------------- #
+
+@lru_cache(maxsize=4096)
+def sector_of(cik: str) -> str:
+    """Secteur GICS du déclarant, depuis son code SIC.
+
+    Le secteur était jusqu'ici renvoyé « Unknown » pour tout le monde, ce qui
+    rendait inertes quatre mécanismes à la fois : le taux de détresse
+    sectoriel de l'écran MM, le plafond de 30 % par secteur du portefeuille
+    (un seul secteur observé ⇒ plafond relevé à 100 %), la neutralisation
+    sectorielle du pilier valorisation, et l'exemption des financières.
+    """
+    try:
+        r = requests.get(
+            f"{EDGAR_BASE}/submissions/CIK{cik}.json",
+            headers=HEADERS, timeout=15,
+        )
+        r.raise_for_status()
+        return sector_from_sic((r.json() or {}).get("sic"))
+    except Exception as e:
+        logger.debug("SIC indisponible pour CIK %s: %s", cik, e)
+        return "Unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -415,6 +443,7 @@ def get_fundamentals(ticker: str) -> dict:
 
     result["shares_outstanding"] = _shares_outstanding(facts)
     result["revenue_cagr"] = revenue_cagr(us_gaap)
+    result["sector"]       = sector_of(cik)
 
     # Net debt = total_debt - cash
     if result["total_debt"] == result["total_debt"] and result["cash"] == result["cash"]:
