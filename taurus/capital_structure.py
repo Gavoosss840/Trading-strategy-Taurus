@@ -98,6 +98,15 @@ _SECTOR_DISTRESS_RATE: Dict[str, float] = {
 }
 
 
+# Secteurs exemptés du garde-fou de couverture des intérêts : ceux dont les
+# intérêts versés sont un coût d'exploitation et non une charge de financement.
+_NO_COVERAGE_GUARD = frozenset({"Financials"})
+
+# Secteurs que l'écran MM ne prétend pas valoriser : ceux dont le levier est
+# l'activité elle-même, et non un choix de structure du capital.
+_NO_MM_VALUATION = frozenset({"Financials"})
+
+
 def _distress_rate(sector: str, cfg: TaurusConfig) -> float:
     """Return distress cost rate for a given sector."""
     if not getattr(cfg, "industry_distress_costs", True):
@@ -492,7 +501,10 @@ def mm_capital_structure_screen(
         underleveraged (bool), overleveraged (bool),
         VU, nopat, unlevered_beta, discount_rate, growth_rate, growth_start,
         pv_tax_shield, pv_distress, pv_agency,
-        credit_spread, distress_rate, ic_ratio
+        credit_spread, distress_rate, ic_ratio, thin_coverage
+
+    `underleveraged` and `overleveraged` are mutually exclusive: the solvency
+    guards override a cheap valuation.
     """
     rf        = cfg.risk_free_rate_annual
     threshold = cfg.leverage_gap_threshold * 100
@@ -523,6 +535,24 @@ def mm_capital_structure_screen(
     # stock is neither a long nor a short candidate on valuation grounds.  The
     # two solvency guards below still apply to it: a loss-making, indebted firm
     # is a short candidate regardless of whether a perpetuity can be computed.
+    # A bank has no unlevered firm to value.  APV separates operating assets
+    # from a financing choice, but for a financial institution leverage IS the
+    # business: deposits are raw material, not a capital-structure decision,
+    # and "EBIT" is not an operating flow that can be capitalised.  The screen
+    # therefore abstains rather than producing an uninterpretable number —
+    # exactly as it does for a company with non-positive EBIT.  Financials
+    # remain tradeable through the alpha and momentum pillars.
+    if getattr(cfg, "mm_skip_financials", True) and "sector" in df.columns:
+        _no_valuation = (
+            df["sector"].reindex(result_df.index).fillna("Unknown").isin(_NO_MM_VALUATION)
+        )
+        if _no_valuation.any():
+            result_df.loc[_no_valuation, "divergence_pct"] = np.nan
+            logger.info(
+                "MM screen: %d financials left unvalued (no unlevered firm to value).",
+                int(_no_valuation.sum()),
+            )
+
     result_df["underleveraged"] = result_df["divergence_pct"] >  threshold
     result_df["overleveraged"]  = result_df["divergence_pct"] < -threshold
 
@@ -535,12 +565,31 @@ def mm_capital_structure_screen(
     )
     ic = (df["ebit"] / _imputed_interest.where(_imputed_interest > 0)
           ).reindex(result_df.index).fillna(np.inf)
-    result_df["ic_ratio"]    = ic
-    result_df["overleveraged"] |= (ic < cfg.min_interest_coverage)
+    result_df["ic_ratio"] = ic
+
+    # …except for financials, where interest is not a financing charge but the
+    # cost of the raw material.  A bank funds itself with deposits and lends
+    # the proceeds: paying more interest than its operating income is the
+    # normal shape of the business, not a solvency warning.  JPMorgan covers
+    # its interest 0.9× and was flagged SHORT every month on that basis, while
+    # the valuation put it 47% undervalued — it ended up in BOTH legs at once.
+    # Real Estate keeps the guard: a REIT's debt is genuine leverage.
+    _financial = (
+        df["sector"].reindex(result_df.index).fillna("Unknown").isin(_NO_COVERAGE_GUARD)
+        if "sector" in df.columns
+        else pd.Series(False, index=result_df.index)
+    )
+    result_df["thin_coverage"] = (ic < cfg.min_interest_coverage) & ~_financial
+    result_df["overleveraged"] |= result_df["thin_coverage"]
     _neg_ebit_with_debt = (
         (df["ebit"] < 0) & (df["total_debt"] > 0)
     ).reindex(result_df.index).fillna(False)
     result_df["overleveraged"] |= _neg_ebit_with_debt
+
+    # A stock must never be a candidate for both legs.  The solvency guards
+    # win: being cheap is worth nothing if the company cannot service its debt
+    # through the holding period.
+    result_df["underleveraged"] &= ~result_df["overleveraged"]
 
     n_under  = int(result_df["underleveraged"].sum())
     n_over   = int(result_df["overleveraged"].sum())
