@@ -78,9 +78,23 @@ class TaurusConfig:
     # formulation was circular.  These three exogenous inputs drive the
     # perpetuity; the fair value is highly sensitive to them.
     equity_risk_premium:  float = 0.05   # US long-run equity risk premium
-    terminal_growth:      float = 0.025  # perpetual growth of NOPAT
+    terminal_growth:      float = 0.025  # growth after convergence, forever
     min_discount_spread:  float = 0.02   # floor on (r_U − g); keeps VU finite
     default_unlevered_beta: float = 1.0  # fallback when beta is unavailable
+
+    # Two-stage valuation. A single perpetual growth rate applied to every
+    # company mechanically undervalues any that grows faster, and the screen
+    # then shorts precisely the fastest growers: measured on 20 US large caps,
+    # growth and divergence correlated at −0.49 and 100% of names above 8%
+    # revenue growth were flagged as short candidates, while the long leg went
+    # to the telecoms in decline.
+    #
+    # Stage 1: the company's own growth, fading linearly to the terminal rate.
+    # Stage 2: perpetuity at the terminal rate.
+    explicit_growth_years:  int   = 10    # length of the fade
+    max_initial_growth:     float = 0.15  # nothing grows at 20% for a decade
+    min_initial_growth:     float = -0.05 # a declining business
+    default_initial_growth: float = 0.03  # when no history is available
 
     # ------------------------------------------------------------------ #
     #  Momentum filter                                                    #

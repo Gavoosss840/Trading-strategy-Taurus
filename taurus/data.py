@@ -382,12 +382,13 @@ def get_fundamentals(
 
     Returns a DataFrame indexed by ticker with columns:
         total_debt, total_equity, ebit, interest_expense,
-        total_assets, market_cap, sector, tax_rate, cash, fcf
+        total_assets, market_cap, sector, tax_rate, cash, fcf, revenue_cagr
     """
     if not tickers:
         _empty_cols = [
             "total_debt", "total_equity", "ebit", "interest_expense",
             "total_assets", "market_cap", "sector", "tax_rate", "cash", "fcf",
+            "revenue_cagr",
         ]
         return pd.DataFrame(columns=_empty_cols)
 
@@ -413,6 +414,7 @@ def get_fundamentals(
             rec["sector"]           = row.get("sector",           "Unknown")
             rec["tax_rate"]         = 0.21   # taux standard US
             rec["fcf"]              = row.get("free_cash_flow", row.get("net_income", np.nan))  # OpCF-CapEx
+            rec["revenue_cagr"]     = row.get("revenue_cagr",      np.nan)  # pilote la 1re étape du DCF
             records.append(rec)
         df = pd.DataFrame(records).set_index("ticker")
 
@@ -438,6 +440,49 @@ def get_fundamentals(
     _cache_save(key, df, cfg)
     logger.info("Fundamentals ready for %d tickers.", len(df))
     return df
+
+
+def _revenue_cagr_yf(ticker_obj) -> float:
+    """Croissance annuelle composée du chiffre d'affaires, via yfinance.
+
+    Contrepartie de `sec_edgar.revenue_cagr` pour les titres hors EDGAR (CAC,
+    Nikkei, Hang Seng) : même fenêtre de huit exercices, mêmes extrémités
+    lissées sur deux ans pour qu'un exercice exceptionnel ne décale pas le
+    taux de plusieurs points.
+
+    Renvoie NaN si moins de quatre exercices sont disponibles : la
+    valorisation retombe alors sur la croissance par défaut, jamais sur une
+    estimation de deux points.
+    """
+    try:
+        inc = ticker_obj.income_stmt          # annuel, contrairement au quarterly
+        if inc is None or inc.empty:
+            return np.nan
+        row = None
+        for label in inc.index:
+            if str(label).strip().lower() in ("total revenue", "operating revenue", "revenue"):
+                row = inc.loc[label].dropna()
+                break
+        if row is None or len(row) < 4:
+            return np.nan
+
+        # yfinance indexe par date de clôture, du plus récent au plus ancien.
+        series = row.sort_index()
+        series = series[-8:]
+        values = [float(v) for v in series.values]
+        years  = [int(str(d)[:4]) for d in series.index]
+        if len(values) < 4 or any(v <= 0 for v in values):
+            return np.nan
+
+        start = (values[0] + values[1]) / 2.0
+        end   = (values[-1] + values[-2]) / 2.0
+        span  = (years[-1] + years[-2]) / 2.0 - (years[0] + years[1]) / 2.0
+        if span <= 0 or start <= 0:
+            return np.nan
+        return float((end / start) ** (1.0 / span) - 1.0)
+    except Exception as exc:
+        logger.debug("Revenue CAGR unavailable: %s", exc)
+        return np.nan
 
 
 def _fetch_single_fundamental(ticker: str) -> dict:
@@ -467,6 +512,11 @@ def _fetch_single_fundamental(ticker: str) -> dict:
             rec["cash"] = _row(["Cash And Cash Equivalents", "Cash"])
         else:
             rec["total_debt"] = rec["total_equity"] = rec["total_assets"] = rec["cash"] = np.nan
+
+        # Croissance du chiffre d'affaires, depuis le compte de résultat ANNUEL
+        # (le trimestriel ne remonte que quelques trimestres : trop court, et
+        # saisonnier).
+        rec["revenue_cagr"] = _revenue_cagr_yf(t)
 
         # Income statement
         inc = t.quarterly_income_stmt
@@ -520,7 +570,7 @@ def _fetch_single_fundamental(ticker: str) -> dict:
         logger.debug("Fundamental fetch error for %s: %s", ticker, exc)
         for field in ("market_cap", "sector", "industry", "total_debt",
                       "total_equity", "total_assets", "cash", "ebit",
-                      "interest_expense", "tax_rate", "fcf"):
+                      "interest_expense", "tax_rate", "fcf", "revenue_cagr"):
             rec.setdefault(field, np.nan if field != "sector" else "Unknown")
 
     return rec

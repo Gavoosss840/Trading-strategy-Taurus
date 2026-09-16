@@ -187,11 +187,62 @@ def unlevered_cost_of_capital(
     return float(cfg.risk_free_rate_annual + beta * cfg.equity_risk_premium)
 
 
-def _perpetuity_value(nopat: float, discount: float, growth: float) -> float:
-    """Growing perpetuity:  NOPAT × (1 + g) / (r - g)."""
-    if discount <= growth or not np.isfinite(nopat):
+def initial_growth(row: pd.Series, cfg: TaurusConfig = DEFAULT_CONFIG) -> float:
+    """The company's own starting growth rate, bounded.
+
+    Estimated from past revenue growth: margins move less than earnings, so an
+    exceptional margin is not mistaken for a growth trajectory.
+
+    Capped by an economic maximum — nothing grows at 20% for a decade — but
+    NOT by the discount rate. The g < r constraint binds only the terminal
+    perpetuity, which would otherwise diverge; over a finite stage, growth
+    above the discount rate is the normal case for an expanding company.
+    """
+    observed = row.get("revenue_cagr", float("nan"))
+    try:
+        observed = float(observed)
+    except (TypeError, ValueError):
+        observed = float("nan")
+    if not np.isfinite(observed):
+        observed = cfg.default_initial_growth
+    return float(np.clip(observed, cfg.min_initial_growth, cfg.max_initial_growth))
+
+
+def _two_stage_value(
+    nopat: float,
+    discount: float,
+    growth_start: float,
+    growth_terminal: float,
+    years: int,
+) -> float:
+    """Present value of a flow whose growth fades to its terminal rate.
+
+    Stage 1: `years` periods whose growth declines linearly from
+    `growth_start` to `growth_terminal`.  Stage 2: perpetuity at the terminal
+    rate.
+
+    A single-rate perpetuity undervalues every company growing faster than
+    that rate, and the screen then shorts precisely the fastest growers — the
+    bias this replaces.  The linear fade also avoids the step change of
+    switching regimes at once, and matches the observed erosion of competitive
+    advantage.
+    """
+    if not np.isfinite(nopat) or discount <= growth_terminal or years < 1:
         return float("nan")
-    return float(nopat * (1.0 + growth) / (discount - growth))
+
+    # Only the TERMINAL rate must stay below the discount rate: stage-1 flows
+    # are finite in number, so their growth may legitimately exceed it.
+    flow = nopat
+    present_value = 0.0
+    for year in range(1, years + 1):
+        weight = (year - 1) / max(years - 1, 1)
+        growth = growth_start + (growth_terminal - growth_start) * weight
+        flow *= 1.0 + growth
+        present_value += flow / (1.0 + discount) ** year
+
+    terminal = flow * (1.0 + growth_terminal) / (discount - growth_terminal)
+    present_value += terminal / (1.0 + discount) ** years
+    return float(present_value)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,12 +339,18 @@ def _mm_valuation(
     )
     discount_rate  = unlevered_cost_of_capital(beta_unlevered, cfg)
 
-    # g must stay clear of r_U or the perpetuity diverges.
+    # The terminal rate must stay clear of r_U or the perpetuity diverges.
     growth_rate = min(cfg.terminal_growth, discount_rate - cfg.min_discount_spread)
+    growth_start = initial_growth(row, cfg)
 
-    VU = _perpetuity_value(nopat, discount_rate, growth_rate)
+    VU = _two_stage_value(
+        nopat, discount_rate, growth_start, growth_rate, cfg.explicit_growth_years,
+    )
     if not np.isfinite(VU) or VU <= 0:
-        logger.debug("Perpetuity not computable (r_U=%.4f, g=%.4f).", discount_rate, growth_rate)
+        logger.debug(
+            "Valuation not computable (r_U=%.4f, g1=%.4f, g=%.4f).",
+            discount_rate, growth_start, growth_rate,
+        )
         return _empty_mm(market_cap)
 
     # ── 3. Financial distress costs (Merton model) ──────────────────────── #
@@ -357,6 +414,7 @@ def _mm_valuation(
                           else cfg.default_unlevered_beta,
         "discount_rate":  discount_rate,
         "growth_rate":    growth_rate,
+        "growth_start":   growth_start,
         "pv_tax_shield":  pv_tax_shield,
         "pv_distress":    pv_distress,
         "pv_agency":      pv_agency,
@@ -377,7 +435,7 @@ def _empty_mm(market_cap: float) -> Dict:
     """
     return {
         "VU": np.nan, "nopat": np.nan, "unlevered_beta": np.nan,
-        "discount_rate": np.nan, "growth_rate": np.nan,
+        "discount_rate": np.nan, "growth_rate": np.nan, "growth_start": np.nan,
         "pv_tax_shield": np.nan, "pv_distress": np.nan,
         "pv_agency": np.nan, "VL_theoretical": np.nan,
         "divergence_pct": np.nan, "prob_default": np.nan,
@@ -432,7 +490,7 @@ def mm_capital_structure_screen(
     DataFrame indexed by ticker with columns:
         VL_theoretical, divergence_pct, prob_default,
         underleveraged (bool), overleveraged (bool),
-        VU, nopat, unlevered_beta, discount_rate, growth_rate,
+        VU, nopat, unlevered_beta, discount_rate, growth_rate, growth_start,
         pv_tax_shield, pv_distress, pv_agency,
         credit_spread, distress_rate, ic_ratio
     """

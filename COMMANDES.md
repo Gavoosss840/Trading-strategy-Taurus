@@ -207,6 +207,95 @@ négatif avec dette — continuent de s'appliquer.
 
 ---
 
+## Lecture des comptes EDGAR — correction de période
+
+La lecture XBRL prenait, pour chaque agrégat, **le fait le plus récent quelle
+que soit la période qu'il couvre**. Un dépôt trimestriel étant plus récent que
+le dernier exercice, le chiffre retenu était souvent celui d'un trimestre — et
+l'écran MM le capitalisait ensuite à l'infini comme s'il s'agissait d'une
+année.
+
+| Titre | Chiffre d'affaires lu (avant) | Réel sur 12 mois |
+|---|---|---|
+| Coca-Cola | 12,5 Md$ | 47,9 Md$ |
+| Johnson & Johnson | 18,5 Md$ | 94,2 Md$ |
+| Apple | 364 Md$ (exercice 2023) | 416 Md$ |
+
+Le flux était donc divisé par quatre pour une partie des titres — **lesquels
+dépendait du concept XBRL le plus frais**, c'est-à-dire du hasard des dépôts,
+pas de l'économie de l'entreprise. Coca-Cola ressortait « surévalué de 82 % »
+et passait en VENTE pour cette seule raison.
+
+Trois corrections :
+
+- **flux sur douze mois glissants** : somme de quatre trimestres consécutifs
+  et disjoints, à défaut le dernier exercice, à défaut le cumulé annualisé ;
+- **bilan lu sur les faits instantanés** uniquement (une valeur de bilan n'a
+  pas de période) ;
+- **choix du concept par fraîcheur** et non par ordre de priorité : Microsoft
+  n'alimente plus `Revenues` depuis 2010, Johnson & Johnson depuis 2014 ; la
+  priorité seule renvoyait un chiffre vieux de dix ans.
+
+Le nombre d'actions, cherché en dollars, revenait `NaN` pour tout le monde :
+il est désormais lu dans l'unité `shares`.
+
+Mesure sur 20 grandes capitalisations américaines (EDGAR réel, bêtas FF5 réels,
+capitalisations réelles) :
+
+| | Avant | Après |
+|---|---|---|
+| Verdicts VENTE | 15 / 20 | 10 / 20 |
+| Verdicts ACHAT | **0 / 20** | 4 / 20 |
+| Verdicts modifiés | — | **8 / 20** |
+
+Zéro achat sur vingt signifiait que `_binary_signal` restait sous son seuil
+`MM_MIN_RATIO = 0,10` et **ignorait purement et simplement le pilier MM** pour
+la jambe longue, à chaque rebalancement.
+
+---
+
+## Valorisation en deux étapes — le biais anti-croissance
+
+Le NOPAT était capitalisé en perpétuité à un taux unique de 2,5 % pour
+**toutes** les sociétés. Une entreprise qui croît à 15 % par an était donc
+valorisée comme si elle croissait à 2,5 % — et ressortait mécaniquement
+surévaluée.
+
+Mesure sur les mêmes 20 titres : croissance du chiffre d'affaires et divergence
+corrélées à **−0,49**, 100 % des titres au-dessus de 8 % de croissance classés
+en VENTE, et la jambe longue peuplée des télécoms en déclin (T à −5,7 % de
+croissance annuelle). L'algorithme vendait les sociétés en croissance et
+achetait celles qui reculent — un pari que personne n'avait choisi.
+
+La valorisation se fait désormais en deux étapes :
+
+1. **dix exercices** dont la croissance décroît linéairement de la croissance
+   propre de l'entreprise vers le taux terminal ;
+2. **perpétuité** au taux terminal (2,5 %).
+
+La croissance de départ est estimée sur **huit exercices de chiffre
+d'affaires** (le chiffre d'affaires plutôt que le résultat : ses marges
+fluctuent moins, et une marge exceptionnelle ne se confond pas avec une
+trajectoire). Les extrémités sont lissées sur deux ans. Elle est bornée à
+±15 % / −5 %, mais **pas** par le taux d'actualisation : la contrainte `g < r`
+ne s'applique qu'à la perpétuité terminale.
+
+Sans historique exploitable, le repli est `default_initial_growth = 3 %` — la
+valorisation reste calculable, jamais estimée sur deux points.
+
+> **Ce qui subsiste, et qui est assumé** : après correction, la corrélation
+> croissance / divergence reste négative (−0,55 sur les 20 titres). C'est le
+> biais *value* d'un modèle d'actualisation : le marché price les sociétés en
+> forte croissance à des multiples que dix ans de fondu à 15 % ne rattrapent
+> pas. Ce n'est plus un artefact de lecture des données, c'est un choix de
+> méthode — il se corrige en relevant `max_initial_growth`, ou en neutralisant
+> `z_mm` par secteur.
+
+> **À faire avant le prochain rebalancement réel** : relancer un back-test.
+> Ces deux corrections changent la composition des deux jambes.
+
+---
+
 ## Paramètres clés (config.py)
 
 | Paramètre | Valeur | Description |
@@ -218,7 +307,11 @@ négatif avec dette — continuent de s'appliquer.
 | `circuit_breaker_pct` | 15% | Coupe tout si portefeuille -15% depuis dernier rebalancement |
 | `lookback_months` | 60 | Fenêtre régression FF5/FF6 |
 | `equity_risk_premium` | 5,0% | Prime de risque actions — valorisation MM (APV) |
-| `terminal_growth` | 2,5% | Croissance perpétuelle du NOPAT — valorisation MM |
+| `terminal_growth` | 2,5% | Croissance du NOPAT après fondu — perpétuité terminale |
+| `explicit_growth_years` | 10 | Durée du fondu entre croissance propre et taux terminal |
+| `max_initial_growth` | 15% | Plafond de la croissance de départ |
+| `min_initial_growth` | −5% | Plancher (activité en déclin) |
+| `default_initial_growth` | 3% | Repli quand l'historique de CA est absent |
 | `min_discount_spread` | 2,0% | Écart plancher entre r_U et g (perpétuité finie) |
 | `optimizer_method` | `max_sharpe` | Optimiseur : tangency portfolio (max-Sharpe) |
 | `signal_method` | `binary` | Signal : AND-filter (alpha AND MM AND momentum) |
