@@ -296,6 +296,85 @@ valorisation reste calculable, jamais estimée sur deux points.
 
 ---
 
+## Le secteur n'était jamais renseigné
+
+`sec_edgar.get_fundamentals` renvoyait `sector = "Unknown"` pour **toutes** les
+sociétés, et yfinance ne complétait que les titres dont la capitalisation
+manquait. Quatre mécanismes tournaient donc à vide :
+
+| Mécanisme | Effet du secteur manquant |
+|---|---|
+| Taux de détresse MM (`_SECTOR_DISTRESS_RATE`) | 20 % forfaitaire pour tout le monde |
+| Plafond sectoriel (`max_sector_weight` = 30 %) | un seul secteur observé ⇒ plafond relevé à 100 %, **inerte** |
+| Neutralisation sectorielle du pilier valorisation | impossible |
+| Exemption des financières | impossible |
+
+Le secteur est désormais lu depuis le **code SIC** du dépôt SEC
+(`data.sec.gov/submissions/CIK…`) et traduit en nomenclature GICS par
+`taurus/sectors.py`. Vérifié : JPM → Financials, KO → Consumer Staples,
+NVDA → Information Technology, T → Communication Services, PLD → Real Estate.
+
+---
+
+## Neutralisation sectorielle du pilier valorisation
+
+Le biais de niveau d'un modèle d'actualisation est presque entièrement
+sectoriel : le marché paie des multiples élevés pour le logiciel et bas pour
+les télécoms. Classer un titre contre l'univers entier **achète donc des
+secteurs, pas des sociétés** — et c'est ce qui produisait la corrélation
+négative entre croissance et divergence.
+
+`z_mm` est maintenant calculé **au sein de chaque secteur** (`mm_sector_neutral`,
+actif par défaut). Un secteur de moins de `mm_sector_min_members = 4` titres est
+classé contre l'univers : une médiane sur deux titres est du bruit.
+
+Mesure sur 30 grandes capi US, données réelles :
+
+| | Classement absolu | Neutralisé par secteur |
+|---|---|---|
+| Corrélation croissance / `z_mm` | −0,49 | **−0,10** |
+| Côté achat | VZ, TMUS, COP, MRK, T, PEP | MRK, ADBE, COP, META, MSFT, JNJ |
+| Côté vente | AVGO, NVDA, AAPL, ORCL, AMZN, GOOGL | T, LLY, AVGO, NVDA, KO, AMZN |
+
+AT&T passe du côté achat au côté vente : dans l'absolu son cours paraît bas,
+mais **face aux autres télécoms** c'est la moins bonne. C'est exactement
+l'information que le pilier est censé porter.
+
+> ⚠️ `z_mm` n'est utilisé que par `_composite_signal`. Avec
+> `signal_method = "binary"` — la valeur par défaut, donc votre mode actif —
+> le pilier MM passe par les seuils absolus `divergence > ±25 %` et la
+> neutralisation n'a **aucun effet**. Pour en bénéficier, passer
+> `signal_method = "composite"` dans `config.py`.
+
+---
+
+## Financières : l'écran MM s'abstient
+
+Le garde-fou de couverture des intérêts (`EBIT / intérêts < 1,5×`) classait
+**toutes les banques** en VENTE. Pour une banque les intérêts versés ne sont pas
+une charge de financement mais le coût de la matière première : elle se finance
+par les dépôts et prête le produit. Ratios mesurés : JPM 0,89× · BAC 0,51× ·
+GS 0,33× · WFC 0,77×.
+
+Pire, la valorisation mettait JPM 47 % sous son prix : le titre était
+simultanément `underleveraged = True` **et** `overleveraged = True`, donc
+candidat aux **deux jambes en même temps**.
+
+Trois corrections :
+
+- **les financières sont exemptées du garde-fou de couverture** ; les foncières
+  (Real Estate) le conservent, leur dette est un vrai levier ;
+- **l'écran MM ne les valorise plus du tout** (`mm_skip_financials`, actif par
+  défaut) : l'APV sépare des actifs d'exploitation d'un choix de financement,
+  or pour une banque le levier **est** l'activité — il n'y a pas de firme non
+  endettée à valoriser, et l'« EBIT » n'est pas un flux capitalisable. Le pilier
+  s'abstient, comme il le fait déjà pour un EBIT négatif. Les financières
+  restent négociables via l'alpha et le momentum ;
+- **un titre ne peut plus être candidat aux deux jambes** : en cas de conflit,
+  les garde-fous de solvabilité l'emportent sur une valorisation attractive.
+
+---
+
 ## Paramètres clés (config.py)
 
 | Paramètre | Valeur | Description |
@@ -314,7 +393,10 @@ valorisation reste calculable, jamais estimée sur deux points.
 | `default_initial_growth` | 3% | Repli quand l'historique de CA est absent |
 | `min_discount_spread` | 2,0% | Écart plancher entre r_U et g (perpétuité finie) |
 | `optimizer_method` | `max_sharpe` | Optimiseur : tangency portfolio (max-Sharpe) |
-| `signal_method` | `binary` | Signal : AND-filter (alpha AND MM AND momentum) |
+| `signal_method` | `binary` | Signal : AND-filter (alpha AND MM AND momentum) — `composite` pour activer `z_mm` |
+| `mm_sector_neutral` | `True` | `z_mm` calculé au sein du secteur (mode composite) |
+| `mm_sector_min_members` | 4 | En deçà, le secteur est classé contre l'univers |
+| `mm_skip_financials` | `True` | L'écran MM s'abstient sur les financières |
 | `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
 | `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
 | `cov_halflife` | 0 | Covariance Ledoit-Wolf (0 = pas d'EWMA) |

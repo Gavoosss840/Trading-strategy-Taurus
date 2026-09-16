@@ -79,6 +79,51 @@ def _zscore(s: pd.Series, clip: float = 3.0) -> pd.Series:
     return z.clip(-clip, clip)
 
 
+def _zscore_by_sector(
+    values: pd.Series,
+    sector_map: Dict[str, str],
+    min_members: int = 4,
+    clip: float = 3.0,
+) -> pd.Series:
+    """Cross-sectional z-score computed WITHIN each sector.
+
+    A discounted-cash-flow screen carries a level bias that is almost entirely
+    sectoral: the market pays high multiples for software and low ones for
+    telecoms, so every technology name reads "overvalued" and every telecom
+    "undervalued" against the same absolute yardstick.  Ranking a stock against
+    the whole universe therefore buys sectors, not companies — measured on 20
+    US large caps, growth and divergence correlate at −0.55, and the long leg
+    filled up with the declining telecoms.
+
+    Comparing each company with its own sector removes that common level and
+    keeps what the pillar actually knows: which name is cheap *relative to its
+    peers*.
+
+    Sectors with fewer than `min_members` names are pooled and scored against
+    the whole universe: a median over two stocks is noise, and forcing it would
+    hand a lone member a z-score of exactly 0.
+    """
+    if values.empty:
+        return values
+
+    sectors = pd.Series(
+        {t: sector_map.get(t, "Unknown") for t in values.index},
+        index=values.index, dtype=object,
+    )
+    counts = sectors.value_counts()
+    big = sectors.isin(counts[counts >= min_members].index) & (sectors != "Unknown")
+
+    out = pd.Series(0.0, index=values.index, dtype=float)
+    if (~big).any():
+        # Against the WHOLE universe, not against the leftovers: a pool that
+        # happens to hold a single name would score it at exactly 0 — neutral
+        # by accident rather than by measurement.
+        out.loc[~big] = _zscore(values, clip)[~big]
+    for sector, members in sectors[big].groupby(sectors[big]):
+        out.loc[members.index] = _zscore(values[members.index], clip)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 #  Data-classes for outputs                                                     #
 # --------------------------------------------------------------------------- #
@@ -240,7 +285,8 @@ class TaurusStrategy:
 
         if signal_method == "composite":
             long_final, short_final, composite = self._composite_signal(
-                alpha_df, mm_df, mom_df, factors, as_of, cfg
+                alpha_df, mm_df, mom_df, factors, as_of, cfg,
+                sector_map=fund["sector"].to_dict() if "sector" in fund.columns else {},
             )
         else:
             long_final, short_final, composite = self._binary_signal(
@@ -325,6 +371,7 @@ class TaurusStrategy:
         factors: pd.DataFrame,
         as_of: pd.Timestamp,
         cfg: TaurusConfig,
+        sector_map: Optional[Dict[str, str]] = None,
     ) -> Tuple[pd.Index, pd.Index, pd.Series]:
         """
         Build a continuous composite score for each stock and return the
@@ -350,11 +397,18 @@ class TaurusStrategy:
             # screen could not value (non-positive EBIT) must score 0 on this
             # pillar — leaving NaN would poison its whole composite and drop it
             # from both legs even when its alpha and momentum are valid.
-            z_mm = (
-                _zscore(mm_df["divergence_pct"])
-                .reindex(common_idx)
-                .fillna(0.0)
-            )
+            # Sector-neutral by default: the valuation pillar's level error is
+            # sectoral, so an absolute ranking picks sectors rather than the
+            # cheap name inside each one.
+            if getattr(cfg, "mm_sector_neutral", True) and sector_map:
+                raw_mm = _zscore_by_sector(
+                    mm_df["divergence_pct"].dropna(),
+                    sector_map,
+                    int(getattr(cfg, "mm_sector_min_members", 4)),
+                )
+            else:
+                raw_mm = _zscore(mm_df["divergence_pct"])
+            z_mm = raw_mm.reindex(common_idx).fillna(0.0)
         else:
             z_mm = pd.Series(0.0, index=common_idx)
 

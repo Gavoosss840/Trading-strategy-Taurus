@@ -69,6 +69,11 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     leverage_gap_threshold: float = 0.25     # 25 % divergence to flag
     min_interest_coverage:  float = 1.5      # IC below → always flag overleveraged
+    # Les financières échappent à l'écran MM dans les deux sens : leurs
+    # intérêts sont un coût d'exploitation (pas une charge de financement), et
+    # l'APV n'a pas de firme non endettée à valoriser quand le levier EST
+    # l'activité. Elles restent négociables via l'alpha et le momentum.
+    mm_skip_financials:     bool  = True     # divergence = NaN pour les financières
     industry_distress_costs: bool = False    # Sector-specific distress rates (vs flat 20%)
     variable_credit_spread:  bool = False    # Leverage-based spread (vs flat +2%)
 
@@ -113,6 +118,13 @@ class TaurusConfig:
     signal_method: str  = "binary"
     w_alpha:       float = 0.40          # Weight for FF alpha t-stat z-score
     w_mm:          float = 0.30          # Weight for MM divergence z-score
+    # Le biais de niveau d'un modèle d'actualisation est presque entièrement
+    # sectoriel : le marché paie des multiples élevés pour le logiciel et bas
+    # pour les télécoms, si bien qu'un classement absolu achète des secteurs et
+    # non des sociétés. Comparer chaque titre à son propre secteur retire ce
+    # niveau commun et ne garde que ce que le pilier sait vraiment.
+    mm_sector_neutral:     bool = True   # z(divergence) calculé au sein du secteur
+    mm_sector_min_members: int  = 4      # en deçà, le secteur est classé contre l'univers
     w_momentum:    float = 0.30          # Weight for momentum z-score
 
     # ------------------------------------------------------------------ #
