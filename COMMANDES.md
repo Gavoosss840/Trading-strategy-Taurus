@@ -1,19 +1,72 @@
 # Taurus Strategy — Commandes
 
-## Rebalancement mensuel (commande principale)
+## ⭐ LA COMMANDE — rebalancement mensuel
 
-```bash
-python main.py --mode force-rebalance --universes sp500 nasdaq100 ftse100 cac40 nikkei225 --no-dry-run
+Deux lignes, **identiques à chaque fois**, depuis la racine du projet (PowerShell) :
+
+```powershell
+git pull
 ```
 
-> **À lancer le 1er du mois** (ex: 1er juin pour les signaux de mai).
-> Lance une fois, place les ordres, s'arrête automatiquement.
-> Connexion paper par défaut (port 7497). Ajouter `--live` pour le compte réel (port 7496).
+```powershell
+python main.py --mode force-rebalance --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run | Tee-Object -FilePath "run_$(Get-Date -Format yyyy-MM-dd).log"
+```
 
-**Pourquoi le 1er du mois ?**
-Le calcul des signaux utilise `as_of` = dernier jour ouvrable du mois précédent complété.
-- Lancé le **1er juin** → `as_of = 29 mai` (signaux MAI complets) ✓
-- Lancé le **31 mai** → `as_of = 30 avril` (signaux AVRIL — même que le mois dernier) ✗
+C'est tout. Rien d'autre à lancer, aucun scheduler à laisser tourner.
+
+### Ce que fait cette commande
+
+1. Enregistre la performance réalisée du mois écoulé pour les 5 univers
+   → ajoutée à l'historique, **jamais écrasée**
+2. Recalcule la pondération Sharpe sur **tout** l'historique depuis l'inception, ce nouveau mois inclus
+3. Construit les portefeuilles : FF5 régional → screen MM → momentum → max-Sharpe → neutralisation bêta
+4. Place les ordres au levier **1.25** (exposition brute 125 % du NAV)
+5. Archive les positions dans `output/{univers}/snapshots/` (archive permanente datée)
+6. Sauvegarde l'intégralité du log dans `run_AAAA-MM-JJ.log`
+
+### Quand la lancer
+
+**N'importe quel jour.** L'algo détermine seul le mois à traiter :
+
+| Jour du lancement | Mois enregistré |
+|---|---|
+| du 1er au 5 | le mois **précédent** |
+| du 6 à la fin | le mois **en cours** |
+
+Lancer début de mois reste préférable : les signaux portent alors sur un mois complet.
+
+### Les 3 lignes à vérifier dans le log
+
+```
+NAV allocation (global weights, 5 active universes): SP500=33.8%  NIKKEI225=26.7%  ...
+[sp500] Monthly return appended: 2026-09-30 → +X.XX%
+Beta neutralisation: β_L=..., β_S=... → net β=0.0000
+```
+
+⚠️ Si l'allocation affiche **20 % partout**, la pondération Sharpe n'a pas trouvé l'historique
+(`output/{univers}/monthly_returns.csv`) et est retombée sur l'équipondération de secours.
+
+### Points de vigilance
+
+| | |
+|---|---|
+| **`--universes` est obligatoire** | sans lui, le défaut est `sp500` seul — les 4 autres univers resteraient figés |
+| **Pas de `--live`** | son absence = port 7497 = **compte démo**. L'ajouter bascule sur le compte réel (port 7496) |
+| **`--no-dry-run`** | sans lui, l'algo simule et ne passe aucun ordre |
+| **TWS / IB Gateway ouvert** | API activée, port 7497 |
+
+### Vérification dans IBKR après le lancement
+
+- **Exposition brute** ≈ 125 % du NAV
+- **Exposition nette** ≈ 0 % (bêta-neutre)
+- **Excess Liquidity** largement positif (marge Reg-T requise : 62,5 % du NAV)
+
+### Univers tradés
+
+`sp500` · `nasdaq100` · `cac40` · `ftse100` · `nikkei225`
+
+`hangseng` et `tadawul` sont déclarés dans le registre mais **jamais tradés** : aucun historique,
+donc Sharpe = 0 et allocation 0 % pendant au moins 6 mois. Ne pas les ajouter sans backtest préalable.
 
 ---
 
@@ -87,17 +140,18 @@ python main.py --mode check-protective \
 
 ---
 
-## Checklist mensuelle (1er du mois)
+## Checklist mensuelle
 
 | Étape | Commande / Action |
 |-------|-------------------|
-| 1. Ouvrir TWS | Paper trading → vérifier connexion (port 7497) |
-| 2. Git pull | `git pull origin claude/optimize-python-algorithm-dWMxq` |
-| 3. Rebalancement | `python main.py --mode force-rebalance --universes sp500 nasdaq100 ftse100 cac40 nikkei225 --no-dry-run` |
-| 4. Vérifier TWS | Contrôler les ordres MKT dans le blotter |
-| 5. Corriger STP/LMT | `python main.py --mode refresh-protective --universes sp500 nasdaq100 ftse100 cac40 nikkei225 --no-dry-run` |
-| 6. Rapport | `python main.py --mode report --universes sp500 nasdaq100 ftse100 cac40 nikkei225` |
-| 7. Ouvrir | `output/report.png` |
+| 1. Ouvrir TWS | Paper trading → vérifier la connexion (port 7497) |
+| 2. Mettre à jour | `git pull` |
+| 3. **Rebalancement** | `python main.py --mode force-rebalance --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run \| Tee-Object -FilePath "run_$(Get-Date -Format yyyy-MM-dd).log"` |
+| 4. Contrôler le log | allocation Sharpe ≠ 20 % partout · `Monthly return appended` présent · `net β=0.0000` |
+| 5. Vérifier TWS | ordres MKT dans le blotter · brut ≈ 125 % · net ≈ 0 % |
+| 6. Corriger STP/LMT | `python main.py --mode refresh-protective --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run` |
+| 7. Rapport | `python main.py --mode report --universes sp500 nasdaq100 cac40 ftse100 nikkei225` |
+| 8. Ouvrir | `output/report.png` |
 
 ---
 
@@ -180,3 +234,29 @@ git add -A && git commit -m "message" && git push -u origin claude/optimize-pyth
 | `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
 | `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
 | `cov_halflife` | 0 | Covariance Ledoit-Wolf (0 = pas d'EWMA) |
+| `gross_leverage` | **1.25** | Exposition brute = 125 % du NAV (chaque jambe à 62,5 %) |
+| `sharpe_window_months` | **0** | Pondération Sharpe **depuis l'inception** (0 = fenêtre expansive) |
+| `sharpe_min_months` | 6 | En dessous → équipondération de secours |
+| `max_universe_weight` | 0.35 | Plafond par univers (garde-fou, ne mord pas aujourd'hui) |
+
+### Pondération des univers
+
+Les poids sont proportionnels à `max(Sharpe, 0)`, calculés sur **tout** l'historique
+stocké dans `output/{univers}/monthly_returns.csv` — backtest 10 ans + chaque mois live
+ajouté depuis. Le mois écoulé est enregistré **avant** le calcul des poids, donc il compte
+dès le rebalancement en cours.
+
+Plus l'historique s'allonge, plus l'allocation devient stable : un mois de plus sur une
+base de 126 ne déplace les poids qu'à la marge.
+
+### Facteurs Fama-French par univers
+
+| Univers | Dataset Kenneth French |
+|---|---|
+| sp500 · nasdaq100 | `F-F_Research_Data_5_Factors_2x3` (US) |
+| cac40 · ftse100 | `Europe_5_Factors` |
+| nikkei225 | `Japan_5_Factors` |
+| hangseng | `Asia_Pacific_ex_Japan_5_Factors` |
+| tadawul | `Global_5_Factors` |
+
+Le routage est automatique selon la région déclarée dans `UniverseConfig`.
