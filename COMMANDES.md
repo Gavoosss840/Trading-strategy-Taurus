@@ -65,8 +65,11 @@ Beta neutralisation: β_L=..., β_S=... → net β=0.0000
 
 `sp500` · `nasdaq100` · `cac40` · `ftse100` · `nikkei225`
 
-`hangseng` et `tadawul` sont déclarés dans le registre mais **jamais tradés** : aucun historique,
-donc Sharpe = 0 et allocation 0 % pendant au moins 6 mois. Ne pas les ajouter sans backtest préalable.
+Ce sont les **seuls** univers du registre. Hang Seng et Tadawul ont été retirés :
+jamais tradés, aucun historique, donc Sharpe = 0 et allocation 0 %.
+
+Pour ajouter un univers, il faut d'abord lui constituer un historique
+(`--mode backtest`) — sinon il reste à 0 % pendant au moins `sharpe_min_months`.
 
 ---
 
@@ -256,7 +259,5 @@ base de 126 ne déplace les poids qu'à la marge.
 | sp500 · nasdaq100 | `F-F_Research_Data_5_Factors_2x3` (US) |
 | cac40 · ftse100 | `Europe_5_Factors` |
 | nikkei225 | `Japan_5_Factors` |
-| hangseng | `Asia_Pacific_ex_Japan_5_Factors` |
-| tadawul | `Global_5_Factors` |
 
 Le routage est automatique selon la région déclarée dans `UniverseConfig`.

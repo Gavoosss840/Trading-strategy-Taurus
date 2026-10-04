@@ -129,6 +129,23 @@ class TaurusConfig:
     target_net_beta: float = 0.0         # Beta-neutral by default
     beta_tolerance:  float = 0.05        # Acceptable residual beta
     blume_shrinkage: bool  = False       # Shrink OLS betas: 0.67×β_raw + 0.33×1.0
+
+    # Residual factor exposure caps (APT completion).  The FF5 regression
+    # estimates a loading on every factor but only the market beta is hedged,
+    # so realised P&L carries unintended SMB/HML/RMW/CMA bets.  After beta
+    # neutralisation the book is reweighted to pull each net exposure back
+    # under its cap.  beta_mkt is included with a tight cap so the reweighting
+    # cannot undo beta-neutrality.  Set factor_limits=False to disable.
+    factor_limits:        bool  = True
+    factor_exposure_caps: dict  = field(default_factory=lambda: {
+        "beta_mkt": 0.03,    # keep net beta ≈ 0 through the reweighting
+        "beta_smb": 0.15,    # size
+        "beta_hml": 0.15,    # value
+        "beta_rmw": 0.15,    # profitability
+        "beta_cma": 0.15,    # investment
+    })
+    factor_limit_turnover: float = 0.40  # max Σ|Δw| spent correcting exposures
+
     cov_shrinkage:   bool  = True        # Ledoit-Wolf shrinkage (when EWMA off)
     cov_halflife:    int   = 0           # EWMA half-life months (0 → Ledoit-Wolf)
     cov_min_eigenvalue: float = 1e-6     # Floor eigenvalue (PSD fix)
@@ -152,6 +169,18 @@ class TaurusConfig:
     gross_leverage:       float = 1.25
     margin_cost_annual:   float = 0.058  # 5.8%/an (fed funds + spread)
     borrow_cost_annual:   float = 0.010  # 1.0%/an avg stock borrow fee
+
+    # ------------------------------------------------------------------ #
+    #  Stock borrow control (short leg)                                   #
+    # ------------------------------------------------------------------ #
+    # IBKR rejects or queues a short with no locate, so an unborrowable name
+    # silently fails to fill and leaves the book long-biased.  Before sizing,
+    # availability is queried per name (generic tick 236) and blocked names
+    # have their weight redistributed over the shorts that can be borrowed.
+    # A name with no quote at all is KEPT: a missing market-data subscription
+    # must not wipe the whole short leg.
+    check_borrow_availability: bool  = True
+    min_shortable_shares:      float = 0.0   # availability ≤ this → excluded
 
     # ------------------------------------------------------------------ #
     #  Futures beta hedge (Phase 2)                                       #

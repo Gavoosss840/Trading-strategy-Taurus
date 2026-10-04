@@ -52,6 +52,7 @@ from .data import (
 from .factors import compute_ff5_alpha
 from .momentum import momentum_signal
 from .portfolio import (
+    apply_factor_limits,
     beta_neutralise,
     build_leg,
     estimate_betas,
@@ -286,6 +287,28 @@ class TaurusStrategy:
             long_weights, short_weights = beta_neutralise(
                 long_weights, short_weights, betas, cfg
             )
+
+        # ── 8. Residual factor exposure limits ────────────────────────────── #
+        # Beta neutralisation only hedges the market factor; SMB/HML/RMW/CMA
+        # exposures survive untouched, so P&L carries unintended factor bets.
+        # The market beta is passed in with a tight cap so this reweighting
+        # cannot undo the neutralisation just applied.
+        factor_exposure: Dict[str, float] = {}
+        if getattr(cfg, "factor_limits", False) and not cfg.use_futures_hedge:
+            ff_cols = [c for c in ("beta_smb", "beta_hml", "beta_rmw", "beta_cma")
+                       if c in alpha_df.columns]
+            if ff_cols and len(long_weights) and len(short_weights):
+                loadings = alpha_df[ff_cols].copy()
+                loadings["beta_mkt"] = betas.reindex(loadings.index)
+                long_weights, short_weights, _before, factor_exposure = apply_factor_limits(
+                    long_weights, short_weights, loadings,
+                    caps=cfg.factor_exposure_caps,
+                    max_turnover=getattr(cfg, "factor_limit_turnover", 0.40),
+                )
+                # Re-check net beta after the reweighting
+                nb = (long_weights * betas.reindex(long_weights.index).fillna(1.0)).sum() \
+                   - (short_weights * betas.reindex(short_weights.index).fillna(1.0)).sum()
+                logger.info("[%s] Net beta after factor limits: %+.4f", as_of.date(), nb)
 
         logger.info(
             "[%s] Final portfolio: %d longs, %d shorts%s.",

@@ -545,3 +545,134 @@ def build_leg(
 
     weights = apply_sector_constraints(weights, sector_map, cfg)
     return weights
+
+
+# --------------------------------------------------------------------------- #
+#  Residual factor exposure limits (APT completion)                            #
+# --------------------------------------------------------------------------- #
+
+def net_factor_exposure(
+    long_weights: pd.Series,
+    short_weights: pd.Series,
+    loadings: pd.DataFrame,
+    factors: Optional[List[str]] = None,
+) -> Dict[str, float]:
+    """
+    Net factor exposure of the book: long leg minus short leg.
+
+    The FF5 regression estimates a loading on every factor, but only the market
+    beta is hedged — SMB/HML/RMW/CMA exposures ride along unmanaged, so realised
+    P&L is alpha PLUS unintended factor bets.  This measures them.
+    """
+    factors = factors if factors is not None else list(loadings.columns)
+    out: Dict[str, float] = {}
+    for f in factors:
+        if f not in loadings.columns:
+            continue
+        b = loadings[f]
+        bl = float((long_weights * b.reindex(long_weights.index).fillna(0.0)).sum())
+        bs = float((short_weights * b.reindex(short_weights.index).fillna(0.0)).sum())
+        out[f] = bl - bs
+    return out
+
+
+def apply_factor_limits(
+    long_weights: pd.Series,
+    short_weights: pd.Series,
+    loadings: pd.DataFrame,
+    caps: Dict[str, float],
+    max_turnover: float = 0.40,
+) -> Tuple[pd.Series, pd.Series, Dict[str, float], Dict[str, float]]:
+    """
+    Pull net factor exposures back towards their caps, changing weights as
+    little as possible.
+
+    PENALISED formulation, not a hard constraint: when the signal systematically
+    picks high-loading longs against low-loading shorts, no internal reweighting
+    can reach the cap.  A hard constraint would make the problem infeasible and
+    fix NOTHING; minimising the breach always yields the best reduction available
+    under the turnover bound.
+
+        min  Σ_k max(0, |e_k| − cap_k)²  +  ε‖w′ − w‖²
+        s.t. Σ w′_long = k_L,  Σ w′_short = k_S,  Σ|w′ − w| ≤ max_turnover,  w′ ≥ 0
+
+    Pass the market beta in `loadings` with a tight cap so beta-neutrality
+    survives the reweighting.
+
+    Returns (long′, short′, exposure_before, exposure_after).  Weights are
+    returned untouched when nothing breaches, when the legs are empty, or when
+    the result would be worse than the input.
+    """
+    factors = [f for f in caps if f in loadings.columns]
+    before = net_factor_exposure(long_weights, short_weights, loadings, factors)
+    if not factors:
+        return long_weights, short_weights, before, before
+
+    breached = [f for f in factors if abs(before.get(f, 0.0)) > caps[f] + 1e-9]
+    if not breached:
+        return long_weights, short_weights, before, before
+
+    lt, st = long_weights.index.tolist(), short_weights.index.tolist()
+    nL, nS = len(lt), len(st)
+    if nL == 0 or nS == 0:
+        return long_weights, short_weights, before, before
+
+    w0   = np.concatenate([long_weights.values.astype(float),
+                           short_weights.values.astype(float)])
+    sign = np.concatenate([np.ones(nL), -np.ones(nS)])
+    kL, kS = float(long_weights.sum()), float(short_weights.sum())
+
+    B = np.column_stack([
+        np.concatenate([
+            loadings[f].reindex(lt).fillna(0.0).values,
+            loadings[f].reindex(st).fillna(0.0).values,
+        ]) for f in factors
+    ])
+    capv = np.array([caps[f] for f in factors], dtype=float)
+    eps  = 1e-3 / max(float(np.abs(w0).sum()), 1e-9) ** 2
+
+    def objective(w):
+        viol = np.maximum(np.abs((sign * w) @ B) - capv, 0.0)
+        return float((viol ** 2).sum() + eps * ((w - w0) ** 2).sum())
+
+    def grad(w):
+        e    = (sign * w) @ B
+        viol = np.maximum(np.abs(e) - capv, 0.0)
+        return sign * (B @ (2.0 * viol * np.sign(e))) + 2.0 * eps * (w - w0)
+
+    constraints = [
+        {"type": "eq",   "fun": lambda w: w[:nL].sum() - kL},
+        {"type": "eq",   "fun": lambda w: w[nL:].sum() - kS},
+        {"type": "ineq", "fun": lambda w: max_turnover - np.abs(w - w0).sum()},
+    ]
+
+    result = minimize(objective, w0, jac=grad, method="SLSQP",
+                      bounds=[(0.0, None)] * (nL + nS),
+                      constraints=constraints,
+                      options={"maxiter": 400, "ftol": 1e-14})
+
+    w  = np.maximum(result.x if result.success else w0, 0.0)
+    lw = pd.Series(w[:nL], index=lt)
+    sw = pd.Series(w[nL:], index=st)
+    if lw.sum() > 0:
+        lw *= kL / lw.sum()
+    if sw.sum() > 0:
+        sw *= kS / sw.sum()
+
+    after = net_factor_exposure(lw, sw, loadings, factors)
+    if sum(abs(after[f]) for f in factors) > sum(abs(before[f]) for f in factors):
+        return long_weights, short_weights, before, before   # never make it worse
+
+    still = [f for f in factors if abs(after[f]) > caps[f] + 1e-6]
+    if still:
+        logger.warning(
+            "Factor caps unreachable by reweighting for %s — the signal picks "
+            "high-loading longs against low-loading shorts. Residual: %s",
+            ", ".join(still),
+            "  ".join(f"{f}={after[f]:+.3f}(cap {caps[f]:.2f})" for f in still),
+        )
+    logger.info(
+        "Factor limits: %s",
+        "  ".join(f"{f} {before[f]:+.3f}->{after[f]:+.3f}" for f in factors),
+    )
+    return lw, sw, before, after

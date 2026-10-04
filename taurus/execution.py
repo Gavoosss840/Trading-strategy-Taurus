@@ -408,6 +408,69 @@ def _round_price(price: float, currency: str) -> float:
 class OrderManager:
     """Places and monitors orders via ib_insync."""
 
+    def get_shortable_shares(
+        self,
+        conn:         IBKRConnection,
+        tickers:      List[str],
+        universe_cfg: UniverseConfig,
+    ) -> Dict[str, float]:
+        """
+        Borrow availability per name, via IBKR generic tick 236.
+
+        Returns {ticker: shortable shares}.  A name absent from the result has
+        no usable borrow quote; IBKR rejects or queues a short with no locate,
+        so shorting it silently fails and leaves the book long-biased.
+
+        NaN is treated as unknown (not zero) — the caller decides whether to
+        trust an unknown, so a missing data subscription cannot wipe the whole
+        short leg.
+        """
+        from ib_insync import Stock
+
+        out: Dict[str, float] = {}
+        if not tickers:
+            return out
+
+        contracts, tmap = [], {}
+        for t in tickers:
+            sym = t.split(".")[0] if "." in t else t
+            c = Stock(sym, universe_cfg.ibkr_exchange, universe_cfg.currency)
+            contracts.append(c)
+            tmap[sym] = t
+
+        _wrap = logging.getLogger("ib_insync.wrapper")
+        _lvl = _wrap.level
+        _wrap.setLevel(logging.ERROR)
+        qualified = []
+        for c in contracts:
+            try:
+                conn.ib.qualifyContracts(c)
+                if c.conId:
+                    qualified.append(c)
+            except Exception:
+                pass
+        _wrap.setLevel(_lvl)
+
+        tds = []
+        for c in qualified:
+            try:
+                tds.append((c, conn.ib.reqMktData(c, "236", False, False)))
+            except Exception as e:
+                logger.debug("shortable request failed for %s: %s", c.symbol, e)
+        conn.ib.sleep(3.0)          # 236 arrives asynchronously
+
+        for c, td in tds:
+            orig = tmap.get(c.symbol, c.symbol)
+            val = getattr(td, "shortableShares", float("nan"))
+            try:
+                conn.ib.cancelMktData(c)
+            except Exception:
+                pass
+            if val is None or val != val:        # NaN -> unknown
+                continue
+            out[orig] = float(val)
+        return out
+
     def get_live_prices(
         self,
         conn:         IBKRConnection,
@@ -1431,9 +1494,52 @@ class IBKRExecutor:
                         self.udef_cfg.name, len(filled), filled,
                     )
 
+            # ── Borrow availability screen (short leg) ──────────────────── #
+            # IBKR rejects or queues a short with no locate, so an unborrowable
+            # name silently fails to fill and leaves the book long-biased.
+            # Drop those names and REDISTRIBUTE their weight across the shorts
+            # that can actually be borrowed, so the leg still deploys in full.
+            long_w, short_w = snapshot.long_weights, snapshot.short_weights
+            if getattr(self.cfg, "check_borrow_availability", False) and len(short_w):
+                try:
+                    avail = self.order_mgr.get_shortable_shares(
+                        self.conn, list(short_w.index), self.udef_cfg
+                    )
+                    floor = float(getattr(self.cfg, "min_shortable_shares", 0.0))
+                    # Unknown (ticker absent) is kept: a missing data subscription
+                    # must not wipe the short leg.
+                    blocked = [t for t in short_w.index
+                               if t in avail and avail[t] <= floor]
+                    if blocked:
+                        kept = short_w.drop(index=blocked)
+                        if kept.sum() > 0:
+                            k_s = float(short_w.sum())
+                            short_w = kept * (k_s / kept.sum())   # leg size preserved
+                            logger.warning(
+                                "[%s] %d short(s) not borrowable — weight redistributed "
+                                "over %d names: %s",
+                                self.udef_cfg.name, len(blocked), len(short_w),
+                                ", ".join(f"{t}({avail[t]:.0f})" for t in blocked[:10]),
+                            )
+                        else:
+                            logger.error(
+                                "[%s] NO borrowable short available — short leg skipped.",
+                                self.udef_cfg.name,
+                            )
+                            short_w = kept
+                    n_unknown = sum(1 for t in short_w.index if t not in avail)
+                    if n_unknown:
+                        logger.info(
+                            "[%s] Borrow availability unknown for %d short(s) "
+                            "(no tick 236) — kept.", self.udef_cfg.name, n_unknown,
+                        )
+                except Exception as e:
+                    logger.warning("[%s] Borrow check failed (%s) — proceeding without it.",
+                                   self.udef_cfg.name, e)
+
             # 3. Target shares
             target = self.reconciler.compute_target_shares(
-                snapshot.long_weights, snapshot.short_weights,
+                long_w, short_w,
                 nav, self.cfg, prices, universe_cfg=self.udef_cfg,
             )
 

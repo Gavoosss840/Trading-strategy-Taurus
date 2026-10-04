@@ -224,47 +224,7 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         n_shorts=20,
     ),
 
-    "hangseng": UniverseConfig(
-        name="hangseng",
-        display_name="Hang Seng (China/HK)",
-        region="Asia",
-        currency="HKD",
-        ff5_dataset="Asia_Pacific_ex_Japan_5_Factors",
-        futures_symbol="HHI",             # Hang Seng China Enterprises futures
-        futures_exchange="HKEX",
-        futures_currency="HKD",
-        futures_multiplier=50.0,
-        ibkr_exchange="SEHK",             # Stock Exchange of Hong Kong
-        wikipedia_url="https://en.wikipedia.org/wiki/Hang_Seng_Index",
-        wikipedia_table_id="constituents",
-        ticker_suffix=".HK",              # Yahoo Finance: 700.HK
-        ticker_col_index=0,
-        min_market_cap_usd=1e9,
-        n_longs=15,
-        n_shorts=15,
-    ),
 
-    # ── Middle East ───────────────────────────────────────────────────────── #
-
-    "tadawul": UniverseConfig(
-        name="tadawul",
-        display_name="TADAWUL (Saudi Arabia)",
-        region="MiddleEast",
-        currency="SAR",
-        ff5_dataset="Global_5_Factors",   # Best available proxy (no Saudi-specific)
-        futures_symbol="",                # No liquid futures on TASI
-        futures_exchange="",
-        futures_currency="SAR",
-        futures_multiplier=1.0,
-        ibkr_exchange="TADAWUL",          # IBKR uses "TADAWUL" for Saudi exchange
-        wikipedia_url="https://en.wikipedia.org/wiki/Tadawul_All_Share_Index",
-        wikipedia_table_id="constituents",
-        ticker_suffix=".SR",              # Yahoo Finance: 2222.SR
-        ticker_col_index=1,
-        min_market_cap_usd=500e6,         # Lower cap for Saudi market
-        n_longs=12,
-        n_shorts=12,
-    ),
 }
 
 
@@ -472,73 +432,7 @@ _FALLBACKS: Dict[str, List[str]] = {
         "3289.T",  # Tokyu Fudosan Holdings
     ],
 
-    # Hang Seng Index — Yahoo Finance tickers (.HK suffix)
-    "hangseng": [
-        "700.HK",   # Tencent Holdings
-        "941.HK",   # China Mobile
-        "388.HK",   # Hong Kong Exchanges (HKEX)
-        "2318.HK",  # Ping An Insurance
-        "1299.HK",  # AIA Group
-        "3988.HK",  # Bank of China
-        "1398.HK",  # ICBC
-        "939.HK",   # China Construction Bank
-        "2628.HK",  # China Life Insurance
-        "883.HK",   # CNOOC
-        "857.HK",   # PetroChina
-        "27.HK",    # Galaxy Entertainment
-        "5.HK",     # HSBC Holdings
-        "11.HK",    # Hang Seng Bank
-        "1.HK",     # CKH Holdings
-        "2388.HK",  # BOC Hong Kong
-        "12.HK",    # Henderson Land
-        "16.HK",    # Sun Hung Kai Properties
-        "823.HK",   # Link REIT
-        "1044.HK",  # Hengan International
-        "669.HK",   # Techtronic Industries
-        "2382.HK",  # Sunny Optical
-        "9999.HK",  # NetEase
-        "1024.HK",  # Kuaishou Technology
-        "9618.HK",  # JD.com
-        "9988.HK",  # Alibaba Group
-        "1810.HK",  # Xiaomi
-        "6690.HK",  # Haier Smart Home
-        "2269.HK",  # WuXi Biologics
-        "1211.HK",  # BYD Company
-        "2020.HK",  # ANTA Sports
-        "6862.HK",  # Haidilao
-        "3690.HK",  # Meituan
-        "175.HK",   # Geely Automobile
-        "2313.HK",  # Shenzhou International
-    ],
 
-    # TADAWUL (Saudi Exchange) — Yahoo Finance tickers (.SR suffix)
-    "tadawul": [
-        "2222.SR",  # Saudi Aramco
-        "1180.SR",  # Al Rajhi Bank
-        "2010.SR",  # SABIC
-        "2380.SR",  # Petro Rabigh
-        "4130.SR",  # Saudi Telecom (STC)
-        "1120.SR",  # Al Jazira Bank
-        "1020.SR",  # Bank Al Jazira (BJAZ)
-        "2280.SR",  # Almarai
-        "2350.SR",  # Saudi Arabian Mining (Maaden)
-        "3030.SR",  # Saudi Kayan Petrochemical
-        "3010.SR",  # SIPCHEM
-        "1010.SR",  # Riyad Bank
-        "4081.SR",  # Elm Company
-        "2370.SR",  # Saudi Ceramics
-        "7010.SR",  # Saudi Electricity Company (SEC)
-        "2030.SR",  # Saudi Basic Industries (SABIC listed)
-        "2050.SR",  # Savola Group
-        "2060.SR",  # National Petrochemical
-        "3020.SR",  # Saudi Advanced Industries
-        "4020.SR",  # Mouwasat Medical
-        "1050.SR",  # Banque Saudi Fransi
-        "3040.SR",  # Abdullah Al Othaim Markets
-        "4001.SR",  # Saudi Research & Media Group
-        "8010.SR",  # Saudi Re
-        "4290.SR",  # Tawuniya Insurance
-    ],
 }
 
 
