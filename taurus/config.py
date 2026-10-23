@@ -136,7 +136,13 @@ class TaurusConfig:
     # neutralisation the book is reweighted to pull each net exposure back
     # under its cap.  beta_mkt is included with a tight cap so the reweighting
     # cannot undo beta-neutrality.  Set factor_limits=False to disable.
-    factor_limits:        bool  = True
+    # DISABLED 2026-10-23 — rolled back to the 01/09/2026 behaviour after the
+    # October rebalance gave up ~4% and the book fell to 77 positions / 81.8%
+    # gross.  The reweighting deliberately moves weights away from the
+    # max-Sharpe optimum, and it is NOT bounded by max_position_weight or the
+    # sector caps, so a position can balloon past its limit.  Re-enable only
+    # after back-testing the alpha cost and adding those bounds.
+    factor_limits:        bool  = False
     factor_exposure_caps: dict  = field(default_factory=lambda: {
         "beta_mkt": 0.03,    # keep net beta ≈ 0 through the reweighting
         "beta_smb": 0.15,    # size
@@ -179,7 +185,11 @@ class TaurusConfig:
     # have their weight redistributed over the shorts that can be borrowed.
     # A name with no quote at all is KEPT: a missing market-data subscription
     # must not wipe the whole short leg.
-    check_borrow_availability: bool  = True
+    # DISABLED 2026-10-23 — rolled back to the 01/09/2026 behaviour.  The screen
+    # only checks availability > 0, not availability >= shares needed, and the
+    # redistribution concentrates the remaining shorts, which makes that gap
+    # worse.  Suspected contributor to the drop from 107 to 77 positions.
+    check_borrow_availability: bool  = False
     min_shortable_shares:      float = 0.0   # availability ≤ this → excluded
 
     # ------------------------------------------------------------------ #
