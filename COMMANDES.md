@@ -20,7 +20,7 @@ C'est tout. Rien d'autre à lancer, aucun scheduler à laisser tourner.
    → ajoutée à l'historique, **jamais écrasée**
 2. Recalcule la pondération Sharpe sur **tout** l'historique depuis l'inception, ce nouveau mois inclus
 3. Construit les portefeuilles : FF5 régional → screen MM → momentum → max-Sharpe → neutralisation bêta
-4. Place les ordres au levier **1.25** (exposition brute 125 % du NAV)
+4. Place les ordres **sans levier** (exposition brute 100 % du NAV)
 5. Archive les positions dans `output/{univers}/snapshots/` (archive permanente datée)
 6. Sauvegarde l'intégralité du log dans `run_AAAA-MM-JJ.log`
 
@@ -57,9 +57,9 @@ Beta neutralisation: β_L=..., β_S=... → net β=0.0000
 
 ### Vérification dans IBKR après le lancement
 
-- **Exposition brute** ≈ 125 % du NAV
+- **Exposition brute** ≈ 100 % du NAV
 - **Exposition nette** ≈ 0 % (bêta-neutre)
-- **Excess Liquidity** largement positif (marge Reg-T requise : 62,5 % du NAV)
+- **Excess Liquidity** largement positif (marge Reg-T requise : 50 % du NAV)
 
 ### Univers tradés
 
@@ -151,7 +151,7 @@ python main.py --mode check-protective \
 | 2. Mettre à jour | `git pull` |
 | 3. **Rebalancement** | `python main.py --mode force-rebalance --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run \| Tee-Object -FilePath "run_$(Get-Date -Format yyyy-MM-dd).log"` |
 | 4. Contrôler le log | allocation Sharpe ≠ 20 % partout · `Monthly return appended` présent · `net β=0.0000` |
-| 5. Vérifier TWS | ordres MKT dans le blotter · brut ≈ 125 % · net ≈ 0 % |
+| 5. Vérifier TWS | ordres MKT dans le blotter · brut ≈ 100 % · net ≈ 0 % |
 | 6. Corriger STP/LMT | `python main.py --mode refresh-protective --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run` |
 | 7. Rapport | `python main.py --mode report --universes sp500 nasdaq100 cac40 ftse100 nikkei225` |
 | 8. Ouvrir | `output/report.png` |
@@ -237,7 +237,7 @@ git add -A && git commit -m "message" && git push -u origin claude/optimize-pyth
 | `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
 | `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
 | `cov_halflife` | 0 | Covariance Ledoit-Wolf (0 = pas d'EWMA) |
-| `gross_leverage` | **1.25** | Exposition brute = 125 % du NAV (chaque jambe à 62,5 %) |
+| `gross_leverage` | **1.00** | Exposition brute = 100 % du NAV (chaque jambe à 50 %) |
 | `sharpe_window_months` | **0** | Pondération Sharpe **depuis l'inception** (0 = fenêtre expansive) |
 | `sharpe_min_months` | 6 | En dessous → équipondération de secours |
 | `max_universe_weight` | 0.35 | Plafond par univers (garde-fou, ne mord pas aujourd'hui) |

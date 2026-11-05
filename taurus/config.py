@@ -163,16 +163,21 @@ class TaurusConfig:
     # Gross exposure as a multiple of NAV: each leg is sized at
     # gross_leverage/2 × NAV (execution.py) — this IS the leverage; nothing is
     # configured on the IBKR side, the margin account simply funds the larger
-    # orders.  Calibrated on 10y backtests of the 5-universe book:
+    # orders.
+    #
+    # Back at 1.00 as of 2026-11-05.  1.25 had been chosen on a 10y backtest:
     #   1.00 → 14.89% ann, Sharpe 1.25, maxDD  -8.30%, Calmar 1.79
-    #   1.25 → 16.59% ann, Sharpe 1.22, maxDD  -8.72%, Calmar 1.90  ← retained
+    #   1.25 → 16.59% ann, Sharpe 1.22, maxDD  -8.72%, Calmar 1.90
     #   1.50 → 18.64% ann, Sharpe 1.19, maxDD -10.76%, Calmar 1.73
     #   2.00 → 22.75% ann, Sharpe 1.14, maxDD -14.85%, Calmar 1.53
-    # 1.25 is the only level that improves Calmar over 1.0 (drawdown barely
-    # moves, +1.70pt of return) and still survives a degraded scenario
-    # (vol ×1.3, alpha ×0.75 → maxDD -12.64%, inside the -15% circuit breaker).
-    # Reg-T initial margin at 1.25 = 62.5% of NAV → 37.5% free buffer.
-    gross_leverage:       float = 1.25
+    # but it went live in the same run as the signal/optimiser switch and the
+    # allocation change, so none of the three could be attributed.  Leverage
+    # only scales the book — it never improves Sharpe here, because the margin
+    # cost (5.8%) exceeds the risk-free rate (4.5%).  Removing it drops expected
+    # return ~1.7pt and gives back ~0.03 of Sharpe and ~0.4pt of drawdown.
+    # Revisit only with 12 months of live track record showing realised vol
+    # matching the backtest.
+    gross_leverage:       float = 1.00
     margin_cost_annual:   float = 0.058  # 5.8%/an (fed funds + spread)
     borrow_cost_annual:   float = 0.010  # 1.0%/an avg stock borrow fee
 
