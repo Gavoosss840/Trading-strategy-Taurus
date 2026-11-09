@@ -294,19 +294,28 @@ def apply_sector_constraints(
     weights: pd.Series,
     sector_map: Dict[str, str],
     cfg: TaurusConfig = DEFAULT_CONFIG,
+    redistribute: Optional[bool] = None,
 ) -> pd.Series:
     """
-    Trim sector weights exceeding the cap, iterating trim → renormalise to a
-    fixed point (a single trim followed by one global renormalisation pushes
-    just-capped sectors back above the limit).
+    Enforce the per-sector cap.
 
-    SCALE-PRESERVING: the incoming leg total is restored at the end.  The
-    caps are enforced on proportions, but a leg deliberately deploying less
-    than one unit (deploy_only_what_fits) must not be inflated back to 1.0
-    on the way out.
+    redistribute=False (the deploy_only_what_fits path): over-weight sectors
+    are scaled DOWN and the freed weight is NOT handed to other names — the
+    leg simply shrinks and the difference stays in cash.  Redistributing it
+    is what pushed a 0.08-capped position to 0.12: trimming two Tech names
+    from 0.08 to 0.06 freed 0.04, and the renormalisation poured it into the
+    one Financials name.
 
-    If the cap is infeasible (n_sectors × cap < 1), it is relaxed to 1/n_sectors.
+    redistribute=True (legacy): proportions are renormalised after each trim,
+    so the leg stays fully invested and individual positions can exceed
+    max_position_weight.
+
+    Either way the incoming leg total is never exceeded.  An infeasible cap
+    (n_sectors × cap < 1) is relaxed to 1/n_sectors.
     """
+    if redistribute is None:
+        redistribute = not getattr(cfg, "deploy_only_what_fits", True)
+
     w = weights.clip(lower=0)
     scale = float(w.sum())
     if scale <= 0:
@@ -320,7 +329,7 @@ def apply_sector_constraints(
     for _ in range(50):
         violated = False
         for sector in sectors_present:
-            members  = [t for t, s in sector_map.items() if s == sector and t in w.index]
+            members = [t for t, s in sector_map.items() if s == sector and t in w.index]
             if not members:
                 continue
             sector_w = w[members].sum()
@@ -329,13 +338,16 @@ def apply_sector_constraints(
                 violated    = True
         if not violated:
             break
-        total = w.sum()
-        if total > 0:
-            w = w / total   # renormalise, then re-check caps next iteration
+        if redistribute:
+            total = w.sum()
+            if total > 0:
+                w = w / total
+        else:
+            break                      # shrink once, keep the rest in cash
 
-    if w.sum() > 0:
+    if redistribute and w.sum() > 0:
         w = w / w.sum()
-    return w * scale        # restore the leg's intended size
+    return w * scale                   # never inflate past the incoming total * scale        # restore the leg's intended size
 
 
 # --------------------------------------------------------------------------- #
