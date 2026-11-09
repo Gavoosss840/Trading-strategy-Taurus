@@ -334,6 +334,29 @@ def apply_sector_constraints(
     sec_cap  = max(cfg.max_sector_weight, 1.0 / n_sec + 1e-9)
     members  = {s: [t for t in w.index if sector_map.get(t) == s] for s in sectors}
 
+    if mode == "redistribute":
+        # Legacy path, preserved verbatim: work on proportions, trim, then
+        # renormalise PROPORTIONALLY (not by adding the deficit evenly — that
+        # is a different algorithm and silently changed the baseline).
+        w = w / target
+        for _ in range(50):
+            violated = False
+            for s, mem in members.items():
+                if not mem:
+                    continue
+                sw = w[mem].sum()
+                if sw > sec_cap + 1e-8:
+                    w[mem] *= sec_cap / sw
+                    violated = True
+            if not violated:
+                break
+            tot = w.sum()
+            if tot > 0:
+                w = w / tot
+        if w.sum() > 0:
+            w = w / w.sum()
+        return w * target
+
     for _ in range(100):
         total = w.sum()
         if total <= 0:
@@ -357,19 +380,13 @@ def apply_sector_constraints(
         if deficit <= 1e-12:
             break
 
-        if mode == "bounded":
-            room = (pos_cap - w).clip(lower=0)      # only where there is headroom
-        else:
-            room = pd.Series(1.0, index=w.index)    # legacy: anywhere
+        room = (pos_cap - w).clip(lower=0)       # only where there is headroom
         if room.sum() <= 1e-12:
-            break                                    # nothing can absorb it → cash
+            break                                 # nothing can absorb it → cash
 
         w = w + deficit * room / room.sum()
-        if mode == "bounded":
-            w = w.clip(upper=pos_cap)
+        w = w.clip(upper=pos_cap)
 
-    if mode == "redistribute" and w.sum() > 0:
-        w = w * (target / w.sum())
     return w
 
 
