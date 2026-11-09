@@ -294,60 +294,83 @@ def apply_sector_constraints(
     weights: pd.Series,
     sector_map: Dict[str, str],
     cfg: TaurusConfig = DEFAULT_CONFIG,
-    redistribute: Optional[bool] = None,
+    mode: Optional[str] = None,
 ) -> pd.Series:
     """
-    Enforce the per-sector cap.
+    Enforce the per-sector cap without breaking the per-position cap.
 
-    redistribute=False (the deploy_only_what_fits path): over-weight sectors
-    are scaled DOWN and the freed weight is NOT handed to other names — the
-    leg simply shrinks and the difference stays in cash.  Redistributing it
-    is what pushed a 0.08-capped position to 0.12: trimming two Tech names
-    from 0.08 to 0.06 freed 0.04, and the renormalisation poured it into the
-    one Financials name.
+    Three modes:
 
-    redistribute=True (legacy): proportions are renormalised after each trim,
-    so the leg stays fully invested and individual positions can exceed
-    max_position_weight.
+    "bounded" (default when deploy_only_what_fits):
+        Trim over-weight sectors, then give the freed weight back ONLY to
+        names that still have room under max_position_weight.  When no name
+        has room left, the remainder stays in cash.  This keeps the leg
+        invested without inventing concentration — the position cap is a
+        hard ceiling, the sector cap converges, and whatever neither can
+        absorb is simply not deployed.
 
-    Either way the incoming leg total is never exceeded.  An infeasible cap
-    (n_sectors × cap < 1) is relaxed to 1/n_sectors.
+    "shrink":
+        Trim once and keep the rest in cash.  Leaves capital idle AND does
+        not converge — a single pass can leave a sector above its cap.
+
+    "redistribute" (legacy):
+        Renormalise after each trim, so the leg stays fully invested and
+        individual positions can breach max_position_weight.
+
+    The incoming leg total is never exceeded in any mode.  An infeasible
+    sector cap (n_sectors × cap < 1) is relaxed to 1/n_sectors.
     """
-    if redistribute is None:
-        redistribute = not getattr(cfg, "deploy_only_what_fits", True)
+    if mode is None:
+        mode = "bounded" if getattr(cfg, "deploy_only_what_fits", True) else "redistribute"
 
-    w = weights.clip(lower=0)
-    scale = float(w.sum())
-    if scale <= 0:
+    w = weights.clip(lower=0).astype(float)
+    target = float(w.sum())
+    if target <= 0:
         return w
-    w = w / scale
 
-    sectors_present = {sector_map[t] for t in w.index if t in sector_map}
-    n_sec = max(len(sectors_present), 1)
-    cap   = max(cfg.max_sector_weight, 1.0 / n_sec + 1e-6)
+    pos_cap  = float(cfg.max_position_weight)
+    sectors  = {sector_map[t] for t in w.index if t in sector_map}
+    n_sec    = max(len(sectors), 1)
+    sec_cap  = max(cfg.max_sector_weight, 1.0 / n_sec + 1e-9)
+    members  = {s: [t for t in w.index if sector_map.get(t) == s] for s in sectors}
 
-    for _ in range(50):
-        violated = False
-        for sector in sectors_present:
-            members = [t for t, s in sector_map.items() if s == sector and t in w.index]
-            if not members:
-                continue
-            sector_w = w[members].sum()
-            if sector_w > cap + 1e-8:
-                w[members] *= cap / sector_w
-                violated    = True
-        if not violated:
+    for _ in range(100):
+        total = w.sum()
+        if total <= 0:
             break
-        if redistribute:
-            total = w.sum()
-            if total > 0:
-                w = w / total
-        else:
-            break                      # shrink once, keep the rest in cash
 
-    if redistribute and w.sum() > 0:
-        w = w / w.sum()
-    return w * scale                   # never inflate past the incoming total * scale        # restore the leg's intended size
+        breached = False
+        for s, mem in members.items():
+            if not mem:
+                continue
+            sw = w[mem].sum()
+            if sw > sec_cap * total + 1e-12:
+                w[mem] *= (sec_cap * total) / sw
+                breached = True
+
+        if not breached:
+            break
+        if mode == "shrink":
+            break
+
+        deficit = target - w.sum()
+        if deficit <= 1e-12:
+            break
+
+        if mode == "bounded":
+            room = (pos_cap - w).clip(lower=0)      # only where there is headroom
+        else:
+            room = pd.Series(1.0, index=w.index)    # legacy: anywhere
+        if room.sum() <= 1e-12:
+            break                                    # nothing can absorb it → cash
+
+        w = w + deficit * room / room.sum()
+        if mode == "bounded":
+            w = w.clip(upper=pos_cap)
+
+    if mode == "redistribute" and w.sum() > 0:
+        w = w * (target / w.sum())
+    return w
 
 
 # --------------------------------------------------------------------------- #
