@@ -115,6 +115,26 @@ class TaurusConfig:
     min_position_weight: float = 0.005   # 0.5 % floor
     max_sector_weight:   float = 0.30    # 30 % sector cap per leg
 
+    # ------------------------------------------------------------------ #
+    #  Capital deployment                                                 #
+    # ------------------------------------------------------------------ #
+    # Deploy only the capital the signal actually justifies; hold cash for
+    # the rest rather than invent concentration.
+    #
+    # deploy_only_what_fits: cap each position at max_position_weight and do
+    #   NOT renormalise the leg back to 1.0.  A leg with 2 candidates deploys
+    #   2 × 8% = 16% and leaves 84% in cash.  With it False, the leg is
+    #   renormalised to a full unit — which is how two NASDAQ shorts became
+    #   50% each in the 2026-08-31 book.
+    # neutralise_by_shrinking: achieve net beta ≈ 0 by scaling DOWN the leg
+    #   carrying more beta, never scaling the other UP (the old k up to 1.4
+    #   turned those 50% shorts into 70%).  Gross falls instead.
+    #
+    # Both reduce gross exposure below 100% by design. That is intended:
+    # a well-diversified 60% book beats a 100% book carried by two names.
+    deploy_only_what_fits:   bool = True
+    neutralise_by_shrinking: bool = True
+
     # Optimizer:
     #   "max_sharpe"   — classical tangency portfolio (original Taurus optimizer).
     #   "min_variance" — minimises portfolio variance with alpha tilt (AQR-style).

@@ -300,12 +300,18 @@ def apply_sector_constraints(
     fixed point (a single trim followed by one global renormalisation pushes
     just-capped sectors back above the limit).
 
+    SCALE-PRESERVING: the incoming leg total is restored at the end.  The
+    caps are enforced on proportions, but a leg deliberately deploying less
+    than one unit (deploy_only_what_fits) must not be inflated back to 1.0
+    on the way out.
+
     If the cap is infeasible (n_sectors × cap < 1), it is relaxed to 1/n_sectors.
     """
     w = weights.clip(lower=0)
-    if w.sum() <= 0:
+    scale = float(w.sum())
+    if scale <= 0:
         return w
-    w = w / w.sum()
+    w = w / scale
 
     sectors_present = {sector_map[t] for t in w.index if t in sector_map}
     n_sec = max(len(sectors_present), 1)
@@ -329,7 +335,7 @@ def apply_sector_constraints(
 
     if w.sum() > 0:
         w = w / w.sum()
-    return w
+    return w * scale        # restore the leg's intended size
 
 
 # --------------------------------------------------------------------------- #
@@ -419,10 +425,19 @@ def beta_neutralise(
     k_L = 2.0 * abs(beta_S) / denom
     k_S = 2.0 * abs(beta_L) / denom
 
-    # Bound the leg scalars so noisy beta estimates cannot produce extreme
-    # gross tilts (trade exact neutrality for bounded leverage per leg).
-    k_L = float(np.clip(k_L, 0.6, 1.4))
-    k_S = float(np.clip(k_S, 0.6, 1.4))
+    if getattr(cfg, "neutralise_by_shrinking", True):
+        # SHRINK-ONLY: scale DOWN the leg carrying more beta, never scale the
+        # other one UP.  k_L·β_L = k_S·β_S = min(β_L, β_S) still holds, so net
+        # beta is still ~0, but no position can be inflated past its cap.
+        # Scaling up is what turned a 50% NASDAQ short into 70%.
+        # Gross exposure drops instead — the uninvested part stays in cash.
+        bL, bS = abs(beta_L), abs(beta_S)
+        k_L = min(1.0, bS / bL) if bL > 0 else 1.0
+        k_S = min(1.0, bL / bS) if bS > 0 else 1.0
+    else:
+        # Legacy: k_L + k_S = 2, gross preserved, one leg inflated.
+        k_L = float(np.clip(k_L, 0.6, 1.4))
+        k_S = float(np.clip(k_S, 0.6, 1.4))
 
     lw = long_weights  * k_L
     sw = short_weights * k_S
@@ -532,16 +547,28 @@ def build_leg(
         mu      = pd.Series(alpha_scores[tickers].fillna(0.0).values, index=tickers)
         weights = max_sharpe_weights(mu, cov, cfg)
 
-    # Hard per-position cap, iterated: a single clip + renormalise can push
-    # weights back above the cap, so repeat until the cap holds.
-    actual_max_w = max(cfg.max_position_weight, 1.0 / max(len(tickers), 1))
-    actual_max_w = min(actual_max_w, 0.25)
-    for _ in range(20):
-        if weights.sum() > 0:
+    # Per-position cap.
+    #
+    # deploy_only_what_fits (default): cap each weight ABSOLUTELY and do NOT
+    # renormalise.  A leg that finds only 2 candidates then deploys
+    # 2 × max_position_weight and leaves the rest in cash, instead of being
+    # inflated back to 100%.  Renormalising after a clip is what turned two
+    # NASDAQ shorts into 50% each (then 70% after beta scaling).
+    #
+    # Legacy path: cap floor of 1/N then renormalise to 1 — keeps the leg fully
+    # invested at the cost of inventing concentration the optimiser never chose.
+    if getattr(cfg, "deploy_only_what_fits", True):
+        weights = weights.clip(upper=cfg.max_position_weight)
+        if weights.sum() > 1.0:                      # never exceed one leg unit
             weights = weights / weights.sum()
-        if (weights <= actual_max_w + 1e-9).all():
-            break
-        weights = weights.clip(upper=actual_max_w)
+    else:
+        actual_max_w = min(max(cfg.max_position_weight, 1.0 / max(len(tickers), 1)), 0.25)
+        for _ in range(20):
+            if weights.sum() > 0:
+                weights = weights / weights.sum()
+            if (weights <= actual_max_w + 1e-9).all():
+                break
+            weights = weights.clip(upper=actual_max_w)
 
     weights = apply_sector_constraints(weights, sector_map, cfg)
     return weights
