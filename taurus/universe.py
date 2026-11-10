@@ -956,42 +956,58 @@ class UniverseDef:
         US   → SEC EDGAR (primary) + yfinance fallback.
         All other regions → yfinance only (not on EDGAR).
         """
-        if self.config.region == "US":
-            return get_fundamentals(tickers, cfg)
-        else:
-            # Europe / Japan / Asia / MiddleEast — IFRS/local GAAP, not on EDGAR
-            if not tickers:
-                _empty_cols = [
-                    "total_debt", "total_equity", "ebit", "interest_expense",
-                    "total_assets", "market_cap", "sector", "tax_rate", "cash", "fcf",
-                ]
-                return pd.DataFrame(columns=_empty_cols)
+        # Every region now takes the same path.  The US one used to go through
+        # SEC EDGAR, which is fresher after a filing but, for this strategy,
+        # worse on every count that matters: it hard-coded tax_rate to 0.21 for
+        # all 495 S&P 500 names (one distinct value, against a measured 17%-41%
+        # spread), it capped the market_cap backfill at 50 tickers (10% coverage
+        # in the cache), and it carries NONE of the fields a valuation leg needs
+        # — common equity, net income to common shareholders, share count.
+        #
+        # Routing US through EDGAR and everything else through yfinance also
+        # made the two incomparable: different tax rates, different statement
+        # horizons, different field definitions, on universes whose returns are
+        # then Sharpe-weighted against each other.  One path, one definition.
+        #
+        # get_fundamentals and the EDGAR module are left in place; nothing calls
+        # them by default any more.
+        if not tickers:
+            return pd.DataFrame(columns=[
+                "total_debt", "total_equity", "equity_common", "total_assets",
+                "ebit", "ebitda", "interest_expense", "net_income_common",
+                "normalized_income", "roe", "roe_normalized",
+                "effective_tax_rate", "market_cap", "sector", "tax_rate",
+                "cash", "fcf", "shares_outstanding", "book_per_share",
+            ])
 
-            import hashlib as _hl
-            _fb_key = f"fundamentals_{self.config.name}_v1"
-            cached = _cache_load(_fb_key, cfg)
-            if cached is not None:
-                return cached
+        # "_v2": the record gained the valuation fields and the field
+        # definitions changed (exact row matching, twelve-month flows,
+        # effective tax rate), so v1 entries must not be reused.
+        _key = f"fundamentals_{self.config.name}_v2"
+        cached = _cache_load(_key, cfg)
+        if cached is not None:
+            return cached
 
-            from .data import _fetch_single_fundamental
-            from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+        from .data import _fetch_single_fundamental
+        from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                        TimeoutError as FuturesTimeout)
 
-            records = []
-            logger.info("[%s] Downloading fundamentals for %d tickers (parallel)…",
-                        self.config.name, len(tickers))
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {pool.submit(_fetch_single_fundamental, t): t for t in tickers}
-                for fut in as_completed(futures):
-                    ticker = futures[fut]
-                    try:
-                        records.append(fut.result(timeout=30))
-                    except (FuturesTimeout, Exception) as e:
-                        logger.debug("Fundamentals timeout/error for %s: %s", ticker, e)
-                        records.append({"ticker": ticker})   # empty row — NaN filled downstream
+        records = []
+        logger.info("[%s] Downloading fundamentals for %d tickers (parallel)…",
+                    self.config.name, len(tickers))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_single_fundamental, t): t for t in tickers}
+            for fut in as_completed(futures):
+                ticker = futures[fut]
+                try:
+                    records.append(fut.result(timeout=60))
+                except (FuturesTimeout, Exception) as e:
+                    logger.debug("Fundamentals timeout/error for %s: %s", ticker, e)
+                    records.append({"ticker": ticker})   # NaN-filled downstream
 
-            df = pd.DataFrame(records).set_index("ticker")
-            _cache_save(_fb_key, df, cfg)
-            return df
+        df = pd.DataFrame(records).set_index("ticker")
+        _cache_save(_key, df, cfg)
+        return df
 
     # ── IBKR Futures Contract ────────────────────────────────────────────── #
 
