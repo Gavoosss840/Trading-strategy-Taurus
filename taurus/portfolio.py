@@ -317,8 +317,24 @@ def apply_sector_constraints(
         Renormalise after each trim, so the leg stays fully invested and
         individual positions can breach max_position_weight.
 
-    The incoming leg total is never exceeded in any mode.  An infeasible
-    sector cap (n_sectors × cap < 1) is relaxed to 1/n_sectors.
+    The incoming leg total is never exceeded in any mode.
+
+    On an INFEASIBLE sector cap (n_sectors × cap < 1, e.g. a leg spread over
+    two sectors under a 30% cap) the two families diverge, on purpose:
+
+      "redistribute" (legacy) relaxes the cap to 1/n_sectors so the leg can
+      still deploy in full.  Preserved as-is so the legacy baseline does not
+      move.
+
+      "bounded" / "shrink" honour the configured cap and leave the remainder
+      in CASH.  Relaxing it there would inflate sector concentration to force
+      deployment, which is the opposite of what deploy_only_what_fits means.
+      It also made the cap unpredictable: measured on 130 S&P 500 rebalances,
+      the legs hold only 2 to 5 distinct sectors, so a cap configured at 30%
+      was actually applied at 30% on 87 legs, 33% on 73, 50% on 83 and 100%
+      — no constraint at all — on 17, where a single sector held the whole
+      leg.  Caps of 20%, 30%, 40% and 50% all produced byte-identical
+      portfolios, which is not something a working constraint can do.
     """
     if mode is None:
         mode = "bounded" if getattr(cfg, "deploy_only_what_fits", True) else "redistribute"
@@ -331,8 +347,21 @@ def apply_sector_constraints(
     pos_cap  = float(cfg.max_position_weight)
     sectors  = {sector_map[t] for t in w.index if t in sector_map}
     n_sec    = max(len(sectors), 1)
-    sec_cap  = max(cfg.max_sector_weight, 1.0 / n_sec + 1e-9)
     members  = {s: [t for t in w.index if sector_map.get(t) == s] for s in sectors}
+
+    if mode == "redistribute":
+        sec_cap = max(cfg.max_sector_weight, 1.0 / n_sec + 1e-9)
+    else:
+        sec_cap = float(cfg.max_sector_weight)
+        # In the bounded family the position cap is a hard ceiling, so enforce
+        # it on the way in rather than trusting the caller.  build_leg already
+        # clips before calling, so this is a no-op in the normal path; it only
+        # matters for a caller that does not, where the top-up below would
+        # otherwise hand back a weight above max_position_weight.
+        w = w.clip(upper=pos_cap)
+        target = float(w.sum())
+        if target <= 0:
+            return w
 
     if mode == "redistribute":
         # Legacy path, preserved verbatim: work on proportions, trim, then
@@ -357,22 +386,21 @@ def apply_sector_constraints(
             w = w / w.sum()
         return w * target
 
-    for _ in range(100):
-        total = w.sum()
-        if total <= 0:
-            break
+    # The cap is measured against the leg's TARGET size, not against its
+    # running total.  Against the running total the constraint tightens every
+    # time the leg shrinks, so an infeasible cap never converges: each pass
+    # trims, redistribution re-breaches, and the loop just burns its 100
+    # iterations and returns whatever state it happened to stop in.
+    sec_limit = sec_cap * target
 
-        breached = False
+    for _ in range(100):
         for s, mem in members.items():
             if not mem:
                 continue
             sw = w[mem].sum()
-            if sw > sec_cap * total + 1e-12:
-                w[mem] *= (sec_cap * total) / sw
-                breached = True
+            if sw > sec_limit + 1e-12:
+                w[mem] *= sec_limit / sw
 
-        if not breached:
-            break
         if mode == "shrink":
             break
 
@@ -380,12 +408,21 @@ def apply_sector_constraints(
         if deficit <= 1e-12:
             break
 
-        room = (pos_cap - w).clip(lower=0)       # only where there is headroom
+        # Headroom is the position cap, but a name whose sector is already at
+        # its limit gets none — otherwise the top-up immediately re-breaches
+        # the sector we just trimmed.
+        room = (pos_cap - w).clip(lower=0)
+        for s, mem in members.items():
+            if mem and w[mem].sum() >= sec_limit - 1e-12:
+                room[mem] = 0.0
+
         if room.sum() <= 1e-12:
             break                                 # nothing can absorb it → cash
 
-        w = w + deficit * room / room.sum()
-        w = w.clip(upper=pos_cap)
+        added = deficit * room / room.sum()
+        w = (w + added).clip(upper=pos_cap)
+        if added.sum() <= 1e-12:
+            break
 
     return w
 

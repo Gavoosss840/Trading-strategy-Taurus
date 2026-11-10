@@ -113,7 +113,30 @@ class TaurusConfig:
     n_shorts: int   = 25
     max_position_weight: float = 0.08    # 8 % cap per leg
     min_position_weight: float = 0.005   # 0.5 % floor
-    max_sector_weight:   float = 0.30    # 30 % sector cap per leg
+    max_sector_weight:   float = 0.80    # sector cap per leg — see note below
+    #
+    # Raised from 0.30 once the cap was actually honoured.  It used to be
+    # silently relaxed to 1/n_sectors, so 0.30 was never what ran.  Honoured,
+    # 0.30 starves the book: the legs hold only 2-5 distinct sectors, so the
+    # cap stops being a diversification tool and becomes a deployment throttle,
+    # with gross exposure tracking it almost linearly.  Measured on the S&P 500
+    # over 2016-2026 (gross | annual | Sharpe | maxDD):
+    #
+    #   0.30  0.83 | +11.01% | 0.98 | -6.55%      0.60  1.36 | +18.85% | 1.50 | -9.09%
+    #   0.40  1.01 | +13.62% | 1.20 | -7.48%      0.80  1.64 | +23.73% | 1.80 | -9.24%
+    #   0.50  1.19 | +16.25% | 1.37 | -8.28%      1.00  1.71 | +24.59% | 1.84 | -11.53%
+    #
+    # 0.80 takes 98% of the attainable Sharpe with 20% less drawdown than no
+    # cap at all, and still beats the pre-fix behaviour (Sharpe 1.45, maxDD
+    # -11.67%) on both counts.  The Nikkei disagrees mildly — its legs are
+    # spread widely enough that 0.30 never binds there (gross 1.79) and its
+    # Sharpe peaks at 0.30-0.40 — but the S&P 500 gain (+0.82) dwarfs the
+    # Nikkei loss (-0.04) at this allocation.
+    #
+    # The real fix is structural, not a number: a cap applied at SIZING cannot
+    # diversify a leg that only had 3 sectors to choose from, it can only
+    # refuse to invest. Sector breadth belongs in the SELECTION step, and the
+    # cap should probably be per-universe rather than global.
 
     # ------------------------------------------------------------------ #
     #  Capital deployment                                                 #
