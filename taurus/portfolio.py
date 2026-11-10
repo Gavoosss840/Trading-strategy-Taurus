@@ -602,9 +602,46 @@ def build_leg(
     if len(tickers) == 0:
         return pd.Series(dtype=float)
 
-    # Rank by signal score, take top-N
-    ranked  = alpha_scores[tickers].nlargest(min(n, len(tickers)))
-    tickers = ranked.index.tolist()
+    # ── Name selection ────────────────────────────────────────────────────── #
+    # Plain top-N by score is sector-blind, and that is where the concentration
+    # comes from: measured over 130 S&P 500 rebalances the legs span only 2 to 5
+    # distinct sectors.  A sector cap applied later at SIZING cannot diversify a
+    # leg that was handed 3 sectors — it can only refuse to invest, which is why
+    # gross exposure tracked max_sector_weight almost linearly (0.83 at 0.30
+    # against 1.71 uncapped).
+    #
+    # sector_diversified_selection caps the NUMBER of names per sector at
+    # n × max_sector_weight, so the leg spans at least 1/max_sector_weight
+    # sectors whenever the candidates allow it, and the weight cap becomes
+    # feasible instead of acting as a throttle.  Names are still taken in score
+    # order within each sector, so the signal ranking is respected.
+    if getattr(cfg, "sector_diversified_selection", False) and sector_map:
+        per_sector = max(1, int(n * float(cfg.max_sector_weight)))
+        ordered    = alpha_scores[tickers].sort_values(ascending=False)
+        taken: List[str] = []
+        counts: Dict[str, int] = {}
+        for t in ordered.index:
+            s = sector_map.get(t, "Unknown")
+            if counts.get(s, 0) >= per_sector:
+                continue
+            taken.append(t)
+            counts[s] = counts.get(s, 0) + 1
+            if len(taken) >= n:
+                break
+        # Too few sectors to fill the leg under the per-sector cap: top up with
+        # the best names left rather than hold fewer positions.  This keeps the
+        # name count at n and the sector spread as wide as the candidates allow;
+        # whatever concentration survives is then the weight cap's job.
+        if len(taken) < min(n, len(ordered)):
+            for t in ordered.index:
+                if t not in taken:
+                    taken.append(t)
+                    if len(taken) >= n:
+                        break
+        tickers = taken
+    else:
+        ranked  = alpha_scores[tickers].nlargest(min(n, len(tickers)))
+        tickers = ranked.index.tolist()
 
     # Filter to tickers with sufficient return history
     ret_sub   = returns[tickers].dropna(how="all")

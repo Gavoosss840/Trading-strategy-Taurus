@@ -113,6 +113,12 @@ class TaurusConfig:
     n_shorts: int   = 25
     max_position_weight: float = 0.08    # 8 % cap per leg
     min_position_weight: float = 0.005   # 0.5 % floor
+    # Cap the NUMBER of names per sector at n × max_sector_weight when picking
+    # the leg, instead of taking the top N by score regardless of sector.  The
+    # weight cap below can only shrink a leg it was handed with three sectors
+    # in it; breadth has to come from the selection step.  Off until measured.
+    sector_diversified_selection: bool = False
+
     max_sector_weight:   float = 0.80    # sector cap per leg — see note below
     #
     # Raised from 0.30 once the cap was actually honoured.  It used to be
