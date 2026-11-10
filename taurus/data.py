@@ -172,29 +172,62 @@ def get_monthly_prices(
     Index: DatetimeIndex (month-end)
     Columns: tickers
     """
-    key = f"prices_{'_'.join(sorted(tickers[:5]))}_{start}_{end}"
+    # Cache key carries "_d2" since the switch from Yahoo monthly bars to
+    # daily-resampled prices: older entries hold the corrupted monthly series.
+    key = f"prices_d2_{'_'.join(sorted(tickers[:5]))}_{start}_{end}"
     cached = _cache_load(key, cfg)
     if cached is not None:
         return cached
 
+    # ── Daily bars, resampled to month-end ────────────────────────────────── #
+    # Yahoo's MONTHLY bars (interval="1mo", auto_adjust=True) misapply the
+    # dividend adjustment on some non-US names, and the corruption is silent.
+    # Measured against the daily series over 2009-2026:
+    #   S&P 500 / NASDAQ 100 / Nikkei 225 : 0.00 % of points wrong
+    #   CAC 40                            : 0.55 % wrong (up to 2.2 %)
+    #   FTSE 100                          : 2.75 % wrong, CPG.L off by +70 %
+    #   STOXX 600 (London)                : III.L off by -99 % on 3 months
+    # A -10 % or +70 % error passes every outlier screen and flows straight
+    # into the FF5 alpha, the betas and the covariance.  The daily series is
+    # the reference and does not depend on Yahoo's monthly adjustment logic,
+    # so we resample it ourselves.  Chunked to keep payloads reasonable.
     logger.info("Downloading prices for %d tickers (%s → %s)...", len(tickers), start, end)
-    raw = yf.download(
-        tickers,
-        start=start,
-        end=end,
-        interval="1mo",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        prices = raw["Close"]
-    else:
-        prices = raw[["Close"]]
-        prices.columns = tickers
+    frames: List[pd.DataFrame] = []
+    chunk_size = 50
+    for i in range(0, len(tickers), chunk_size):
+        chunk = tickers[i : i + chunk_size]
+        raw = yf.download(
+            chunk,
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if raw is None or raw.empty:
+            logger.warning("No price data returned for chunk %d-%d.", i, i + len(chunk))
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            part = raw["Close"]
+        else:
+            part = raw[["Close"]].copy()
+            part.columns = chunk[:1] if len(chunk) == 1 else chunk
+        frames.append(part)
 
-    # Align to month-end
+    if not frames:
+        logger.error("Price download returned nothing for %d tickers.", len(tickers))
+        return pd.DataFrame()
+
+    daily = pd.concat(frames, axis=1)
+    daily = daily.loc[:, ~daily.columns.duplicated(keep="first")]
+    daily.index = pd.to_datetime(daily.index)
+    daily = daily.sort_index()
+
+    # Last traded price of each month; .last() skips NaN, so a stock that did
+    # not trade on the final session keeps its most recent price that month.
+    prices = daily.resample("ME").last()
     prices.index = prices.index.to_period("M").to_timestamp("M")
     prices = prices.sort_index()
 
