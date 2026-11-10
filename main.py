@@ -46,7 +46,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--force-calibration", action="store_true",
+                   help="calibrate: accept parameter jumps between quarters. "
+                        "A jump is a data problem far more often than an "
+                        "economic one, so review the alerts first.")
     p.add_argument("--as-of", default=None,
                    help="orders: rebalance date for the sheet (default: today). "
                         "Separate from --end, whose default is a backtest date.")
@@ -1223,6 +1227,89 @@ def run_check_protective(args, cfg) -> None:
     logger.info("Report saved → %s (.txt / .json)", base)
 
 
+def run_calibrate(args, cfg) -> None:
+    """
+    Re-estimate the valuation parameters and archive them under this quarter.
+
+    The PROCEDURE is frozen in taurus/valuation.py (winsorisation bounds,
+    validity constraints on phi and R2, ranking criterion, tie-break). This
+    command re-runs it over fresh statements and writes the resulting NUMBERS.
+    Updating estimates under an unchanged rule is maintenance; changing the
+    rule because the estimates displease is overfitting, and the two must not
+    be confused.
+
+    Dating each archive also makes the parameters point-in-time going forward:
+    load_calibration returns the most recent calibration not later than the
+    rebalance date, so from the first stored quarter onward they cannot leak
+    backwards. The historical backtest stays contaminated — phi is estimated
+    on the only four annual periods yfinance exposes — and that can be
+    disclosed but not undone.
+
+    Usage:
+      python main.py --mode calibrate --universes sp500 stoxx_eur stoxx_uk nikkei225
+      python main.py --mode calibrate --universes ... --force-calibration
+    """
+    from datetime import date
+    from taurus.universe import REGISTRY
+    from taurus.valuation import (build_panel, estimate_calibration,
+                                  save_calibration, load_calibration)
+
+    universes = args.universes or ["sp500"]
+    tickers: list = []
+    for u in universes:
+        try:
+            tickers.extend(REGISTRY.get(u).get_tickers(cfg))
+        except Exception as e:
+            logger.error("[%s] Unknown universe (%s) — skipped.", u, e)
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        logger.error("No tickers to calibrate on.")
+        return
+
+    as_of = (date.fromisoformat(args.as_of) if getattr(args, "as_of", None)
+             else date.today())
+    logger.info("=== CALIBRATE | %d tickers from %s | as_of %s ===",
+                len(tickers), universes, as_of)
+
+    panel = build_panel(tickers)
+    if panel.empty:
+        logger.error("Empty panel — nothing to estimate. The statement source "
+                     "may be rate-limiting; retry later.")
+        return
+
+    calib = estimate_calibration(panel)
+    secteurs = calib.get("sectors", {})
+    assignes = {s: c for s, c in secteurs.items() if c.get("metric")}
+    logger.info("")
+    logger.info("%-26s %-6s %-7s %-7s %-6s  %s", "SECTOR", "METRIC", "PHI",
+                "R2", "FIRMS", "WHY")
+    for s, c in sorted(secteurs.items()):
+        cd = c.get("candidates", {}).get(c.get("metric") or "roe", {})
+        logger.info("%-26s %-6s %-7s %-7s %-6d  %s", s[:26],
+                    (c.get("metric") or "NONE").upper(),
+                    f"{c['phi']:.3f}" if c.get("phi") is not None else "-",
+                    f"{cd.get('r2'):.3f}" if cd.get("r2") is not None else "-",
+                    c.get("n_firms", 0), c.get("reason", ""))
+    logger.info("")
+    logger.info("%d/%d sectors assigned a metric.", len(assignes), len(secteurs))
+    sans = [s for s, c in secteurs.items() if not c.get("metric")]
+    if sans:
+        logger.info("No usable metric (tradable, but no target price): %s",
+                    ", ".join(sorted(sans)))
+
+    path = save_calibration(calib, as_of=as_of,
+                            force=getattr(args, "force_calibration", False))
+    if path is None:
+        logger.error("Nothing written. Review the alerts above; re-run with "
+                     "--force-calibration to accept them.")
+        return
+    logger.info("Written: %s", path)
+
+    check = load_calibration(as_of)
+    if check is None:
+        logger.error("Written but not loadable — investigate before relying on it.")
+
+
 def run_orders(args, cfg) -> None:
     """
     Produce the month's positions as an Excel workbook instead of trading them.
@@ -1845,6 +1932,8 @@ def main() -> None:
         run_report(args, cfg)
     elif args.mode == "live-report":
         run_live_report(args, cfg)
+    elif args.mode == "calibrate":
+        run_calibrate(args, cfg)
     elif args.mode == "orders":
         run_orders(args, cfg)
     elif args.mode == "flatten":
