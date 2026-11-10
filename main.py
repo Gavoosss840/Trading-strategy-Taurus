@@ -46,7 +46,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--as-of", default=None,
+                   help="orders: rebalance date for the sheet (default: today). "
+                        "Separate from --end, whose default is a backtest date.")
+    p.add_argument("--base-currency", default="EUR",
+                   help="orders: currency the NAV is expressed in (default EUR).")
     p.add_argument("--include-untracked", action="store_true",
                    help="flatten: also close positions matching the universe that "
                         "RiskState attributes to no universe (opened before "
@@ -1218,6 +1223,131 @@ def run_check_protective(args, cfg) -> None:
     logger.info("Report saved → %s (.txt / .json)", base)
 
 
+def run_orders(args, cfg) -> None:
+    """
+    Produce the month's positions as an Excel workbook instead of trading them.
+
+    Needs NO IBKR connection: prices come from market data and the NAV is given
+    with --nav, so the sheet can be built anywhere and read before any order is
+    placed.  Manual execution from a sheet you have read is a check the
+    automated path does not have.
+
+    Usage:
+      python main.py --mode orders --nav 1000000 \
+          --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk
+    """
+    import dataclasses
+    import pandas as pd
+    from datetime import date
+    from pathlib import Path
+    from taurus.order_sheet import build_rows, write_workbook
+    from taurus.risk import RiskConfig
+    from taurus.scheduler import sharpe_allocation_weights
+    from taurus.strategy import TaurusStrategy
+    from taurus.universe import REGISTRY
+
+    universes = args.universes or ["sp500"]
+    nav = float(getattr(args, "nav", 0.0) or 0.0)
+    if nav <= 0:
+        logger.error("--mode orders requires --nav (account value, e.g. --nav 1000000).")
+        return
+
+    base_ccy = (getattr(args, "base_currency", None) or "EUR").upper()
+    rcfg = RiskConfig()
+    # NOT args.end: its default is a backtest end date, which would silently
+    # build the sheet for a past month.
+    as_of = getattr(args, "as_of", None) or date.today().isoformat()
+
+    logger.info("=== ORDER SHEET | universes=%s | NAV=%.2f %s | as_of=%s ===",
+                universes, nav, base_ccy, as_of)
+
+    # ── NAV split across universes, by the same Sharpe weighting as live ──── #
+    hist: dict = {}
+    for u in universes:
+        for p in (Path(args.output) / u / "monthly_returns.csv",
+                  Path(args.output) / "live" / u / "monthly_returns.csv"):
+            if p.exists():
+                try:
+                    s = pd.read_csv(p, index_col=0, parse_dates=True).squeeze("columns")
+                    if len(s) >= 6:
+                        hist[u] = s
+                        break
+                except Exception as e:
+                    logger.debug("Could not read %s: %s", p, e)
+    if len(hist) >= 2:
+        weights = sharpe_allocation_weights(
+            hist, universes, rf_annual=getattr(cfg, "risk_free_rate", 0.045),
+            window=getattr(cfg, "sharpe_window_months", 0),
+            min_months=getattr(cfg, "sharpe_min_months", 6),
+            max_weight=getattr(cfg, "max_universe_weight", 0.35),
+        )
+        logger.info("Sharpe weights from %d universes with history: %s", len(hist),
+                    "  ".join(f"{k}={v*100:.1f}%" for k, v in sorted(weights.items(),
+                                                                     key=lambda x: -x[1])))
+    else:
+        weights = {u: 1.0 / len(universes) for u in universes}
+        logger.warning(
+            "Only %d universe(s) have >=6 months of return history on disk — "
+            "splitting the NAV EQUALLY instead of by Sharpe.  The live weights "
+            "will differ; set them by hand if that matters.", len(hist),
+        )
+
+    rows_by_universe: dict = {}
+    for name in universes:
+        try:
+            udef = REGISTRY.get(name)
+        except Exception as e:
+            logger.error("[%s] Unknown universe (%s) — skipped.", name, e)
+            continue
+        ucfg = udef.config
+        ucfg_cfg = dataclasses.replace(cfg, n_longs=ucfg.n_longs, n_shorts=ucfg.n_shorts)
+
+        warm = ucfg_cfg.lookback_months + ucfg_cfg.momentum_months + 6
+        start = (pd.Timestamp(as_of) - pd.DateOffset(months=warm)).strftime("%Y-%m-%d")
+
+        logger.info("[%s] Loading data …", name)
+        strat = TaurusStrategy(ucfg_cfg)
+        tickers = udef.get_tickers(ucfg_cfg)
+        strat.load_data(
+            start=start, end=as_of, tickers=tickers,
+            factors_df=udef.get_ff5_factors(start, as_of, ucfg_cfg),
+            fundamentals_fn=udef.get_fundamentals,
+            prices_fn=udef.get_prices,
+        )
+        snap = strat.run(as_of=as_of)
+        if not len(snap.long_weights) and not len(snap.short_weights):
+            logger.warning("[%s] Empty snapshot — nothing to trade.", name)
+            rows_by_universe[name] = []
+            continue
+
+        nav_uni = nav * weights.get(name, 0.0)
+        rows = build_rows(
+            universe=name, snapshot=snap, returns=strat._returns,
+            nav_base=nav_uni, base_currency=base_ccy,
+            cfg=ucfg_cfg, rcfg=rcfg,
+        )
+        rows_by_universe[name] = rows
+        alertes = sum(1 for r in rows if r.get("Alerte"))
+        logger.info("[%s] %d position(s)%s — NAV allocated %.2f %s",
+                    name, len(rows),
+                    f", {alertes} flagged" if alertes else "", nav_uni, base_ccy)
+
+    out = Path(args.output) / f"ordres_{as_of}.xlsx"
+    write_workbook(rows_by_universe, out, base_ccy, nav, weights)
+
+    total = sum(len(r) for r in rows_by_universe.values())
+    alertes = sum(1 for rs in rows_by_universe.values() for r in rs if r.get("Alerte"))
+    logger.info("=== ORDER SHEET WRITTEN | %d positions%s → %s ===",
+                total, f", {alertes} FLAGGED" if alertes else "", out)
+    logger.info(
+        "Take-profit is reported twice on purpose: 'TP pose' is what the "
+        "automated path would place (MM divergence with a 5%% floor, and the MM "
+        "screen returns 0 for ~92%% of names, so it lands on 5%%), 'TP config' "
+        "is RiskConfig.take_profit_pct at 20%%.  The backtest models NEITHER — "
+        "it holds every position for the full month."
+    )
+
+
 def run_flatten(args, cfg) -> None:
     """
     Close every position a universe owns and leave nothing behind.
@@ -1715,6 +1845,8 @@ def main() -> None:
         run_report(args, cfg)
     elif args.mode == "live-report":
         run_live_report(args, cfg)
+    elif args.mode == "orders":
+        run_orders(args, cfg)
     elif args.mode == "flatten":
         run_flatten(args, cfg)
     elif args.mode == "force-rebalance":
