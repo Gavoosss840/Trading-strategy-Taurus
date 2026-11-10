@@ -1,263 +1,295 @@
 # Taurus Strategy — Commandes
 
-## ⭐ LA COMMANDE — rebalancement mensuel
+> Document de référence du rebalancement mensuel.
+> Mis à jour pour l'**exécution manuelle** : l'algo produit une feuille d'ordres,
+> vous passez les ordres. Plus prudent que l'automatique, et c'est un filet que
+> le mode automatique n'a pas.
 
-Deux lignes, **identiques à chaque fois**, depuis la racine du projet (PowerShell) :
+---
+
+## ⭐ LE REBALANCEMENT MENSUEL — 3 étapes
+
+TWS ou IB Gateway doit tourner, API activée.
+
+### 1. Mettre à jour le code
 
 ```powershell
 git pull
 ```
 
+### 2. Produire la feuille d'ordres
+
 ```powershell
-python main.py --mode force-rebalance --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run | Tee-Object -FilePath "run_$(Get-Date -Format yyyy-MM-dd).log"
+python main.py --mode orders --nav 1000000 --from-ibkr --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk | Tee-Object -FilePath "orders_$(Get-Date -Format yyyy-MM-dd).log"
 ```
 
-C'est tout. Rien d'autre à lancer, aucun scheduler à laisser tourner.
+→ écrit `output/ordres_AAAA-MM-JJ.xlsx`
 
-### Ce que fait cette commande
+`--nav` est la valeur de votre compte, dans la devise de `--base-currency`
+(EUR par défaut). `--from-ibkr` lit vos positions réelles : **lecture seule**,
+aucun ordre n'est passé.
 
-1. Enregistre la performance réalisée du mois écoulé pour les 5 univers
-   → ajoutée à l'historique, **jamais écrasée**
-2. Recalcule la pondération Sharpe sur **tout** l'historique depuis l'inception, ce nouveau mois inclus
-3. Construit les portefeuilles : FF5 régional → screen MM → momentum → max-Sharpe → neutralisation bêta
-4. Place les ordres **sans levier** (exposition brute 100 % du NAV)
-5. Archive les positions dans `output/{univers}/snapshots/` (archive permanente datée)
-6. Sauvegarde l'intégralité du log dans `run_AAAA-MM-JJ.log`
+### 3. Lire la feuille, puis passer les ordres dans TWS
 
-### Quand la lancer
+Une feuille par univers, plus une feuille `Toutes positions` et un `Resume`.
 
-**N'importe quel jour.** L'algo détermine seul le mois à traiter :
+---
 
-| Jour du lancement | Mois enregistré |
+## La feuille d'ordres, colonne par colonne
+
+| colonne | à quoi elle sert |
 |---|---|
-| du 1er au 5 | le mois **précédent** |
-| du 6 à la fin | le mois **en cours** |
+| `Ticker` · `Societe` | le ticker Yahoo et le **vrai nom** de la société |
+| `Symbole IBKR` · `Place` | ce que vous cherchez dans TWS, et sur quelle place |
+| `Sens` | LONG ou SHORT |
+| **`Action`** | **NOUVELLE · RENFORCER · REDUIRE · INCHANGEE · RETOURNEMENT · SOLDER** |
+| **`A passer`** | **le nombre exact de titres à acheter (+) ou vendre (−)** |
+| `Ordre` | ACHAT ou VENTE |
+| `Titres actuels` · `Titres cibles` | l'existant et la cible, signés |
+| `Prix entree` · `Prix en EUR` | prix de marché, devise locale puis devise de base |
+| `Stop ordre` · `Stop ordre %` | **le stop à déposer** (−10 % de l'entrée) |
+| `Stop moniteur` | le niveau qu'utiliserait le moniteur automatique — **information**, pas un ordre |
+| `Prix cible` · `Potentiel %` | prix cible de la valorisation, **souvent vide** (voir plus bas) |
+| `Sans prix cible` | pourquoi il n'y a pas de cible sur cette ligne |
+| `Alerte` | ce qui demande votre attention |
 
-Lancer début de mois reste préférable : les signaux portent alors sur un mois complet.
+### Les six actions
 
-### Les 3 lignes à vérifier dans le log
+- **NOUVELLE** — rien de détenu, acheter la cible entière
+- **RENFORCER** / **REDUIRE** — même sens, ajuster de `A passer`
+- **INCHANGEE** — à moins d'un titre près, aucun ordre
+- **RETOURNEMENT** — le sens s'inverse : l'ordre passe par zéro et est **plus
+  gros que chacune des deux positions**. Signalé à part exprès
+- **SOLDER** — détenu mais sorti du signal : **fermer entièrement**
 
+### Le `Resume`
+
+Donne par univers le poids Sharpe, la NAV allouée, le brut déployé et le
+**cash conservé**. Un cash positif est **normal** : quand une contrainte mord
+(plafond de 8 % par position, plafond sectoriel, candidats insuffisants), le
+capital non déployé reste en cash plutôt que d'être réparti de force.
+
+---
+
+## Avant la première exécution : solder le CAC 40 et le FTSE 100
+
+Ces deux univers ont été retirés — ils rapportaient **moins que le cash** sur
+dix ans (Sharpe −0,44 et −0,23 contre un taux sans risque de 4,5 %). Leurs
+positions ne se ferment pas d'elles-mêmes.
+
+```powershell
+# 1. lire le plan, sans rien envoyer
+python main.py --mode flatten --universes cac40 ftse100
+
+# 2. exécuter
+python main.py --mode flatten --universes cac40 ftse100 --no-dry-run --live
 ```
-NAV allocation (global weights, 5 active universes): SP500=33.8%  NIKKEI225=26.7%  ...
-[sp500] Monthly return appended: 2026-09-30 → +X.XX%
-Beta neutralisation: β_L=..., β_S=... → net β=0.0000
+
+> **À faire AVANT que `stoxx_eur` ne trade.** Les deux univers partagent des
+> noms (AI.PA, BNP.PA, AIR.PA…) et seule l'attribution dans `RiskState`
+> permet de les distinguer. Après, l'ambiguïté s'installe.
+
+Le mode épargne les lignes attribuées à un autre univers et signale celles
+qu'il n'attribue à personne sans les fermer (`--include-untracked` pour les
+inclure).
+
+---
+
+## Recalibration trimestrielle
+
+```powershell
+python main.py --mode calibrate --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk
 ```
 
-⚠️ Si l'allocation affiche **20 % partout**, la pondération Sharpe n'a pas trouvé l'historique
-(`output/{univers}/monthly_returns.csv`) et est retombée sur l'équipondération de secours.
+→ écrit `taurus/calibration/valuation_AAAATQ.json`
 
-### Points de vigilance
+Ré-estime les paramètres de la jambe de valorisation (persistance du ROIC/ROE
+par secteur) sur les états financiers frais. **La procédure est figée dans le
+code, seuls les nombres bougent.**
+
+Chaque calibration est **datée** : un rebalancement n'utilise que la plus
+récente antérieure ou égale à sa date, donc les paramètres ne peuvent pas
+fuiter en arrière. Un paramètre qui bouge de plus de 0,25 en un trimestre
+**refuse de s'écrire** et affiche pourquoi — c'est presque toujours une panne
+de données, pas l'économie. `--force-calibration` pour accepter.
+
+---
+
+## Les univers
+
+`sp500` · `nasdaq100` · `nikkei225` · `stoxx_eur` · `stoxx_uk`
+
+| univers | valeurs | positions/jambe | ce qui limite |
+|---|---|---|---|
+| sp500 | 495 | 35 | la cible |
+| stoxx_eur | 289 | 35 | la cible |
+| nikkei225 | 129 | 32 | la taille |
+| stoxx_uk | 127 | 31 | la taille |
+| nasdaq100 | 95 | 23 | la taille |
+
+Le nombre de positions vient d'**une seule règle** :
+`min(n_target, taille × max_universe_fraction / 2)` = `min(35, taille × 0,25)`.
+Un univers ne diffère que par sa **largeur**, pas par un modèle propre.
+
+Disponible mais non activé : `stoxx_europe` (416 valeurs, EUR + Londres en un
+seul book multi-devises). **Ne pas le lancer en même temps que `stoxx_eur` /
+`stoxx_uk`** — mêmes noms, les books se disputeraient les lignes.
+
+Conservés dans le registre pour pouvoir être soldés : `cac40`, `ftse100`.
+
+---
+
+## Ce que fait le signal
+
+1. **Alpha FF5 régional** — régression 5 facteurs, t-stat de l'intercept (HC1)
+2. **Momentum** — 12 mois ajusté de la volatilité, saut du dernier mois
+3. **Véto crédit** — retire un candidat **long** sur : couverture d'intérêts
+   < 1,5 · perte d'exploitation avec dette · probabilité de défaut de Merton
+   > 20 %. Les prêteurs (banques, assureurs, foncières) sont exemptés des deux
+   premiers : les intérêts sont leur matière première
+4. **Dimensionnement max-Sharpe**, plafond absolu de 8 % par position
+5. **Neutralisation bêta par réduction** — la jambe la plus exposée est
+   réduite, jamais l'autre gonflée
+
+Bêta réalisé mesuré sur le book combiné : **−0,029** (t = −0,67), R² marché
+0,004.
+
+### La jambe de valorisation existe mais est désactivée
+
+Un modèle de résultat résiduel (Ohlson/Penman) est construit et calibré, avec
+une métrique par secteur choisie sur les données (ROIC ou ROE selon la
+persistance mesurée). **Il n'entre ni dans la sélection ni dans le
+take-profit**, pour deux raisons mesurées :
+
+- **en sélection** il coûte **−0,586 de Sharpe**, dégradation sur les cinq
+  univers. Il inverse le biais value/croissance du book, et la croissance a
+  dominé la décennie
+- **en prix cible** il est inutilisable : ancré sur les fonds propres
+  comptables, il ne peut pas atteindre les multiples que le marché paie pour
+  les sociétés à forte composante immatérielle (plafond ~1,2-1,6× le book
+  contre une médiane de 1,87× sur le CAC 40, 8,6× pour Safran). Les cibles
+  sortaient à −78 % sous l'entrée sur les longs
+
+C'est pourquoi la colonne `Prix cible` est souvent vide, avec le motif indiqué.
+
+---
+
+## Risk management
+
+### Appliqué à la construction
+
+| contrôle | valeur |
+|---|---|
+| levier brut | 1.00 (chaque jambe = 0,50 du NAV alloué) |
+| plafond par position | **8 %, absolu**, sans renormalisation |
+| plafond sectoriel | 80 %, honoré, le reste en cash |
+| plafond par univers | 35 % du NAV |
+| positions par jambe | règle de largeur ci-dessus |
+
+### Sorties — ⚠️ lire attentivement en exécution manuelle
+
+| protection | en manuel |
+|---|---|
+| stop −10 % par position | ✅ **si vous le déposez** depuis la colonne `Stop ordre` |
+| take-profit | ⚠️ +5 % seulement (défaut connu, rapport gain/risque inversé) |
+| trailing stop depuis le pic | ❌ **absent** |
+| stop ajusté de la volatilité | ❌ absent (le fichier l'indique, l'ordre est à −10 % fixe) |
+| **circuit breaker −15 % du portefeuille** | ❌ **absent** |
+
+Le moniteur de risque (trailing stop, circuit breaker, stop vol-ajusté) ne
+tourne que dans `--mode live`, la boucle permanente. **En exécution manuelle,
+vous n'avez que les stops individuels à −10 % et aucune protection au niveau
+du portefeuille.**
+
+---
+
+## Réserves sur les chiffres de backtest
+
+Performance combinée mesurée : **+17,35 %/an, Sharpe 1,99, maxDD −5,42 %,
+Calmar 3,20**. À lire avec trois réserves :
+
+1. **Biais du survivant** — les listes de constituants sont celles
+   d'aujourd'hui. La jambe zone euro affiche zéro année négative sur onze et un
+   Sortino presque double de son Sharpe : la queue de perte est tronquée.
+   **Attendez-vous à nettement moins que 1,99 en réel.**
+2. **Le backtest ne modélise ni stop ni take-profit** — il tient chaque
+   position un mois plein, alors que le système réel pose un stop à −10 %. Ce
+   sont deux stratégies différentes, et c'est le candidat le plus solide pour
+   expliquer un écart backtest/réel.
+3. **Biais factoriel non déclaré** — la sélection est longue croissance /
+   courte value (P/B médian 8,80 contre 2,29). Le Sharpe dépend d'un régime.
+
+---
+
+## Autres commandes
+
+### Rapport de performance
+
+```powershell
+python main.py --mode report --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk
+```
+
+### Vérifier les ordres de protection en cours
+
+```powershell
+python main.py --mode check-protective
+```
+
+### Corriger les STP/LMT après exécution
+
+```powershell
+# prévisualisation
+python main.py --mode refresh-protective --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk
+# application
+python main.py --mode refresh-protective --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk --no-dry-run
+```
+
+Recalcule stop-loss et take-profit depuis l'`avg_cost` IBKR réel. Ne touche
+jamais aux ordres MKT.
+
+### Backtest complet
+
+```powershell
+python main.py --mode backtest --universes sp500 nasdaq100 nikkei225 stoxx_eur stoxx_uk --start 2016-01-01 --end 2026-10-31
+```
+
+### Feuille d'ordres sans IBKR
+
+```powershell
+python main.py --mode orders --nav 1000000 --positions mes_positions.csv --universes ...
+```
+
+CSV à deux colonnes, `ticker` et `quantity` **signée** (positive = long,
+négative = short). Moins précis que `--from-ibkr` : un export ne porte pas la
+place de cotation, donc `SAN` est ambigu entre Sanofi (Paris) et Banco
+Santander (Madrid).
+
+---
+
+## Points de vigilance
 
 | | |
 |---|---|
-| **`--universes` est obligatoire** | sans lui, le défaut est `sp500` seul — les 4 autres univers resteraient figés |
-| **Pas de `--live`** | son absence = port 7497 = **compte démo**. L'ajouter bascule sur le compte réel (port 7496) |
-| **`--no-dry-run`** | sans lui, l'algo simule et ne passe aucun ordre |
-| **TWS / IB Gateway ouvert** | API activée, port 7497 |
-
-### Vérification dans IBKR après le lancement
-
-- **Exposition brute** ≈ 100 % du NAV
-- **Exposition nette** ≈ 0 % (bêta-neutre)
-- **Excess Liquidity** largement positif (marge Reg-T requise : 50 % du NAV)
-
-### Univers tradés
-
-`sp500` · `nasdaq100` · `cac40` · `ftse100` · `nikkei225`
-
-Ce sont les **seuls** univers du registre. Hang Seng et Tadawul ont été retirés :
-jamais tradés, aucun historique, donc Sharpe = 0 et allocation 0 %.
-
-Pour ajouter un univers, il faut d'abord lui constituer un historique
-(`--mode backtest`) — sinon il reste à 0 % pendant au moins `sharpe_min_months`.
+| **`--universes` est obligatoire** | sans lui, le défaut est `sp500` seul |
+| **`--nav` est obligatoire** en mode `orders` | sinon rien n'est dimensionné |
+| **Pas de `--live`** | son absence = port 7497 = compte démo. L'ajouter bascule sur le réel (7496) |
+| **`--no-dry-run`** | nécessaire pour que `flatten` passe réellement les ordres |
+| **TWS / IB Gateway ouvert** | API activée. Sans lui, `--from-ibkr` **interrompt** le run plutôt que de produire une feuille qui dirait « tout est nouveau » |
+| **Codes de place IBKR européens non vérifiés** | `SBF`, `IBIS`, `BVME`, `BM`, `AEB`, `ENEXT.BE`, `BVL`, `ISE`, `HEX`, `VSE`, `ATH` viennent de la documentation IBKR, non qualifiés contre un TWS réel. À vérifier avant le premier ordre sur un marché non encore tradé |
 
 ---
 
-## Correction des ordres STP/LMT après rebalancement
+## Vérification dans IBKR après exécution
 
-```bash
-# Prévisualisation (dry-run)
-python main.py --mode refresh-protective \
-  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
-
-# Application
-python main.py --mode refresh-protective \
-  --universes sp500 nasdaq100 ftse100 cac40 nikkei225 \
-  --no-dry-run
-```
-
-> Recalcule les niveaux stop-loss et take-profit depuis le `avg_cost` IBKR réel.
-> Ne touche **jamais** aux ordres MKT (entrées déjà placées).
-> À lancer si des STP/LMT semblent mal positionnés dans TWS.
-
----
-
-## Rapport de performance
-
-```bash
-python main.py --mode report \
-  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
-```
-
-> Génère tous les charts en ~3 secondes depuis les données stockées.
-> Fusionne automatiquement backtest + données live si `output/live/nav_history.csv` existe.
-> Aucune connexion IBKR ni téléchargement nécessaire.
-
-**Fichiers générés dans `output/` :**
-
-| Fichier | Description |
-|---------|-------------|
-| `report.png` | Rapport complet 1 page (table + equity curve + heatmap) |
-| `equity_curve.png` | Courbe de performance avec ligne de transition backtest→live |
-| `monthly_heatmap.png` | Heatmap des returns mensuels (backtest + cases live) |
-| `rolling_sharpe.png` | Sharpe ratio glissant 12 mois |
-| `positions.csv` | Positions actuelles tous univers |
-| `combined_analytics.json` | Stats détaillées JSON |
-| `{univers}/monthly_returns.csv` | Returns mensuels par univers |
-| `live/nav_history.csv` | Historique NAV live (1 ligne par rebalancement) |
-| `execution_{univers}_{date}.json` | Rapport d'exécution des ordres |
-
----
-
-## Backtest complet
-
-```bash
-python main.py --mode backtest \
-  --start 2020-01-01 --end 2026-05-29 \
-  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
-```
-
-> Durée : ~10-15 min (téléchargement EDGAR + yfinance + calcul).
-> Génère les `monthly_returns.csv` nécessaires pour `--mode report`.
-
----
-
-## Vérifier les ordres de protection en cours
-
-```bash
-python main.py --mode check-protective \
-  --universes sp500 nasdaq100 ftse100 cac40 nikkei225
-```
-
-> Liste tous les STP/LMT actifs et leur statut sans rien modifier.
-
----
-
-## Checklist mensuelle
-
-| Étape | Commande / Action |
-|-------|-------------------|
-| 1. Ouvrir TWS | Paper trading → vérifier la connexion (port 7497) |
-| 2. Mettre à jour | `git pull` |
-| 3. **Rebalancement** | `python main.py --mode force-rebalance --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run \| Tee-Object -FilePath "run_$(Get-Date -Format yyyy-MM-dd).log"` |
-| 4. Contrôler le log | allocation Sharpe ≠ 20 % partout · `Monthly return appended` présent · `net β=0.0000` |
-| 5. Vérifier TWS | ordres MKT dans le blotter · brut ≈ 100 % · net ≈ 0 % |
-| 6. Corriger STP/LMT | `python main.py --mode refresh-protective --universes sp500 nasdaq100 cac40 ftse100 nikkei225 --no-dry-run` |
-| 7. Rapport | `python main.py --mode report --universes sp500 nasdaq100 cac40 ftse100 nikkei225` |
-| 8. Ouvrir | `output/report.png` |
-
----
-
-## Ajouter une NAV manuelle dans l'historique live
-
-Si une NAV mensuelle est manquante (ex: mois de démarrage), l'ajouter dans
-`output/live/nav_history.csv` :
-
-```csv
-date,nav,currency,note,recorded_at
-2026-03-31,100000.00,USD,manual-baseline,2026-04-01T09:00:00
-2026-04-30,XXXXX.XX,USD,force-rebalance,2026-04-30T11:...
-```
-
-> La valeur NAV du 31 mars se trouve dans TWS → Account → Reports → Account Statement.
-
----
-
-## Vérifications avant lancement
-
-```bash
-# Tester la connexion IBKR + prix live (ex: LVMH)
-python -c "
-from ib_insync import IB, Stock
-ib = IB()
-ib.connect('127.0.0.1', 7497, clientId=99)
-contract = Stock('MC.PA', 'EURONEXT', 'EUR')
-ib.qualifyContracts(contract)
-ticker = ib.reqMktData(contract)
-ib.sleep(2)
-print('LVMH last price:', ticker.last)
-ib.disconnect()
-"
-
-# Tester yfinance
-python -c "import yfinance as yf; print(yf.Ticker('AAPL').info.get('marketCap', 'N/A'))"
-```
+- **exposition brute** ≈ 100 % du NAV moins le cash conservé (voir `Resume`)
+- **exposition nette** ≈ 0 % (bêta-neutre)
+- **Excess Liquidity** largement positif (marge Reg-T : 50 % du NAV)
 
 ---
 
 ## Git
 
-```bash
-# Récupérer les dernières mises à jour
-git pull origin claude/optimize-python-algorithm-dWMxq
-
-# Pousser ses modifications
-git add -A && git commit -m "message" && git push -u origin claude/optimize-python-algorithm-dWMxq
+```powershell
+git pull
+git log --oneline -10
 ```
-
----
-
-## Modes disponibles (référence complète)
-
-| Mode | Usage | Boucle infinie |
-|------|-------|:--------------:|
-| `force-rebalance` | **Rebalancement mensuel manuel** | Non — s'arrête seul |
-| `refresh-protective` | Corriger STP/LMT après rebalancement | Non — s'arrête seul |
-| `check-protective` | Inspecter les ordres de protection | Non — s'arrête seul |
-| `report` | Générer les charts (backtest + live) | Non — s'arrête seul |
-| `live-report` | Rapport live uniquement (NAV history) | Non — s'arrête seul |
-| `backtest` | Backtest complet (données historiques) | Non — s'arrête seul |
-| `snapshot` | Snapshot du portefeuille actuel | Non — s'arrête seul |
-| `live` | Daemon 24/7 automatique (pas utile en manuel) | **Oui — Ctrl+C pour stop** |
-
----
-
-## Paramètres clés (config.py)
-
-| Paramètre | Valeur | Description |
-|-----------|--------|-------------|
-| `ibkr_port` | 7497 | Paper trading (live = 7496) |
-| `stop_loss_pct` | 10% | Stop-loss par position (vol-ajusté si `vol_adjusted_stops=True`) |
-| `take_profit_pct` | 20% | Take-profit par position (ou divergence MM si disponible) |
-| `trailing_stop_pct` | 10% | Trailing stop depuis le pic |
-| `circuit_breaker_pct` | 15% | Coupe tout si portefeuille -15% depuis dernier rebalancement |
-| `lookback_months` | 60 | Fenêtre régression FF5/FF6 |
-| `optimizer_method` | `max_sharpe` | Optimiseur : tangency portfolio (max-Sharpe) |
-| `signal_method` | `binary` | Signal : AND-filter (alpha AND MM AND momentum) |
-| `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
-| `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
-| `cov_halflife` | 0 | Covariance Ledoit-Wolf (0 = pas d'EWMA) |
-| `gross_leverage` | **1.00** | Exposition brute = 100 % du NAV (chaque jambe à 50 %) |
-| `sharpe_window_months` | **0** | Pondération Sharpe **depuis l'inception** (0 = fenêtre expansive) |
-| `sharpe_min_months` | 6 | En dessous → équipondération de secours |
-| `max_universe_weight` | 0.35 | Plafond par univers (garde-fou, ne mord pas aujourd'hui) |
-
-### Pondération des univers
-
-Les poids sont proportionnels à `max(Sharpe, 0)`, calculés sur **tout** l'historique
-stocké dans `output/{univers}/monthly_returns.csv` — backtest 10 ans + chaque mois live
-ajouté depuis. Le mois écoulé est enregistré **avant** le calcul des poids, donc il compte
-dès le rebalancement en cours.
-
-Plus l'historique s'allonge, plus l'allocation devient stable : un mois de plus sur une
-base de 126 ne déplace les poids qu'à la marge.
-
-### Facteurs Fama-French par univers
-
-| Univers | Dataset Kenneth French |
-|---|---|
-| sp500 · nasdaq100 | `F-F_Research_Data_5_Factors_2x3` (US) |
-| cac40 · ftse100 | `Europe_5_Factors` |
-| nikkei225 | `Japan_5_Factors` |
-
-Le routage est automatique selon la région déclarée dans `UniverseConfig`.
