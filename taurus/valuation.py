@@ -452,7 +452,8 @@ def _latest(directory: Path, as_of: date, exclusive: bool = False):
     return best, json.loads(best.read_text())
 
 
-def load_calibration(as_of=None, directory: Optional[Path] = None) -> Optional[dict]:
+def load_calibration(as_of=None, directory: Optional[Path] = None,
+                     allow_future: bool = False) -> Optional[dict]:
     """
     The calibration a rebalance on `as_of` is entitled to see: the most recent
     one NOT LATER than that date.  Point-in-time by construction, so once a
@@ -473,7 +474,35 @@ def load_calibration(as_of=None, directory: Optional[Path] = None) -> Optional[d
         except Exception:
             logger.error("Cannot read %r as a date — no calibration loaded.", as_of)
             return None
-    path, calib = _latest(directory or CALIBRATION_DIR, as_of)
+    directory = directory or CALIBRATION_DIR
+    path, calib = _latest(directory, as_of)
+
+    if calib is None and allow_future:
+        # BACKTEST ONLY, and a deliberate look-ahead.
+        #
+        # Point-in-time loading is correct for live use, but it makes the
+        # valuation leg untestable on history until several years of quarterly
+        # calibrations exist: with one calibration dated today, every past
+        # rebalance correctly finds none, the leg stays inactive, and a
+        # with/without comparison returns a delta of exactly zero — which looks
+        # like "the signal adds nothing" and actually means "the signal never
+        # ran". That happened, and it is the only reason this escape hatch
+        # exists.
+        #
+        # Any result obtained this way uses parameters estimated AFTER the
+        # period they are applied to. It is an upper bound on what the leg can
+        # contribute, never an estimate of live performance.
+        futures = sorted(directory.glob("valuation_*.json"))
+        if futures:
+            import json as _json
+            path = futures[-1]
+            calib = _json.loads(path.read_text())
+            logger.warning(
+                "LOOK-AHEAD: no calibration existed on or before %s, so %s "
+                "(produced %s) is being used anyway. Parameters estimated after "
+                "the period they are applied to — a backtest upper bound, not a "
+                "performance estimate.", as_of, path.name, calib.get("as_of"))
+
     if calib is None:
         logger.warning("No calibration dated on or before %s — the valuation leg "
                        "is unavailable for this run.", as_of)

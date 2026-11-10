@@ -79,6 +79,12 @@ class TaurusConfig:
     # survived the sensitivity test, including across the full equity-risk-
     # premium range, so a rank is what it is allowed to express.
     use_valuation_in_signal: bool  = False
+    # BACKTEST ONLY. Lets a past rebalance use a calibration produced after it,
+    # because with a single calibration the leg never runs on history and a
+    # with/without comparison returns exactly zero — indistinguishable from "no
+    # effect". Results obtained with it are an upper bound, not an estimate.
+    # Must stay False for anything that trades.
+    valuation_allow_future_calibration: bool = False
     valuation_long_quantile: float = 0.50   # longs: divergence above this rank
     valuation_short_quantile: float = 0.50  # shorts: divergence below this rank
 

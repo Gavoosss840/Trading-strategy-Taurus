@@ -504,7 +504,10 @@ class TaurusStrategy:
         if key in cache:
             return cache[key]
 
-        calib = load_calibration(as_of)
+        calib = load_calibration(
+            as_of,
+            allow_future=getattr(cfg, "valuation_allow_future_calibration", False),
+        )
         if not calib:
             cache[key] = None
             return None
