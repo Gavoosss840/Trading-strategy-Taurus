@@ -900,13 +900,14 @@ def run_refresh_protective(args, cfg) -> None:
                 logger.warning("  No universe config for currency %s — skipping %s", currency, sym)
                 continue
 
-            from ib_insync import Stock, Order, LimitOrder
-            ibkr_sym  = sym.split(".")[0] if "." in sym else sym
-            contract  = Stock(ibkr_sym, ucfg.ibkr_exchange, ucfg.currency)
-            try:
-                conn.ib.qualifyContracts(contract)
-            except Exception:
-                pass
+            from ib_insync import Order, LimitOrder
+            # Use the LIVE position's own contract rather than rebuilding one
+            # from its symbol.  A rebuilt Stock(sym, exchange, currency) cannot
+            # tell two listings apart — "SAN" in EUR is both Sanofi (Paris) and
+            # Banco Santander (Madrid) — so a protective order could land on
+            # the wrong company.  The position already carries the exact
+            # contract IBKR filled it on, conId included.
+            contract = p.contract
 
             pos_qty       = abs(qty)
             protect_action = "SELL" if qty > 0 else "BUY"

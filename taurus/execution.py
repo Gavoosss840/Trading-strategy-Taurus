@@ -25,6 +25,32 @@ import pandas as pd
 from .config import TaurusConfig, UniverseConfig, DEFAULT_CONFIG
 from .data import normalise_quote_prices
 
+
+def _stock_contract(ticker: str, universe_cfg):
+    """
+    IBKR Stock contract for a Yahoo ticker.
+
+    Every call site used to build Stock(symbol, universe_exchange,
+    universe_currency) with the suffix stripped, which cannot tell two listings
+    apart: Stock("SAN", "SMART", "EUR") matches Sanofi (Paris) AND Banco
+    Santander (Madrid).  stoxx_eur holds SAN.PA and SAN.MC, plus UNI.MI and
+    UNI.MC, so four names collapsed onto two contracts and two of them would
+    have been traded as the wrong company.
+
+    primaryExchange disambiguates the listing; the currency comes from the
+    ticker's own market rather than the universe, which is what lets a universe
+    span several quote currencies.  A ticker with no suffix (US) resolves to the
+    universe currency and no primaryExchange, exactly as before.
+    """
+    from ib_insync import Stock
+    from .universe import ticker_market
+
+    sym, ccy, _minor, primary = ticker_market(ticker, universe_cfg)
+    if primary:
+        return Stock(sym, universe_cfg.ibkr_exchange, ccy,
+                     primaryExchange=primary)
+    return Stock(sym, universe_cfg.ibkr_exchange, ccy)
+
 logger = logging.getLogger(__name__)
 
 
@@ -434,10 +460,9 @@ class OrderManager:
 
         contracts, tmap = [], {}
         for t in tickers:
-            sym = t.split(".")[0] if "." in t else t
-            c = Stock(sym, universe_cfg.ibkr_exchange, universe_cfg.currency)
+            c = _stock_contract(t, universe_cfg)
             contracts.append(c)
-            tmap[sym] = t
+            tmap[c.symbol] = t
 
         _wrap = logging.getLogger("ib_insync.wrapper")
         _lvl = _wrap.level
@@ -496,10 +521,9 @@ class OrderManager:
         # Map ibkr_ticker → original ticker for price dict
         ticker_map: Dict[str, str] = {}
         for ticker in tickers:
-            ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
-            c = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
+            c = _stock_contract(ticker, universe_cfg)
             contracts.append(c)
-            ticker_map[ibkr_ticker] = ticker
+            ticker_map[c.symbol] = ticker
 
         # Qualify individually so one failed contract (Error 200) doesn't block others.
         # Suppress ib_insync's internal Error 200 warning during qualify — we handle failures ourselves.
@@ -650,7 +674,7 @@ class OrderManager:
             )
             return
 
-        contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
+        contract = _stock_contract(ticker, universe_cfg)
         try:
             conn.ib.qualifyContracts(contract)
         except Exception as e:
@@ -796,7 +820,7 @@ class OrderManager:
         try:
             # Strip Yahoo Finance exchange suffixes (.L, .PA, .T, .HK, .SR, etc.)
             ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
-            contract = Stock(ibkr_ticker, universe_cfg.ibkr_exchange, universe_cfg.currency)
+            contract = _stock_contract(ticker, universe_cfg)
 
             # Try to qualify with primary exchange; fall back to SMART if market is closed
             # (e.g. ENXTPA/LSE/TSEJ during overnight US session).
@@ -811,7 +835,8 @@ class OrderManager:
                     "qualifyContracts failed for %s on %s (conId=0) — retrying with SMART",
                     ibkr_ticker, universe_cfg.ibkr_exchange,
                 )
-                contract = Stock(ibkr_ticker, "SMART", universe_cfg.currency)
+                contract = _stock_contract(ticker, universe_cfg)
+                contract.exchange = "SMART"
                 conn.ib.qualifyContracts(contract)
 
             if bracket_mode:

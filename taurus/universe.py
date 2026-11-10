@@ -17,7 +17,7 @@ Each universe knows its own:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -33,6 +33,82 @@ from .data import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+#  Market metadata per Yahoo ticker suffix                                     #
+# --------------------------------------------------------------------------- #
+#
+# Every IBKR contract in this codebase used to be built as
+#
+#     Stock(symbol, universe_cfg.ibkr_exchange, universe_cfg.currency)
+#
+# i.e. with the suffix stripped off the Yahoo ticker and ONE currency for the
+# whole universe.  Two things break on that:
+#
+#   1. The symbol alone is ambiguous.  Stock("SAN", "SMART", "EUR") matches both
+#      Sanofi (Paris) and Banco Santander (Madrid) — both EUR.  stoxx_eur holds
+#      SAN.PA and SAN.MC, and UNI.MI and UNI.MC, so four names resolve to two
+#      contracts and two of them would be traded as the wrong company.
+#   2. A universe spanning several quote currencies cannot be expressed at all.
+#
+# primaryExchange is what disambiguates a listing, so it is derived here from
+# the suffix, which is static and reliable — unlike Yahoo's `.info` currency,
+# which needs a network call and distinguishes pence from pounds by case alone.
+#
+# The minor-unit factor is how many quote units make one major currency unit:
+# the LSE quotes in GBp, so 100 pence per pound.
+#
+# CAUTION: the IBKR exchange codes below come from IBKR's documented list and
+# have NOT been verified against a live TWS session from here.  Qualify them
+# against the account before the first real order on a new market.
+SUFFIX_MARKET: Dict[str, Tuple[str, float, str]] = {
+    ".L":  ("GBP", 100.0, "LSE"),        # London — quoted in GBp (pence)
+    ".PA": ("EUR",   1.0, "SBF"),        # Euronext Paris
+    ".AS": ("EUR",   1.0, "AEB"),        # Euronext Amsterdam
+    ".BR": ("EUR",   1.0, "ENEXT.BE"),   # Euronext Brussels
+    ".LS": ("EUR",   1.0, "BVL"),        # Euronext Lisbon
+    ".IR": ("EUR",   1.0, "ISE"),        # Euronext Dublin
+    ".DE": ("EUR",   1.0, "IBIS"),       # Xetra
+    ".MI": ("EUR",   1.0, "BVME"),       # Borsa Italiana
+    ".MC": ("EUR",   1.0, "BM"),         # BME Madrid
+    ".HE": ("EUR",   1.0, "HEX"),        # Nasdaq Helsinki
+    ".VI": ("EUR",   1.0, "VSE"),        # Wiener Börse
+    ".AT": ("EUR",   1.0, "ATH"),        # Athens
+    ".T":  ("JPY",   1.0, "TSEJ"),       # Tokyo
+}
+
+
+def ticker_market(
+    ticker: str,
+    universe_cfg=None,
+) -> Tuple[str, str, float, str]:
+    """
+    Resolve a Yahoo ticker to its IBKR contract identity.
+
+    Returns (ibkr_symbol, quote_currency, minor_units_per_major, primary_exchange).
+
+    A ticker with no suffix, or an unknown one, falls back to the universe's own
+    currency and an empty primaryExchange — i.e. exactly the previous behaviour,
+    so US universes are unaffected.
+    """
+    if "." in ticker:
+        sym, _, suf = ticker.partition(".")
+        suffix = "." + suf
+    else:
+        sym, suffix = ticker, ""
+
+    spec = SUFFIX_MARKET.get(suffix)
+    if spec is None:
+        ccy = getattr(universe_cfg, "currency", "USD") if universe_cfg else "USD"
+        minor = float(getattr(universe_cfg, "nav_scale", 1.0) or 1.0) if universe_cfg else 1.0
+        if suffix:
+            logger.debug("No market metadata for suffix %r (%s) — using %s.",
+                         suffix, ticker, ccy)
+        return sym, ccy, minor, ""
+
+    ccy, minor, primary = spec
+    return sym, ccy, minor, primary
 
 
 def _download_ff5_region(dataset_name: str, start: str, end: str):
