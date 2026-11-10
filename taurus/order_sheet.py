@@ -193,6 +193,138 @@ def load_current_positions(
     return {}, "none"
 
 
+def load_positions_from_ibkr(
+    cfg: TaurusConfig,
+    universe: Optional[str] = None,
+) -> Tuple[Dict[str, float], Dict[str, str], str]:
+    """
+    Read what is held straight from IBKR. READ-ONLY: it reads positions and
+    disconnects, it never places, modifies or cancels anything.
+
+    More accurate than any export, and for one reason beyond freshness: an
+    IBKR position carries its full CONTRACT, so currency and primary exchange
+    come with it. A CSV gives only "SAN", which is Sanofi in Paris and Banco
+    Santander in Madrid; the contract says which. That matters most on a line
+    telling you to close a position entirely.
+
+    Returns {bare symbol: signed quantity}, {bare symbol: full Yahoo ticker}
+    for the ones that could be resolved, and a description of the source.
+    """
+    from .universe import REGISTRY, ticker_market, _FALLBACKS
+
+    try:
+        from .execution import IBKRConnection
+    except Exception as e:
+        logger.error("IBKR layer unavailable (%s) — cannot read positions.", e)
+        return {}, {}, "IBKR unavailable"
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot reach IBKR TWS/Gateway — is it running, and is the "
+                     "API enabled? No positions read.")
+        return {}, {}, "IBKR unreachable"
+
+    try:
+        brutes = conn.ib.positions(account=conn.cfg.ibkr_account or "")
+    except Exception as e:
+        logger.error("Reading positions from IBKR failed: %s", e)
+        brutes = []
+    finally:
+        try:
+            conn.ib.disconnect()
+        except Exception:
+            pass
+
+    brutes = [p for p in brutes if getattr(p, "position", 0)]
+    if not brutes:
+        logger.info("IBKR reports no open position.")
+        return {}, {}, "IBKR (no position)"
+
+    ucfg = REGISTRY.get(universe).config if universe else None
+    # Candidats de cet univers, indexes par (symbole nu, devise de cotation)
+    candidats: Dict[Tuple[str, str], List[str]] = {}
+    if universe:
+        for t in _FALLBACKS.get(universe, []):
+            sym, ccy, _m, _px = ticker_market(t, ucfg)
+            candidats.setdefault((sym, ccy), []).append(t)
+
+    # Les positions sont indexees sur le TICKER COMPLET, jamais sur le symbole
+    # nu. Deux cotations du meme symbole coexistent dans un portefeuille —
+    # Sanofi (SAN/EUR/SBF) et Banco Santander (SAN/EUR/BM) — et une cle nue
+    # fait que la seconde ECRASE la premiere : la feuille annoncerait la
+    # quantite de l'une sous le nom de l'autre, et l'autre disparaitrait sans
+    # un mot. C'est le defaut qui a failli etre livre.
+    pos: Dict[str, float] = {}
+    plein: Dict[str, str] = {}
+    hors, ambigus, collisions = [], [], []
+    for p in brutes:
+        c = p.contract
+        sym = str(getattr(c, "symbol", "") or "")
+        ccy = str(getattr(c, "currency", "") or "")
+        place = str(getattr(c, "primaryExchange", "") or "")
+        if not sym:
+            continue
+
+        if universe:
+            choix = candidats.get((sym, ccy), [])
+            if not choix:
+                hors.append(f"{sym}/{ccy}")
+                continue                      # appartient a un autre univers
+            if len(choix) > 1:
+                # Deux cotations du meme symbole dans la meme devise : seule la
+                # place les separe. Sans elle on n'invente pas.
+                par_place = [t for t in choix
+                             if ticker_market(t, ucfg)[3] == place]
+                if len(par_place) == 1:
+                    choix = par_place
+                else:
+                    ambigus.append(f"{sym}/{ccy}" + (f"@{place}" if place else ""))
+                    cle = f"{sym}@{place}" if place else sym
+                    if cle in pos:
+                        collisions.append(cle)
+                    pos[cle] = pos.get(cle, 0.0) + float(p.position)
+                    continue
+            # Un seul candidat ne suffit PAS a conclure : si la position vient
+            # d'une autre place, c'est une autre societe qui porte le meme
+            # symbole dans la meme devise. Sans ce controle, Banco Santander
+            # (SAN/EUR/BM) etait agrege dans Sanofi (SAN/EUR/SBF) des que
+            # l'univers ne listait que Sanofi — et la quantite affichee devenait
+            # la somme des deux.
+            attendue = ticker_market(choix[0], ucfg)[3]
+            if place and attendue and place != attendue:
+                hors.append(f"{sym}/{ccy}@{place}")
+                continue
+            cle = choix[0]
+            plein[cle] = choix[0]
+        else:
+            cle = f"{sym}@{place}" if place else sym
+
+        if cle in pos:
+            # Deux lignes IBKR sur le MEME contrat : on additionne plutot que
+            # d'en perdre une, et on le signale.
+            collisions.append(cle)
+            pos[cle] = pos[cle] + float(p.position)
+        else:
+            pos[cle] = float(p.position)
+
+    logger.info("IBKR: %d position(s) read%s, %d resolved to a full ticker.",
+                len(pos), f" for {universe}" if universe else "", len(plein))
+    if hors:
+        logger.debug("Not in %s: %s", universe, ", ".join(sorted(hors)[:12]))
+    if collisions:
+        logger.warning(
+            "%d contract(s) appeared more than once in the IBKR positions and "
+            "their quantities were SUMMED: %s. Check them — a contract should "
+            "normally appear once.", len(collisions), ", ".join(sorted(set(collisions))))
+    if ambigus:
+        logger.warning(
+            "%d position(s) match several listings of the same symbol in the "
+            "same currency and the primary exchange did not separate them, so "
+            "their company name is left blank: %s. Check what they are before "
+            "acting on their line.", len(ambigus), ", ".join(sorted(ambigus)))
+    return pos, plein, "IBKR"
+
+
 def _vol_stop_pct(returns: pd.DataFrame, ticker: str, rcfg: RiskConfig) -> float:
     """
     The level the risk monitor would cut at, which is NOT the level the resting
@@ -224,6 +356,7 @@ def build_rows(
     factors: Optional[pd.DataFrame] = None,
     as_of=None,
     current: Optional[Dict[str, float]] = None,
+    current_full: Optional[Dict[str, str]] = None,
 ) -> List[dict]:
     """One row per position for a single universe."""
     ucfg = REGISTRY.get(universe).config
@@ -329,7 +462,12 @@ def build_rows(
             # Cible signee : un short est une quantite negative, comme IBKR la
             # rapporte, pour que le delta se calcule sans ambiguite de signe.
             cible_titres = shares if side == "LONG" else -shares
-            actuel = float((current or {}).get(sym, 0.0))
+            # Par TICKER COMPLET d'abord : c'est la cle que la lecture IBKR
+            # produit, et la seule qui distingue deux cotations du meme
+            # symbole. Le symbole nu reste accepte pour un CSV ou le registre
+            # interne, qui ne portent pas la place de cotation.
+            cur = current or {}
+            actuel = float(cur.get(ticker, cur.get(sym, 0.0)))
             delta = cible_titres - actuel
             if actuel == 0:
                 action = "NOUVELLE"
@@ -391,9 +529,15 @@ def build_rows(
     # meme defaut que l'absence de mode flatten au niveau de l'univers, mais
     # ligne par ligne.
     if current:
-        vises = {ticker_market(t, ucfg)[0] for _, w in legs for t in w.index}
-        sortants = {sym: q for sym, q in current.items()
-                    if sym not in vises and abs(q) >= 1}
+        # On compare sur les DEUX formes, parce que `current` peut etre indexe
+        # par ticker complet (lecture IBKR) ou par symbole nu (CSV, registre).
+        vises = set()
+        for _, w in legs:
+            for t in w.index:
+                vises.add(t)
+                vises.add(ticker_market(t, ucfg)[0])
+        sortants = {k: q for k, q in current.items()
+                    if k not in vises and abs(q) >= 1}
         if sortants:
             # Le nom ne peut PAS etre cherche sur le symbole nu. Une position
             # IBKR ne porte que "AI", et interroger "AI" renvoie C3.ai, une
@@ -406,10 +550,19 @@ def build_rows(
             vers_complet = {}
             for t in _FALLBACKS.get(universe, []):
                 vers_complet.setdefault(ticker_market(t, ucfg)[0], t)
-            complets = {sym: vers_complet.get(sym) for sym in sortants}
+            # La resolution faite par IBKR a partir du contrat prime sur celle
+            # deduite de la liste : elle vient de la devise et de la place
+            # reelles de la position, pas d'une correspondance de symbole.
+            def _resoudre(k: str) -> Optional[str]:
+                # La cle est deja un ticker complet quand elle vient d'IBKR.
+                if "." in k and k in vers_complet.values():
+                    return k
+                base = k.split("@")[0]
+                return (current_full or {}).get(k) or vers_complet.get(base)
+            complets = {k: _resoudre(k) for k in sortants}
             a_chercher = [c for c in complets.values() if c]
             noms_s = _company_names(a_chercher) if a_chercher else {}
-            inconnus = [s_ for s_, c in complets.items() if not c]
+            inconnus = [k for k, c in complets.items() if not c]
             if inconnus:
                 logger.warning(
                     "[%s] %d position(s) to close are not in this universe's "
@@ -418,10 +571,11 @@ def build_rows(
                     universe, len(inconnus), ", ".join(sorted(inconnus)))
             logger.info("[%s] %d position(s) to CLOSE — out of the target: %s",
                         universe, len(sortants), ", ".join(sorted(sortants)))
-            for sym, q in sorted(sortants.items()):
-                plein = complets.get(sym)
+            for cle, q in sorted(sortants.items()):
+                plein = complets.get(cle)
+                sym = cle.split("@")[0]
                 rows.append({
-                    "Ticker":         plein or sym,
+                    "Ticker":         plein or cle,
                     "Societe":        noms_s.get(plein, "") if plein else "",
                     "Univers":        universe,
                     "Sens":           "LONG" if q > 0 else "SHORT",

@@ -47,6 +47,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--from-ibkr", action="store_true",
+                   help="orders: read the held positions from IBKR instead of a "
+                        "file. READ-ONLY — it reads and disconnects, it never "
+                        "places an order. More accurate than an export: the "
+                        "position carries its contract, so currency and primary "
+                        "exchange disambiguate symbols like SAN (Sanofi in "
+                        "Paris, Banco Santander in Madrid).")
     p.add_argument("--positions", default=None,
                    help="orders: CSV of what you currently hold (columns ticker "
                         "and quantity, signed). Without it the sheet falls back "
@@ -1333,7 +1340,8 @@ def run_orders(args, cfg) -> None:
     from datetime import date
     from pathlib import Path
     from taurus.order_sheet import (build_rows, write_workbook,
-                                    load_current_positions)
+                                    load_current_positions,
+                                    load_positions_from_ibkr)
     from taurus.risk import RiskConfig
     from taurus.scheduler import sharpe_allocation_weights
     from taurus.strategy import TaurusStrategy
@@ -1414,10 +1422,22 @@ def run_orders(args, cfg) -> None:
             continue
 
         nav_uni = nav * weights.get(name, 0.0)
-        courant, source = load_current_positions(
-            getattr(args, "positions", None), universe=name)
+        courant_plein = {}
+        if getattr(args, "from_ibkr", False):
+            courant, courant_plein, source = load_positions_from_ibkr(
+                ucfg_cfg, universe=name)
+            if source in ("IBKR unreachable", "IBKR unavailable"):
+                logger.error(
+                    "[%s] Positions NOT read from IBKR. The sheet would report "
+                    "every line as NEW and would not tell you what to close, "
+                    "which is worse than no sheet — aborting. Start TWS, or "
+                    "pass --positions <file.csv>.", name)
+                return
+        else:
+            courant, source = load_current_positions(
+                getattr(args, "positions", None), universe=name)
         rows = build_rows(
-            current=courant,
+            current=courant, current_full=courant_plein,
             universe=name, snapshot=snap, returns=strat._returns,
             nav_base=nav_uni, base_currency=base_ccy,
             cfg=ucfg_cfg, rcfg=rcfg,
