@@ -46,7 +46,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--include-untracked", action="store_true",
+                   help="flatten: also close positions matching the universe that "
+                        "RiskState attributes to no universe (opened before "
+                        "attribution tracking). Off by default.")
     p.add_argument("--start",   default="2015-01-01", help="Back-test start date (YYYY-MM-DD)")
     p.add_argument("--end",     default="2024-12-31", help="Back-test / snapshot end date")
     p.add_argument("--output",  default="output",     help="Output directory")
@@ -1213,6 +1217,186 @@ def run_check_protective(args, cfg) -> None:
     logger.info("Report saved → %s (.txt / .json)", base)
 
 
+def run_flatten(args, cfg) -> None:
+    """
+    Close every position a universe owns and leave nothing behind.
+
+    For retiring a universe.  A force-rebalance cannot do this: it rebalances
+    INTO new positions, so a universe dropped from --universes simply keeps its
+    old lines open and untracked for ever.
+
+    Why this does not reuse execute_rebalance with an empty target
+    --------------------------------------------------------------
+    execute_rebalance decides what it manages from `untracked_live`, which is
+    filtered by CURRENCY.  cac40 and stoxx_eur are both EUR and overlap heavily
+    by name (AI.PA, AIR.PA, BNP.PA ...), so flattening one that way could close
+    the other's positions.  Neither currency nor the ticker list can separate
+    them; only RiskState's per-position `universe` attribution can.
+
+    So ORDER MATTERS: flatten a universe BEFORE its replacement ever trades.
+    Run it with --dry-run first and read the plan.
+
+    What it closes
+    --------------
+      (a) every live position RiskState attributes to this universe
+      (b) with --include-untracked, live positions in this universe's currency
+          whose symbol matches its ticker list and that RiskState attributes to
+          NO universe (positions opened before attribution tracking)
+
+    Orders are placed on the live position's OWN IBKR contract, never on a
+    contract rebuilt from the Yahoo ticker — "SAN.PA" resolves to SAN, which is
+    Banco Santander, not Sanofi.  Closing orders are plain MKT with no
+    protective bracket: a flattened universe must leave no resting orders.
+
+    Usage:
+      python main.py --mode flatten --universes cac40 ftse100            # plan
+      python main.py --mode flatten --universes cac40 ftse100 --no-dry-run --live
+    """
+    from ib_insync import MarketOrder
+    from taurus.execution import IBKRConnection, OrderManager
+    from taurus.risk import RiskManager, RiskConfig
+    from taurus.universe import REGISTRY, _FALLBACKS
+
+    universes = args.universes
+    dry_run   = cfg.dry_run
+
+    if not universes:
+        logger.error("--mode flatten requires --universes.")
+        return
+
+    logger.info(
+        "=== FLATTEN | universes=%s | %s | dry_run=%s ===",
+        universes, "LIVE" if args.live else "PAPER", dry_run,
+    )
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot connect to IBKR TWS/Gateway. Is TWS/IB Gateway running?")
+        return
+
+    order_mgr = OrderManager()
+    rm        = RiskManager(RiskConfig())
+
+    def _bare(sym: str) -> str:
+        return sym.split(".")[0] if "." in sym else sym
+
+    try:
+        live = conn.ib.positions(account=conn.cfg.ibkr_account or "")
+        live = [p for p in live if p.position != 0]
+        if not live:
+            logger.info("No open positions on the account — nothing to flatten.")
+            return
+
+        attributed = {t: p.universe for t, p in rm.state.positions.items()}
+        total_closed, total_skipped = 0, 0
+
+        for uni in universes:
+            try:
+                ucfg = REGISTRY.get(uni).config
+            except Exception as e:
+                logger.error("[%s] Unknown universe (%s) — skipped.", uni, e)
+                continue
+
+            own_bare = {_bare(t) for t in _FALLBACKS.get(uni, [])}
+            owned_by_uni = {_bare(t) for t, u in attributed.items() if u == uni}
+            owned_by_other = {_bare(t): u for t, u in attributed.items() if u != uni}
+
+            targets, untracked = [], []
+            for p in live:
+                sym = _bare(p.contract.symbol)
+                if sym in owned_by_uni:
+                    targets.append(p)
+                elif (p.contract.currency == ucfg.currency
+                      and sym in own_bare
+                      and sym not in owned_by_other):
+                    untracked.append(p)
+
+            # Loud guard: another universe holding names this one also lists is
+            # exactly the ambiguity RiskState exists to resolve.
+            overlap = {s: u for s, u in owned_by_other.items() if s in own_bare}
+            if overlap:
+                logger.warning(
+                    "[%s] %d name(s) in this universe's list are attributed to "
+                    "another universe and will NOT be touched: %s",
+                    uni, len(overlap),
+                    ", ".join(f"{s}->{u}" for s, u in sorted(overlap.items())[:10]),
+                )
+
+            if untracked and not getattr(args, "include_untracked", False):
+                logger.warning(
+                    "[%s] %d position(s) match this universe but RiskState "
+                    "attributes them to nobody — NOT closed.  Re-run with "
+                    "--include-untracked to close them: %s",
+                    uni, len(untracked),
+                    ", ".join(sorted(_bare(p.contract.symbol) for p in untracked)),
+                )
+                total_skipped += len(untracked)
+            elif untracked:
+                logger.info("[%s] including %d untracked position(s).",
+                            uni, len(untracked))
+                targets.extend(untracked)
+
+            if not targets:
+                logger.info("[%s] Nothing to close.", uni)
+                continue
+
+            syms = {p.contract.symbol for p in targets}
+            logger.info("[%s] Closing %d position(s): %s",
+                        uni, len(targets), ", ".join(sorted(syms)))
+
+            # Resting STP/LMT must go first, or they fire against the close.
+            if not dry_run:
+                order_mgr.cancel_all_orders_for_tickers(conn, syms, dry_run=False)
+                conn.ib.sleep(1.5)
+
+            for p in targets:
+                qty    = abs(p.position)
+                action = "SELL" if p.position > 0 else "BUY"
+                logger.info("    %-10s %-4s %-12g  (position %+g, %s)",
+                            p.contract.symbol, action, qty, p.position,
+                            p.contract.currency)
+                if dry_run:
+                    continue
+                try:
+                    trade = conn.ib.placeOrder(p.contract, MarketOrder(action, qty))
+                    conn.ib.sleep(0.4)
+                    if trade is None:
+                        logger.error("    %s: placeOrder returned nothing.",
+                                     p.contract.symbol)
+                        continue
+                    total_closed += 1
+                    rm.state.positions.pop(p.contract.symbol, None)
+                    for t in list(rm.state.positions):
+                        if _bare(t) == _bare(p.contract.symbol):
+                            rm.state.positions.pop(t, None)
+                except Exception as e:
+                    logger.error("    %s: close FAILED (%s) — still open.",
+                                 p.contract.symbol, e)
+
+            if dry_run:
+                total_closed += len(targets)
+
+        if not dry_run and total_closed:
+            rm.state.save()
+            logger.info("RiskState updated — %d position(s) de-registered.",
+                        total_closed)
+
+        logger.info(
+            "=== FLATTEN %s | %d position(s) %s%s ===",
+            "PLAN" if dry_run else "DONE", total_closed,
+            "would be closed" if dry_run else "closed",
+            f", {total_skipped} skipped as untracked" if total_skipped else "",
+        )
+        if dry_run:
+            logger.info("Dry run — no orders sent.  Re-run with --no-dry-run "
+                        "--live to execute.")
+    finally:
+        try:
+            conn.ib.disconnect()
+        except Exception:
+            pass
+
+
 def run_force_rebalance(args, cfg) -> None:
     """
     Force-rebalance specific universe(s) NOW, bypassing the end-of-month check.
@@ -1530,6 +1714,8 @@ def main() -> None:
         run_report(args, cfg)
     elif args.mode == "live-report":
         run_live_report(args, cfg)
+    elif args.mode == "flatten":
+        run_flatten(args, cfg)
     elif args.mode == "force-rebalance":
         run_force_rebalance(args, cfg)
     elif args.mode == "check-protective":
