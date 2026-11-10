@@ -71,7 +71,13 @@ class TaurusConfig:
     #  Capital structure  (MM screen)                                     #
     # ------------------------------------------------------------------ #
     leverage_gap_threshold: float = 0.25     # 25 % divergence to flag
-    min_interest_coverage:  float = 1.5      # IC below → always flag overleveraged
+    # ── Credit veto (what the MM module is actually for) ────────────────── #
+    # MM cannot value a business — it takes the price as an input — but it can
+    # read a balance sheet. These three thresholds drive credit_risk, a veto on
+    # the long leg, not a score.
+    min_interest_coverage:  float = 1.5      # EBIT / interest below → fragile
+    max_prob_default:       float = 0.20     # Merton 1-year PD above → fragile
+    veto_credit_risk_longs: bool  = True     # exclude flagged names from longs
     industry_distress_costs: bool = False    # Sector-specific distress rates (vs flat 20%)
     variable_credit_spread:  bool = False    # Leverage-based spread (vs flat +2%)
 

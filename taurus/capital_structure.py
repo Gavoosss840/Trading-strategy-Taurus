@@ -293,8 +293,31 @@ def mm_capital_structure_screen(
     result_df = pd.DataFrame(rows).set_index("ticker")
 
     # ── Flags ─────────────────────────────────────────────────────────────── #
-    result_df["underleveraged"] = result_df["divergence_pct"] >  threshold
-    result_df["overleveraged"]  = result_df["divergence_pct"] < -threshold
+    # ── Valuation flags: retired ─────────────────────────────────────────── #
+    # These two used to feed the stock selection as the "valuation leg".  They
+    # cannot: VU is backed out of the market price (VU = market_cap + net_debt
+    # - pv_tax_shield), so substituting it collapses the whole expression to
+    #
+    #     divergence = -(pv_distress + pv_agency) / market_cap
+    #
+    # verified against the code to 1.4e-14.  The market cap cancels, the tax
+    # shield cancels, and both surviving terms are non-negative by
+    # construction — so divergence is ALWAYS <= 0 and "underleveraged" can
+    # never fire.  Measured on the S&P 500: 0 times out of 482, and the
+    # divergence runs from -0.00% to -1.32% on current data.
+    #
+    # Removing the screen from the selection entirely moves the Sharpe by
+    # exactly 0.00 on all four universes, which is the empirical form of the
+    # same statement.  It was harmless only by accident: "overleveraged" fires
+    # on 9.3% of names, just under the 10% activation threshold in
+    # _binary_signal, so one threshold crossing away from forcing the short leg
+    # into the most distressed names with nothing to signal it.
+    #
+    # MM keeps the job it can actually do — a CREDIT VETO, below — while the
+    # valuation leg is rebuilt on an estimate of operating value that does not
+    # take the price as an input (taurus/valuation.py).
+    result_df["underleveraged"] = False
+    result_df["overleveraged"]  = False
 
     # Interest coverage guard — impute the same coupon the valuation uses so a
     # debt-carrying firm with unreported interest can't dodge the check, and
@@ -305,12 +328,49 @@ def mm_capital_structure_screen(
     )
     ic = (df["ebit"] / _imputed_interest.where(_imputed_interest > 0)
           ).reindex(result_df.index).fillna(np.inf)
-    result_df["ic_ratio"]    = ic
-    result_df["overleveraged"] |= (ic < cfg.min_interest_coverage)
+    result_df["ic_ratio"] = ic
     _neg_ebit_with_debt = (
         (df["ebit"] < 0) & (df["total_debt"] > 0)
     ).reindex(result_df.index).fillna(False)
-    result_df["overleveraged"] |= _neg_ebit_with_debt
+
+    # ── Credit veto ──────────────────────────────────────────────────────── #
+    # What MM can legitimately say.  Not "this business is mispriced" — it
+    # takes the price as an input — but "this balance sheet is fragile", from
+    # three independent readings: interest cover, operating losses carried
+    # against debt, and the Merton default probability.  The flag is a VETO on
+    # the long leg and a qualifier on the short leg, never a score.
+    #
+    # ebit is now EBIT and no longer EBITDA (it was matched by substring
+    # against "Normalized EBITDA", 1.08x to 1.55x larger), so the coverage
+    # ratio tightens on its own and this filter bites where it did not.
+    # Interest cover does not apply to lenders.  A bank's interest expense is
+    # the cost of its raw material, not a solvency warning: EBIT / interest is
+    # structurally low for every bank in existence, so the test flags the whole
+    # sector and would quietly bar it from the long leg.  Insurers and REITs
+    # carry structurally high leverage for the same kind of reason.  Those
+    # sectors are screened on the Merton default probability alone, which reads
+    # equity value against the debt barrier and stays meaningful for them.
+    _sector = (df["sector"].reindex(result_df.index).fillna("Unknown")
+               if "sector" in df.columns
+               else pd.Series("Unknown", index=result_df.index))
+    _lender = _sector.isin(["Financial Services", "Financials", "Banks",
+                            "Insurance", "Real Estate"])
+
+    _ic_fail  = (ic < cfg.min_interest_coverage) & ~_lender
+    _loss_debt = _neg_ebit_with_debt & ~_lender
+    _pd_high = (result_df["prob_default"]
+                > getattr(cfg, "max_prob_default", 0.20)).fillna(False)
+
+    result_df["credit_risk"] = _ic_fail | _loss_debt | _pd_high
+    result_df["credit_veto_reason"] = np.where(
+        _loss_debt, "operating loss with debt",
+        np.where(_ic_fail, "interest cover",
+                 np.where(_pd_high, "default probability", "")),
+    )
+
+    # Kept for callers that still read it; the short leg may use it as a
+    # qualifier, but nothing scores on it any more.
+    result_df["overleveraged"] = result_df["credit_risk"]
 
     n_under = result_df["underleveraged"].sum()
     n_over  = result_df["overleveraged"].sum()

@@ -252,6 +252,41 @@ class TaurusStrategy:
                 alpha_df, mm_df, mom_df, as_of, cfg
             )
 
+        # ── 5b. Credit veto on the long leg ──────────────────────────────── #
+        # The MM module no longer scores anything; what it can read is balance
+        # sheet fragility (interest cover, operating losses against debt,
+        # Merton default probability).  Applied as a VETO: a fragile name is
+        # removed from the long candidates, never promoted into the shorts —
+        # scoring on it is what the retired valuation flags did wrong, and
+        # shorting distressed names into a rally is how the old short filter
+        # would have cost money had its 9.3% flag rate crossed the 10%
+        # activation threshold.
+        if (getattr(cfg, "veto_credit_risk_longs", True)
+                and not mm_df.empty and "credit_risk" in mm_df.columns):
+            fragile = mm_df.index[mm_df["credit_risk"].fillna(False)]
+            bloques = long_final.intersection(fragile)
+            if len(bloques):
+                restants = long_final.difference(fragile)
+                # Never empty the leg on a veto: a filter that can zero the
+                # book is a worse failure than the risk it screens for.
+                if len(restants) >= max(3, cfg.n_longs // 4):
+                    raisons = {}
+                    if "credit_veto_reason" in mm_df.columns:
+                        raisons = mm_df.loc[bloques, "credit_veto_reason"].to_dict()
+                    logger.info(
+                        "[%s] Credit veto removed %d long candidate(s): %s",
+                        as_of.date(), len(bloques),
+                        ", ".join(f"{t}({raisons.get(t, '')})"
+                                  for t in list(bloques)[:8]),
+                    )
+                    long_final = restants
+                else:
+                    logger.warning(
+                        "[%s] Credit veto would leave only %d long candidate(s) "
+                        "of %d — not applied.", as_of.date(), len(restants),
+                        len(long_final),
+                    )
+
         logger.info(
             "[%s] Signal (%s): %d long candidates, %d short candidates.",
             as_of.date(), signal_method, len(long_final), len(short_final),
