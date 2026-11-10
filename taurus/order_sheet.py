@@ -118,6 +118,81 @@ def _last_prices(tickers: List[str]) -> Dict[str, float]:
     return out
 
 
+def load_current_positions(
+    path: Optional[str] = None,
+    universe: Optional[str] = None,
+) -> Tuple[Dict[str, float], str]:
+    """
+    Signed share count per ticker for what is CURRENTLY held, and where it
+    came from.
+
+    Without this the sheet cannot tell a new position from an adjustment, and —
+    worse — a position that has dropped out of the target is simply ABSENT from
+    the sheet, with nothing telling you to close it. Silence is the one thing a
+    manual order sheet must never do.
+
+    Sources, in order of trust:
+
+      1. a CSV you supply (--positions): columns ticker and quantity, signed
+         (positive long, negative short). Export it from TWS, or write it by
+         hand. The most reliable, because it is what you actually hold.
+      2. .cache/risk_state.json, the register the system keeps itself. Needs no
+         connection, but it drifts from reality if an order was placed or
+         cancelled outside the algo.
+      3. nothing — every line is then reported as NEW, and the sheet says so.
+
+    Positions are keyed on the BARE symbol (suffix stripped), because that is
+    how IBKR reports them and how RiskState stores them.
+    """
+    def _bare(t: str) -> str:
+        return t.split(".")[0] if "." in t else t
+
+    if path:
+        try:
+            df = pd.read_csv(path)
+            cols = {c.lower().strip(): c for c in df.columns}
+            tc = next((cols[k] for k in ("ticker", "symbol", "symbole") if k in cols), None)
+            qc = next((cols[k] for k in ("quantity", "qty", "shares", "quantite",
+                                         "titres", "position") if k in cols), None)
+            if tc is None or qc is None:
+                raise ValueError(
+                    f"needs a ticker column and a quantity column, found {list(df.columns)}")
+            pos = {_bare(str(t)): float(q) for t, q in zip(df[tc], df[qc])
+                   if str(t).strip() and q == q}
+            logger.info("Current positions: %d line(s) from %s.", len(pos), path)
+            return pos, f"file {path}"
+        except Exception as e:
+            logger.error("Could not read positions from %s (%s) — the sheet will "
+                         "report every line as NEW and will NOT tell you what to "
+                         "close.", path, e)
+            return {}, "unreadable file"
+
+    try:
+        from .risk import RiskManager, RiskConfig as _RC
+        rm = RiskManager(_RC())
+        pos = {}
+        for t, ps in rm.state.positions.items():
+            if universe and getattr(ps, "universe", None) != universe:
+                continue
+            q = float(getattr(ps, "shares", 0) or 0)
+            if q == 0:
+                continue
+            pos[_bare(t)] = q if getattr(ps, "side", "LONG") == "LONG" else -abs(q)
+        if pos:
+            logger.info("Current positions: %d line(s) from the internal register "
+                        "(.cache/risk_state.json)%s.", len(pos),
+                        f" for {universe}" if universe else "")
+            return pos, "internal register"
+    except Exception as e:
+        logger.debug("Internal register unavailable: %s", e)
+
+    logger.warning(
+        "NO current positions found — every line will be reported as NEW and the "
+        "sheet will NOT tell you what to close. Pass --positions <file.csv> with "
+        "ticker and quantity columns to get adjustments and closures.")
+    return {}, "none"
+
+
 def _vol_stop_pct(returns: pd.DataFrame, ticker: str, rcfg: RiskConfig) -> float:
     """
     The level the risk monitor would cut at, which is NOT the level the resting
@@ -148,6 +223,7 @@ def build_rows(
     fundamentals: Optional[pd.DataFrame] = None,
     factors: Optional[pd.DataFrame] = None,
     as_of=None,
+    current: Optional[Dict[str, float]] = None,
 ) -> List[dict]:
     """One row per position for a single universe."""
     ucfg = REGISTRY.get(universe).config
@@ -249,6 +325,24 @@ def build_rows(
             stop_mon   = _vol_stop_pct(returns, ticker, rcfg)
 
             sens = 1.0 if side == "LONG" else -1.0
+
+            # Cible signee : un short est une quantite negative, comme IBKR la
+            # rapporte, pour que le delta se calcule sans ambiguite de signe.
+            cible_titres = shares if side == "LONG" else -shares
+            actuel = float((current or {}).get(sym, 0.0))
+            delta = cible_titres - actuel
+            if actuel == 0:
+                action = "NOUVELLE"
+            elif abs(delta) < 1:
+                action = "INCHANGEE"
+            elif (cible_titres > 0) == (actuel > 0):
+                action = "RENFORCER" if abs(cible_titres) > abs(actuel) else "REDUIRE"
+            else:
+                # Le signe s'inverse : ce n'est pas un ajustement mais un
+                # retournement, et il passe par zero. A signaler comme tel.
+                action = "RETOURNEMENT"
+            sens_ordre = "" if abs(delta) < 1 else ("ACHAT" if delta > 0 else "VENTE")
+
             rows.append({
                 "Ticker":            ticker,
                 "Societe":           noms.get(ticker, ticker),
@@ -278,8 +372,67 @@ def build_rows(
                                           and vr.get("cost_of_capital") == vr.get("cost_of_capital"))
                                       else None),
                 "Sans prix cible":   motif_val,
+                # Ce qu'il faut REELLEMENT passer comme ordre, pas seulement la
+                # cible.  Sans ca il faut recalculer a la main l'ecart avec
+                # l'existant, ligne par ligne, et c'est la que les erreurs
+                # arrivent.
+                "Action":            action,
+                "Titres actuels":    actuel,
+                "Titres cibles":     cible_titres,
+                "A passer":          delta,
+                "Ordre":             sens_ordre,
                 "Alerte":            "" if shares > 0 else "sous le lot minimum",
             })
+
+    # ── Positions a SOLDER ───────────────────────────────────────────────── #
+    # Ce que le fichier passait silencieusement sous silence : une position
+    # detenue qui n'est plus dans la cible disparaissait simplement du tableau.
+    # Rien ne disait de la fermer, donc elle restait ouverte indefiniment — le
+    # meme defaut que l'absence de mode flatten au niveau de l'univers, mais
+    # ligne par ligne.
+    if current:
+        vises = {ticker_market(t, ucfg)[0] for _, w in legs for t in w.index}
+        sortants = {sym: q for sym, q in current.items()
+                    if sym not in vises and abs(q) >= 1}
+        if sortants:
+            # Le nom ne peut PAS etre cherche sur le symbole nu. Une position
+            # IBKR ne porte que "AI", et interroger "AI" renvoie C3.ai, une
+            # societe americaine, au lieu d'Air Liquide — la meme ambiguite que
+            # SAN pour Sanofi et Banco Santander. Sur une ligne "a fermer
+            # entierement", un mauvais nom peut faire solder la mauvaise valeur.
+            # On remonte donc au ticker complet via la liste de l'univers, et
+            # faute de correspondance on n'invente pas de nom.
+            from .universe import _FALLBACKS
+            vers_complet = {}
+            for t in _FALLBACKS.get(universe, []):
+                vers_complet.setdefault(ticker_market(t, ucfg)[0], t)
+            complets = {sym: vers_complet.get(sym) for sym in sortants}
+            a_chercher = [c for c in complets.values() if c]
+            noms_s = _company_names(a_chercher) if a_chercher else {}
+            inconnus = [s_ for s_, c in complets.items() if not c]
+            if inconnus:
+                logger.warning(
+                    "[%s] %d position(s) to close are not in this universe's "
+                    "list, so their company name cannot be resolved safely and "
+                    "is left blank: %s. Check what they are before closing.",
+                    universe, len(inconnus), ", ".join(sorted(inconnus)))
+            logger.info("[%s] %d position(s) to CLOSE — out of the target: %s",
+                        universe, len(sortants), ", ".join(sorted(sortants)))
+            for sym, q in sorted(sortants.items()):
+                plein = complets.get(sym)
+                rows.append({
+                    "Ticker":         plein or sym,
+                    "Societe":        noms_s.get(plein, "") if plein else "",
+                    "Univers":        universe,
+                    "Sens":           "LONG" if q > 0 else "SHORT",
+                    "Symbole IBKR":   sym,
+                    "Action":         "SOLDER",
+                    "Titres actuels": q,
+                    "Titres cibles":  0.0,
+                    "A passer":       -q,
+                    "Ordre":          "VENTE" if q > 0 else "ACHAT",
+                    "Alerte":         "sortie du signal — a fermer entierement",
+                })
     return rows
 
 

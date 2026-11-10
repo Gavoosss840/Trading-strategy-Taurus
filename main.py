@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--positions", default=None,
+                   help="orders: CSV of what you currently hold (columns ticker "
+                        "and quantity, signed). Without it the sheet falls back "
+                        "to the internal register, and without that every line "
+                        "reads as NEW and nothing tells you what to close.")
     p.add_argument("--force-calibration", action="store_true",
                    help="calibrate: accept parameter jumps between quarters. "
                         "A jump is a data problem far more often than an "
@@ -1327,7 +1332,8 @@ def run_orders(args, cfg) -> None:
     import pandas as pd
     from datetime import date
     from pathlib import Path
-    from taurus.order_sheet import build_rows, write_workbook
+    from taurus.order_sheet import (build_rows, write_workbook,
+                                    load_current_positions)
     from taurus.risk import RiskConfig
     from taurus.scheduler import sharpe_allocation_weights
     from taurus.strategy import TaurusStrategy
@@ -1408,7 +1414,10 @@ def run_orders(args, cfg) -> None:
             continue
 
         nav_uni = nav * weights.get(name, 0.0)
+        courant, source = load_current_positions(
+            getattr(args, "positions", None), universe=name)
         rows = build_rows(
+            current=courant,
             universe=name, snapshot=snap, returns=strat._returns,
             nav_base=nav_uni, base_currency=base_ccy,
             cfg=ucfg_cfg, rcfg=rcfg,
