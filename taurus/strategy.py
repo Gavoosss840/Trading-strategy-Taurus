@@ -147,6 +147,7 @@ class TaurusStrategy:
         tickers: Optional[List[str]] = None,
         factors_df: Optional[pd.DataFrame] = None,
         fundamentals_fn=None,
+        prices_fn=None,
     ) -> None:
         cfg = self.cfg
 
@@ -154,8 +155,16 @@ class TaurusStrategy:
             tickers = get_sp500_tickers(cfg)
         self._tickers = tickers
 
+        # prices_fn lets a universe express its prices in ONE currency before
+        # any return is computed.  A multi-currency universe needs it: left in
+        # native units, a monthly return would mean "return in EUR" for a Paris
+        # line and "return in GBp" for a London one, and the ranking, the
+        # covariance and the beta neutralisation would mix two numeraires.
         logger.info("Loading price data (%d tickers)...", len(tickers))
-        self._prices  = get_monthly_prices(tickers, start, end, cfg)
+        if prices_fn is not None:
+            self._prices = prices_fn(start, end, tickers, cfg)
+        else:
+            self._prices = get_monthly_prices(tickers, start, end, cfg)
         self._returns = compute_monthly_returns(self._prices)
 
         logger.info("Loading factor data...")
@@ -506,6 +515,7 @@ class TaurusStrategy:
         tickers: Optional[List[str]] = None,
         factors_df: Optional[pd.DataFrame] = None,
         fundamentals_fn=None,
+        prices_fn=None,
     ) -> "BacktestResult":
         """Run a full vectorised back-test over [start, end]."""
         warm_up_months = cfg_warm_months(self.cfg)
@@ -514,7 +524,7 @@ class TaurusStrategy:
         ).strftime("%Y-%m-%d")
 
         self.load_data(warm_start, end, tickers, factors_df=factors_df,
-                       fundamentals_fn=fundamentals_fn)
+                       fundamentals_fn=fundamentals_fn, prices_fn=prices_fn)
 
         prices  = self._prices
         returns = self._returns

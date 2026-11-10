@@ -328,6 +328,47 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         n_shorts=20,
     ),
 
+    # One pan-European book instead of the two above, EUR and London together.
+    #
+    # On the full combined book, Sharpe-weighted across every universe, it is
+    # worth +0.159 of Sharpe and +2.16pp of annual return over running
+    # stoxx_eur and stoxx_uk side by side (1.96 against 1.80), with a slightly
+    # worse drawdown (-6.78% against -6.20%).  Far less than the per-universe
+    # figures suggest (2.19 against 1.98 and 1.09), because the two split legs
+    # already draw 47.9% of NAV between them while a single universe is capped
+    # at max_universe_weight = 35%.
+    #
+    # multi_currency means `currency` is the BASE currency: the NAV is read in
+    # EUR, every price is converted to EUR per line (get_prices for the signal,
+    # build_price_scale for the orders), and nav_scale stays 1.0 because the
+    # NAV is no longer scaled to a quote unit.
+    #
+    # NOT a drop-in replacement for the two split universes: it exercises the
+    # multi-currency order path, which could not be tested against a live TWS
+    # from the build environment.  Dry-run it and check the share counts before
+    # trading it, and do not run it at the same time as stoxx_eur / stoxx_uk —
+    # it holds the same names and the books would fight over them.
+    "stoxx_europe": UniverseConfig(
+        name="stoxx_europe",
+        display_name="STOXX Europe 600 (EUR + UK)",
+        region="Europe",
+        currency="EUR",                      # base currency for the NAV
+        multi_currency=True,
+        nav_scale=1.0,                       # required: prices are converted, not the NAV
+        ff5_dataset="Europe_5_Factors",
+        futures_symbol="ESTX50",
+        futures_exchange="EUREX",
+        futures_currency="EUR",
+        futures_multiplier=10.0,
+        ibkr_exchange="SMART",
+        wikipedia_url="https://en.wikipedia.org/wiki/STOXX_Europe_600",
+        wikipedia_table_id="constituents",
+        min_market_cap_usd=1e9,
+        supports_trail_stop=False,
+        n_longs=25,
+        n_shorts=25,
+    ),
+
     # ── Asia ──────────────────────────────────────────────────────────────── #
 
     "nikkei225": UniverseConfig(
@@ -500,6 +541,7 @@ _FALLBACKS: Dict[str, List[str]] = {
         "ZEG.L",
     ],
 
+
     # Nikkei 225 — Yahoo Finance tickers (.T suffix)
     # ~150-stock fallback used when Wikipedia scraping fails
     "nikkei225": [
@@ -651,6 +693,13 @@ _FALLBACKS: Dict[str, List[str]] = {
 }
 
 
+# The pan-European universe is the union of the two split lists, derived rather
+# than duplicated so the three can never drift apart.
+_FALLBACKS["stoxx_europe"] = sorted(
+    set(_FALLBACKS["stoxx_eur"]) | set(_FALLBACKS["stoxx_uk"])
+)
+
+
 # --------------------------------------------------------------------------- #
 #  Universe definition class                                                   #
 # --------------------------------------------------------------------------- #
@@ -736,6 +785,95 @@ class UniverseDef:
         except Exception as e:
             logger.warning("[%s] Wikipedia scrape error: %s", self.config.name, e)
             return []
+
+    # ── Prices ──────────────────────────────────────────────────────────── #
+
+    def get_prices(
+        self,
+        start: str,
+        end: str,
+        tickers: Optional[List[str]] = None,
+        cfg: TaurusConfig = DEFAULT_CONFIG,
+    ) -> pd.DataFrame:
+        """
+        Monthly prices for this universe, expressed in ONE currency.
+
+        A mono-currency universe needs nothing: its prices are already in a
+        single numeraire (EUR on Euronext, GBp on the LSE) and the download is
+        returned untouched.
+
+        A multi-currency universe must be converted, and before any return is
+        computed.  Left in native units, a monthly return would mean "return in
+        EUR" for a Paris line and "return in GBp" for a London one, so the
+        cross-sectional ranking, the covariance matrix and the beta
+        neutralisation would all be mixing two numeraires. Everything is
+        therefore brought to `currency` (the base).
+
+        A month where the rate is unknown propagates NaN rather than being
+        filled: an invented rate is an invented return.
+        """
+        from .data import get_monthly_prices
+
+        tickers = tickers if tickers is not None else self.get_tickers(cfg)
+        prices = get_monthly_prices(tickers, start, end, cfg)
+
+        if not getattr(self.config, "multi_currency", False) or prices.empty:
+            return prices
+
+        base = (self.config.currency or "EUR").upper()
+        groupes: Dict[str, List[str]] = {}
+        for t in prices.columns:
+            _sym, ccy, minor, _px = ticker_market(t, self.config)
+            if (ccy or base).upper() == base and float(minor) == 1.0:
+                continue                              # already in the base unit
+            groupes.setdefault(f"{ccy}:{minor}", []).append(t)
+
+        if not groupes:
+            return prices
+
+        import yfinance as _yf
+        out = prices.copy()
+        for cle, cols in groupes.items():
+            ccy, minor = cle.split(":")
+            minor = float(minor)
+            if ccy.upper() == base:
+                out[cols] = out[cols].div(minor)      # minor unit only, no FX
+                logger.info("[%s] %d line(s) rescaled from the minor unit of %s.",
+                            self.config.name, len(cols), ccy)
+                continue
+            rate = None
+            try:
+                raw = _yf.download(f"{ccy}{base}=X", start=start, end=end,
+                                   interval="1mo", auto_adjust=True,
+                                   progress=False, threads=False)
+                if raw is not None and not raw.empty:
+                    s = raw["Close"] if "Close" in raw else raw.iloc[:, [0]]
+                    if isinstance(s, pd.DataFrame):
+                        s = s.iloc[:, 0]
+                    s = s.dropna()
+                    s.index = pd.to_datetime(s.index).to_period("M").to_timestamp("M")
+                    rate = s[~s.index.duplicated(keep="last")].reindex(prices.index).ffill()
+            except Exception as e:
+                logger.error("[%s] FX series %s->%s failed: %s",
+                             self.config.name, ccy, base, e)
+            if rate is None or rate.notna().sum() == 0:
+                logger.error(
+                    "[%s] No %s->%s monthly rate — dropping %d line(s) rather "
+                    "than mixing numeraires: %s",
+                    self.config.name, ccy, base, len(cols), ", ".join(sorted(cols)[:8]),
+                )
+                out = out.drop(columns=cols)
+                continue
+            n_nan = int(rate.isna().sum())
+            if n_nan:
+                logger.warning("[%s] %s->%s rate missing for %d month(s) — those "
+                               "months stay NaN.", self.config.name, ccy, base, n_nan)
+            out[cols] = out[cols].div(minor).mul(rate, axis=0)
+            logger.info("[%s] %d line(s) converted %s -> %s (median rate %.4f).",
+                        self.config.name, len(cols), ccy, base,
+                        float(rate.median()))
+
+        return out.dropna(axis=1, how="all")
 
     # ── FF5 Factors ─────────────────────────────────────────────────────── #
 

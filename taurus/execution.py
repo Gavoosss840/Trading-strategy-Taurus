@@ -241,6 +241,65 @@ class PositionReconciler:
             _ib_log.setLevel(_prev)
         return None
 
+    def build_price_scale(
+        self,
+        conn:         IBKRConnection,
+        tickers:      List[str],
+        universe_cfg,
+    ) -> Dict[str, float]:
+        """
+        {ticker: factor} such that price_quoted × factor is the price expressed
+        in the universe's base currency — for compute_target_shares.
+
+        factor = (1 / minor_units_per_major) × fx(quote_currency → base)
+
+        The minor unit and the quote currency come from the ticker's suffix
+        (universe.ticker_market), which is static and needs no network call.
+        The rate is asked of IBKR first and of the market-data layer second; a
+        currency whose rate cannot be established yields NO entry, so its lines
+        are left unsized rather than sized on an unconverted price.
+        """
+        from .universe import ticker_market
+        from .data import _fx_rate as _offline_fx
+
+        base = (getattr(universe_cfg, "currency", "") or "").upper()
+        rates: Dict[str, Optional[float]] = {base: 1.0}
+        out: Dict[str, float] = {}
+        failed: Dict[str, List[str]] = {}
+
+        for t in tickers:
+            _sym, ccy, minor, _primary = ticker_market(t, universe_cfg)
+            ccy = (ccy or base).upper()
+            if ccy not in rates:
+                r = None
+                try:
+                    r = self._fetch_fx_rate(conn, ccy, base)
+                except Exception as e:
+                    logger.debug("IBKR FX %s->%s failed: %s", ccy, base, e)
+                if r is None or not (r > 0):
+                    r = _offline_fx(ccy, base)
+                    if r is not None and r > 0:
+                        logger.info("FX %s->%s from market data (IBKR had none): %.6g",
+                                    ccy, base, r)
+                rates[ccy] = r if (r is not None and r > 0) else None
+            rate = rates[ccy]
+            if rate is None:
+                failed.setdefault(ccy, []).append(t)
+                continue
+            if not (minor > 0):
+                failed.setdefault(ccy, []).append(t)
+                continue
+            out[t] = rate / float(minor)
+
+        if failed:
+            for ccy, ts in failed.items():
+                logger.error(
+                    "[%s] No %s->%s rate — %d line(s) will NOT be sized: %s",
+                    getattr(universe_cfg, "name", "?"), ccy, base, len(ts),
+                    ", ".join(sorted(ts)[:10]),
+                )
+        return out
+
     def compute_target_shares(
         self,
         long_weights:    pd.Series,
@@ -249,19 +308,45 @@ class PositionReconciler:
         cfg:             TaurusConfig,
         prices:          Dict[str, float],
         universe_cfg=None,
+        price_scale:     Optional[Dict[str, float]] = None,
     ) -> pd.Series:
         """
         Convert fractional weights → integer share counts.
         Long: positive shares. Short: negative shares.
+
+        price_scale (multi-currency universes only): {ticker: factor} where
+        price_quoted × factor is the price expressed in the NAV's own currency.
+        For a London line in a EUR-based book that is (1/100) × GBP→EUR: the
+        minor unit and the exchange rate in one number.  A ticker absent from
+        the map is NOT sized — a line sized on an unconverted price is how
+        CPG.L and IHG.L came out 74x too large.
+
+        Left at None (every mono-currency universe) the old single nav_scale
+        applies to the whole book and the arithmetic is unchanged.
         """
         half = cfg.gross_leverage / 2.0
         target: Dict[str, float] = {}
 
         fractional = getattr(universe_cfg, "fractional_shares", False) if universe_cfg else False
 
-        # nav_scale converts NAV to match price units (e.g. LSE: GBP × 100 → GBp pence)
-        nav_scale     = getattr(universe_cfg, "nav_scale", 1.0) if universe_cfg else 1.0
-        effective_nav = nav_usd * nav_scale
+        if price_scale is None:
+            # nav_scale converts NAV to match price units (LSE: GBP × 100 → GBp)
+            nav_scale     = getattr(universe_cfg, "nav_scale", 1.0) if universe_cfg else 1.0
+            effective_nav = nav_usd * nav_scale
+            eff_price     = dict(prices)
+            unscaled: List[str] = []
+        else:
+            # Prices are brought to the NAV's currency instead, so the NAV is
+            # used as-is and nav_scale must stay 1.0 for such a universe.
+            effective_nav = nav_usd
+            eff_price = {}
+            unscaled = []
+            for t, p in prices.items():
+                sc = price_scale.get(t)
+                if sc is None or not (sc > 0):
+                    unscaled.append(t)
+                    continue
+                eff_price[t] = p * sc
 
         # lot-size rounding for non-fractional markets
         lot  = getattr(cfg, "min_lot_size", 1) or 1
@@ -275,7 +360,7 @@ class PositionReconciler:
 
         skipped = []
         for ticker, w in long_weights.items():
-            price = prices.get(ticker, 0.0)
+            price = eff_price.get(ticker, 0.0)
             if price > 0:
                 dollars = w * effective_nav * half
                 if fractional:
@@ -292,7 +377,7 @@ class PositionReconciler:
                         skipped.append(ticker)
 
         for ticker, w in short_weights.items():
-            price = prices.get(ticker, 0.0)
+            price = eff_price.get(ticker, 0.0)
             if price > 0:
                 dollars = w * effective_nav * half
                 if fractional:
@@ -307,6 +392,14 @@ class PositionReconciler:
                         target[ticker] = -rounded
                     else:
                         skipped.append(ticker)
+
+        if unscaled:
+            logger.error(
+                "%d ticker(s) had no price-scale entry and were NOT sized — a "
+                "line sized on an unconverted price is how CPG.L and IHG.L came "
+                "out 74x too large: %s",
+                len(unscaled), ", ".join(sorted(unscaled)),
+            )
 
         if skipped:
             if fractional:
@@ -1305,7 +1398,7 @@ class IBKRExecutor:
         if mm_tp_pcts is None:
             mm_tp_pcts = {}
 
-        live = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
+        live = self.reconciler.get_live_positions(self.conn, currency=self._position_currency())
         if live.empty:
             return
 
@@ -1383,7 +1476,7 @@ class IBKRExecutor:
             open_by_id  = {t.order.orderId: t for t in open_trades}
 
             # Re-read live positions after fills
-            live_now = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
+            live_now = self.reconciler.get_live_positions(self.conn, currency=self._position_currency())
 
             lines = [
                 f"\n{'='*60}",
@@ -1461,6 +1554,20 @@ class IBKRExecutor:
         except Exception as e:
             logger.warning("Reconciliation failed: %s", e)
 
+    def _position_currency(self) -> Optional[str]:
+        """
+        Currency to filter live positions by, or None.
+
+        A single currency isolates two same-currency universes from each other
+        (sp500 and nasdaq100 are both USD).  A multi-currency universe has no
+        single currency to filter on — filtering would hide its London lines
+        from a EUR-based book — so it filters on nothing here and relies on the
+        ticker-list and RiskState isolation applied further down.
+        """
+        if getattr(self.udef_cfg, "multi_currency", False):
+            return None
+        return self.udef_cfg.currency
+
     def execute_rebalance(
         self,
         snapshot,
@@ -1517,12 +1624,23 @@ class IBKRExecutor:
             # ~180 USD quote where ~8500 pence is expected sizes the position
             # about 47x too large.  normalise_quote_prices rescales a mismatch
             # and drops any name whose unit it cannot establish.
+            #
+            # Each price is converted exactly ONCE, by whoever knows its unit:
+            # an IBKR price by build_price_scale (the suffix gives the listing's
+            # currency, which is what IBKR quotes in), a yfinance price here by
+            # normalise_quote_prices (Yahoo's own currency field is the
+            # authority for a Yahoo price, and the two can disagree — the suffix
+            # says CPG.L is GBp, Yahoo says USD).  Prices filled here are
+            # therefore already in the base currency and are pinned to a scale
+            # of 1.0 below, so price_scale cannot convert them a second time.
+            yf_filled: set = set()
             if yf_prices:
                 missing = [t for t in all_tickers if t not in prices or prices[t] <= 0]
                 candidates = {t: yf_prices[t] for t in missing if yf_prices.get(t, 0) > 0}
                 usable, unusable = normalise_quote_prices(candidates, self.udef_cfg)
                 for t, px in usable.items():
                     prices[t] = px
+                yf_filled = set(usable)
                 if usable:
                     logger.info(
                         "[%s] Used yfinance close prices for %d tickers (no IBKR data): %s",
@@ -1580,9 +1698,28 @@ class IBKRExecutor:
                                    self.udef_cfg.name, e)
 
             # 3. Target shares
+            price_scale = None
+            if getattr(self.udef_cfg, "multi_currency", False):
+                if float(getattr(self.udef_cfg, "nav_scale", 1.0) or 1.0) != 1.0:
+                    logger.error(
+                        "[%s] multi_currency universe must have nav_scale = 1.0 "
+                        "(prices are converted per line, the NAV is not scaled) "
+                        "— refusing to size this run.",
+                        self.udef_cfg.name,
+                    )
+                    report.save(self.output_dir)
+                    return report
+                price_scale = self.reconciler.build_price_scale(
+                    self.conn, all_tickers, self.udef_cfg
+                )
+                # Already in the base currency — do not convert twice.
+                for t in yf_filled:
+                    price_scale[t] = 1.0
+
             target = self.reconciler.compute_target_shares(
                 long_w, short_w,
                 nav, self.cfg, prices, universe_cfg=self.udef_cfg,
+                price_scale=price_scale,
             )
 
             # Normalise target tickers: strip Yahoo Finance exchange suffixes
@@ -1601,7 +1738,7 @@ class IBKRExecutor:
                 self._save_fractional_report(manual_rows, snapshot.date)
 
             # 4. Delta vs live (filled positions + pending entry orders)
-            live    = self.reconciler.get_live_positions(self.conn, currency=self.udef_cfg.currency)
+            live    = self.reconciler.get_live_positions(self.conn, currency=self._position_currency())
             pending = self.reconciler.get_pending_shares(self.conn)
 
             # Universe isolation: restrict live positions to tickers this universe

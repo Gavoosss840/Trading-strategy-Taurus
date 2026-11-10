@@ -30,6 +30,9 @@ class UniverseConfig:
     min_market_cap_usd:   float = 2e9
     min_lot_size:         int   = 1        # minimum order size (TSE=100, most others=1)
     nav_scale:            float = 1.0     # multiply NAV to match price units (LSE=100: GBP→GBp pence)
+    multi_currency:       bool  = False   # True: lines quote in several currencies, so `currency` is
+                                          # the BASE currency for the NAV and each price is converted
+                                          # per line instead (nav_scale must stay 1.0)
     fractional_shares:    bool  = False   # True for US markets (IBKR supports MKT fractions)
     supports_trail_stop:  bool  = True     # False for Euronext/LSE: MKT transmits alone, STP sent separately
     use_wikipedia_scrape: bool  = False   # True for non-US universes whose Wikipedia tables have numeric codes

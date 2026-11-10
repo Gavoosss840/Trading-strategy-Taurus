@@ -471,6 +471,7 @@ class RebalanceScheduler:
             tickers=tickers,
             factors_df=factors,
             fundamentals_fn=udef.get_fundamentals,  # non-US → yfinance; US → EDGAR+yfinance
+            prices_fn=udef.get_prices,              # multi-currency → one numeraire
         )
         snapshot = strategy.run(as_of=as_of.strftime("%Y-%m-%d"))
 
