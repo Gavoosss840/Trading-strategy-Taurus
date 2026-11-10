@@ -200,6 +200,58 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         n_shorts=15,
     ),
 
+    # ── STOXX Europe 600, split by quote currency ─────────────────────────── #
+    # Replaces cac40 + ftse100, which earn less than cash over 10 years:
+    # CAC 40 +3.25%/yr (Sharpe -0.44) and FTSE 100 +3.46%/yr (Sharpe -0.23)
+    # against a 4.5% risk-free rate, measured on 29 and 35 names.  Breadth is
+    # the fix: 289 and 127 names give the cross-section something to rank.
+    #
+    # Deliberately TWO universes rather than one pan-European book, because
+    # UniverseConfig carries a single `currency` and a single `nav_scale`, both
+    # used to fetch the NAV, convert it and size the orders.  A mixed EUR+GBP
+    # universe would make both wrong for part of its names — the same class of
+    # bug that sized CPG.L and IHG.L 74x too large.  Split, each universe stays
+    # mono-currency and the Sharpe allocator decides the split between them.
+
+    "stoxx_eur": UniverseConfig(
+        name="stoxx_eur",
+        display_name="STOXX Europe 600 (Eurozone)",
+        region="Europe",
+        currency="EUR",
+        ff5_dataset="Europe_5_Factors",
+        futures_symbol="ESTX50",             # EURO STOXX 50 futures on EUREX
+        futures_exchange="EUREX",
+        futures_currency="EUR",
+        futures_multiplier=10.0,
+        ibkr_exchange="SMART",
+        wikipedia_url="https://en.wikipedia.org/wiki/STOXX_Europe_600",
+        wikipedia_table_id="constituents",
+        min_market_cap_usd=1e9,
+        supports_trail_stop=False,           # Euronext rejects TRAIL on MKT parent
+        n_longs=25,
+        n_shorts=25,
+    ),
+
+    "stoxx_uk": UniverseConfig(
+        name="stoxx_uk",
+        display_name="STOXX Europe 600 (UK)",
+        region="Europe",
+        currency="GBP",
+        ff5_dataset="Europe_5_Factors",
+        futures_symbol="Z",                  # FTSE 100 futures
+        futures_exchange="LIFFE",
+        futures_currency="GBP",
+        futures_multiplier=10.0,
+        ibkr_exchange="SMART",
+        wikipedia_url="https://en.wikipedia.org/wiki/STOXX_Europe_600",
+        wikipedia_table_id="constituents",
+        min_market_cap_usd=1e9,
+        nav_scale=100.0,                     # LSE quotes in GBp (pence)
+        supports_trail_stop=False,           # LSE: STP sent as a standalone order
+        n_longs=20,
+        n_shorts=20,
+    ),
+
     # ── Asia ──────────────────────────────────────────────────────────────── #
 
     "nikkei225": UniverseConfig(
@@ -283,6 +335,93 @@ _FALLBACKS: Dict[str, List[str]] = {
         "CPG.L", "EXPN.L", "RKT.L", "SSE.L", "AHT.L", "WPP.L",
         "JD.L", "TSCO.L", "AUTO.L", "CRH.L", "PSN.L", "TW.L",
         "IHG.L", "BNZL.L", "FRES.L", "HIK.L", "MNDI.L", "RSA.L",
+    ],
+
+    # ── STOXX Europe 600, scinde par devise ───────────────────────────────── #
+    # Un univers par devise, et non un univers paneuropeen unique :
+    # UniverseConfig ne porte QU'UNE devise et QU'UN nav_scale, tous deux
+    # utilises pour recuperer le NAV, le convertir et dimensionner les ordres.
+    # Un univers bi-devise les rendrait tous les deux faux pour une partie des
+    # lignes — exactement la classe de bug qui a produit le facteur 74x sur
+    # CPG.L et IHG.L.  Scinde, chaque univers reste mono-devise et
+    # l'allocation Sharpe decide elle-meme du partage entre les deux.
+
+    # Zone euro : 289 constituants du STOXX 600 cotes en EUR
+    # (Euronext Paris/Amsterdam/Bruxelles/Lisbonne, Xetra, Borsa Italiana,
+    #  BME, Helsinki, Vienne, Athenes, Dublin)
+    "stoxx_eur": [
+        "A2A.MI", "A5G.IR", "AALB.AS", "ABI.BR", "ABN.AS", "ABVX.PA",
+        "AC.PA", "ACA.PA", "ACKB.BR", "ACS.MC", "ACX.MC", "AD.AS",
+        "ADP.PA", "ADS.DE", "ADYEN.AS", "AED.BR", "AENA.MC", "AG1.DE",
+        "AGN.AS", "AGS.BR", "AI.PA", "AIR.PA", "AIXA.DE", "AKE.PA",
+        "AKZA.AS", "ALLFG.AS", "ALO.PA", "ALV.DE", "AM.PA", "AMS.MC",
+        "AMUN.PA", "ANA.MC", "ANDR.VI", "ARCAD.AS", "ARGX.BR", "ASM.AS",
+        "ASML.AS", "ASRNL.AS", "ATS.VI", "AYV.PA", "AZM.MI", "BAMI.MI",
+        "BAMNB.AS", "BAS.DE", "BAYN.DE", "BBVA.MC", "BC.MI", "BC8.DE",
+        "BCP.LS", "BEI.DE", "BELA.AT", "BESI.AS", "BG.VI", "BGN.MI",
+        "BIM.PA", "BIRG.IR", "BKT.MC", "BMED.MI", "BMPS.MI", "BMW.DE",
+        "BN.PA", "BNP.PA", "BNR.DE", "BOL.PA", "BPE.MI", "BVI.PA",
+        "BZU.MI", "CA.PA", "CABK.MC", "CAP.PA", "CBK.DE", "CLNX.MC",
+        "CON.DE", "COV.PA", "CPR.MI", "CS.PA", "DB1.DE", "DBK.DE",
+        "DG.PA", "DHER.DE", "DHL.DE", "DIE.BR", "DIM.PA", "DLG.MI",
+        "DSFIR.AS", "DSY.PA", "DTE.DE", "DTG.DE", "EBS.VI", "EDEN.PA",
+        "EDP.LS", "EDPR.LS", "EL.PA", "ELE.MC", "ELI.BR", "ELIS.PA",
+        "ELISA.HE", "EN.PA", "ENEL.MI", "ENG.MC", "ENGI.PA", "ENI.MI",
+        "ENR.DE", "ENX.PA", "EOAN.DE", "ERF.PA", "ETE.AT", "EUROB.AT",
+        "EVD.DE", "EVK.DE", "EXO.AS", "FBK.MI", "FDJU.PA", "FER.MC",
+        "FGR.PA", "FME.DE", "FNTN.DE", "FORTUM.HE", "FPE3.DE", "FR.PA",
+        "FRE.DE", "FTK.DE", "G.MI", "G1A.DE", "G24.DE", "GALP.LS",
+        "GBF.DE", "GBLB.BR", "GEKTERNA.AT", "GET.PA", "GFC.PA", "GL9.IR",
+        "GLE.PA", "GRF.MC", "GTT.PA", "HAG.DE", "HEI.DE", "HEIA.AS",
+        "HEIO.AS", "HEN3.DE", "HER.MI", "HIAB.HE", "HNR1.DE", "HO.PA",
+        "HOT.DE", "HTO.AT", "HUH1V.HE", "IBE.MC", "IDR.MC", "IFX.DE",
+        "IG.MI", "IMCD.AS", "INGA.AS", "IP.MI", "IPN.PA", "ISP.MI",
+        "ITX.MC", "IVG.MI", "JMT.LS", "KBC.BR", "KBCA.BR", "KBX.DE",
+        "KCR.HE", "KER.PA", "KESKOB.HE", "KGX.DE", "KNEBV.HE", "KPN.AS",
+        "KRX.IR", "KRZ.IR", "LDO.MI", "LEG.DE", "LHA.DE", "LI.PA",
+        "LOTB.BR", "LR.PA", "LTMC.MI", "MANTA.HE", "MAP.MC", "MBG.DE",
+        "MC.PA", "METSO.HE", "ML.PA", "MOH.AT", "MONC.MI", "MRK.DE",
+        "MRL.MC", "MTX.DE", "MUV2.DE", "NDA-FI.HE", "NDA.DE", "NDX1.DE",
+        "NEM.DE", "NESTE.HE", "NEX.PA", "NEXI.MI", "NN.AS", "NOKIA.HE",
+        "NTGY.MC", "OMV.VI", "OR.PA", "ORA.PA", "ORNBV.HE", "P911.DE",
+        "PAH3.DE", "PHIA.AS", "PIRC.MI", "PPC.AT", "PRX.AS", "PRY.MI",
+        "PST.MI", "PUB.PA", "PUM.DE", "QIA.DE", "RAA.DE", "RACE.MI",
+        "RAND.AS", "RBI.VI", "REC.MI", "RED.MC", "REP.MC", "REY.MI",
+        "RHM.DE", "RI.PA", "RMS.PA", "RNO.PA", "RUI.PA", "RWE.DE",
+        "RXL.PA", "RYA.IR", "SAB.MC", "SAF.PA", "SAMPO.HE", "SAN.MC",
+        "SAN.PA", "SAP.DE", "SBMO.AS", "SCR.PA", "SCYR.MC", "SDF.DE",
+        "SGO.PA", "SHL.DE", "SIE.DE", "SOF.BR", "SOI.PA", "SOP.PA",
+        "SPIE.PA", "SPM.MI", "SRG.MI", "SRT3.DE", "STERV.HE", "STLAM.MI",
+        "STMMI.MI", "SU.PA", "SW.PA", "SY1.DE", "TE.PA", "TEF.MC",
+        "TEG.DE", "TEN.MI", "TEP.PA", "TKA.DE", "TLX.DE", "TPEIR.AT",
+        "TPRO.MI", "TRN.MI", "TTE.PA", "TUB.BR", "TUI1.DE", "UCB.BR",
+        "UCG.MI", "UMG.AS", "UMI.BR", "UNI.MC", "UNI.MI", "UPM.HE",
+        "URW.PA", "VALMT.HE", "VER.VI", "VIE.PA", "VK.PA", "VNA.DE",
+        "VOE.VI", "VOW3.DE", "VPK.AS", "WDP.BR", "WKL.AS", "WRT1V.HE",
+        "ZAL.DE",
+    ],
+
+    # Londres : 127 constituants du STOXX 600 cotes au LSE (GBp)
+    "stoxx_uk": [
+        "AAF.L", "AAL.L", "ABDN.L", "ABF.L", "ADM.L", "ANTO.L", "AUTO.L",
+        "AV.L", "AZN.L", "BA.L", "BAB.L", "BARC.L", "BATS.L", "BBOX.L",
+        "BBY.L", "BGEO.L", "BKG.L", "BLND.L", "BME.L", "BNZL.L", "BP.L",
+        "BPT.L", "BRBY.L", "BT-A.L", "BTRW.L", "BWY.L", "CCC.L", "CCH.L",
+        "CNA.L", "CPG.L", "CRDA.L", "CTEC.L", "CWK.L", "DCC.L", "DGE.L",
+        "DLN.L", "DPLM.L", "DRX.L", "EDV.L", "EMG.L", "ENT.L", "EXPN.L",
+        "EZJ.L", "FRES.L", "GAW.L", "GLEN.L", "GSK.L", "HIK.L", "HILS.L",
+        "HLMA.L", "HLN.L", "HOC.L", "HSBA.L", "HSX.L", "HWDN.L", "IAG.L",
+        "ICG.L", "IGG.L", "IHG.L", "III.L", "IMB.L", "IMI.L", "INCH.L",
+        "INF.L", "INVP.L", "ITRK.L", "ITV.L", "JMAT.L", "KGF.L", "LAND.L",
+        "LGEN.L", "LLOY.L", "LMP.L", "LSEG.L", "MKS.L", "MNDI.L", "MNG.L",
+        "MRO.L", "MTO.L", "NG.L", "NWG.L", "NXT.L", "PAF.L", "PHP.L",
+        "PLUS.L", "PNN.L", "PRU.L", "PSN.L", "PSON.L", "QLT.L", "QQ.L",
+        "REL.L", "RIO.L", "RKT.L", "RMV.L", "ROR.L", "RR.L", "RS1.L",
+        "RTO.L", "SBRY.L", "SCT.L", "SDLF.L", "SGE.L", "SGRO.L", "SHC.L",
+        "SHEL.L", "SMIN.L", "SN.L", "SPX.L", "SRP.L", "SSE.L", "STAN.L",
+        "STJ.L", "SVT.L", "TBCG.L", "TCAP.L", "TSCO.L", "TW.L", "ULVR.L",
+        "UTG.L", "UU.L", "VOD.L", "WEIR.L", "WISE.L", "WPP.L", "WTB.L",
+        "ZEG.L",
     ],
 
     # Nikkei 225 — Yahoo Finance tickers (.T suffix)
