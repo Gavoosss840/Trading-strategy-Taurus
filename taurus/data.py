@@ -246,6 +246,150 @@ def compute_monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+#  Quote-currency normalisation                                               #
+# --------------------------------------------------------------------------- #
+
+_QUOTE_CCY_CACHE: Dict[str, Optional[str]] = {}
+_FX_RATE_CACHE: Dict[Tuple[str, str], Optional[float]] = {}
+
+
+def _split_quote_currency(code: str) -> Tuple[str, float]:
+    """
+    Split a Yahoo currency code into (major ISO code, minor units per major).
+
+    Yahoo distinguishes pence from pounds by CASE ALONE: "GBp" means pence,
+    "GBP" means pounds.  Never upper-case this value before testing it.
+    """
+    c = (code or "").strip()
+    if c in ("GBp", "GBX"):
+        return "GBP", 100.0
+    if c in ("ZAc", "ZAC"):
+        return "ZAR", 100.0
+    if c in ("ILa", "ILA"):
+        return "ILS", 100.0
+    return c.upper(), 1.0
+
+
+def _quote_currency(ticker: str) -> Optional[str]:
+    """Yahoo's reported quote currency for one ticker; cached per process."""
+    if ticker in _QUOTE_CCY_CACHE:
+        return _QUOTE_CCY_CACHE[ticker]
+    ccy = None
+    try:
+        t = yf.Ticker(ticker)
+        fast = getattr(t, "fast_info", None)
+        if fast is not None:
+            try:
+                ccy = fast["currency"]
+            except Exception:
+                ccy = None
+        if not ccy:
+            ccy = (t.info or {}).get("currency")
+    except Exception as e:
+        logger.debug("Quote currency lookup failed for %s: %s", ticker, e)
+    _QUOTE_CCY_CACHE[ticker] = ccy
+    return ccy
+
+
+def _fx_rate(from_ccy: str, to_ccy: str) -> Optional[float]:
+    """Spot FX rate: 1 unit of from_ccy expressed in to_ccy."""
+    if from_ccy == to_ccy:
+        return 1.0
+    k = (from_ccy, to_ccy)
+    if k in _FX_RATE_CACHE:
+        return _FX_RATE_CACHE[k]
+    rate = None
+    try:
+        raw = yf.download(f"{from_ccy}{to_ccy}=X", period="5d", interval="1d",
+                          auto_adjust=True, progress=False, threads=False)
+        if raw is not None and not raw.empty:
+            s = raw["Close"] if "Close" in raw else raw.iloc[:, [0]]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            s = s.dropna()
+            if len(s):
+                rate = float(s.iloc[-1])
+    except Exception as e:
+        logger.debug("FX rate %s->%s failed: %s", from_ccy, to_ccy, e)
+    _FX_RATE_CACHE[k] = rate
+    return rate
+
+
+def normalise_quote_prices(
+    prices: Dict[str, float],
+    universe_cfg,
+    fx_fn=None,
+) -> Tuple[Dict[str, float], Dict[str, str]]:
+    """
+    Bring yfinance close prices into the universe's expected quote unit.
+
+    Yahoo does not quote every line of an exchange in that exchange's own
+    currency.  On the LSE most names come back in GBp (pence), but CPG.L and
+    IHG.L come back in USD.  compute_target_shares divides a NAV already
+    scaled by universe_cfg.nav_scale (100 on the LSE: GBP → GBp) by this
+    price, so a USD quote near 180 where ~8500 pence is expected sizes the
+    position roughly 47x too large.  Nothing downstream checks the unit.
+
+    This is a strict no-op wherever the reported currency already matches the
+    universe (GBp on the LSE, EUR on Euronext, USD in the US, JPY in Tokyo):
+    the scale factor comes out at exactly 1.0 and the price is passed through.
+    It only acts on a genuine mismatch, and a ticker whose unit cannot be
+    established is DROPPED rather than sized on an unverified price — an
+    undeployed position costs the expected return of one name, a position
+    sized 47x too large costs far more.
+
+    Returns (usable prices, {ticker: reason dropped}).
+    """
+    expected_major = (getattr(universe_cfg, "currency", "") or "").upper()
+    expected_minor = float(getattr(universe_cfg, "nav_scale", 1.0) or 1.0)
+    rate_fn = fx_fn or _fx_rate
+
+    out: Dict[str, float] = {}
+    dropped: Dict[str, str] = {}
+
+    for ticker, px in prices.items():
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            dropped[ticker] = "price not numeric"
+            continue
+        if not (px > 0) or not np.isfinite(px):
+            dropped[ticker] = "no usable price"
+            continue
+
+        code = _quote_currency(ticker)
+        if not code:
+            dropped[ticker] = "quote currency unknown"
+            continue
+
+        major, minor = _split_quote_currency(code)
+        if major == expected_major:
+            factor = expected_minor / minor
+        else:
+            rate = rate_fn(major, expected_major)
+            if rate is None or not (rate > 0):
+                dropped[ticker] = (f"quoted in {code}, no "
+                                   f"{major}->{expected_major} rate available")
+                continue
+            factor = rate * expected_minor / minor
+
+        if not np.isfinite(factor) or factor <= 0:
+            dropped[ticker] = f"quoted in {code}, bad scale factor"
+            continue
+
+        out[ticker] = px * factor
+        if abs(factor - 1.0) > 1e-9:
+            logger.warning(
+                "[%s] %s is quoted in %s, not the expected unit — price "
+                "rescaled %.6g -> %.6g (x%.6g) before sizing.",
+                getattr(universe_cfg, "name", "?"), ticker, code,
+                px, out[ticker], factor,
+            )
+
+    return out, dropped
+
+
+# --------------------------------------------------------------------------- #
 #  Fama-French 5 Factors                                                       #
 # --------------------------------------------------------------------------- #
 

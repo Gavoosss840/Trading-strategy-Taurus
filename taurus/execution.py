@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from .config import TaurusConfig, UniverseConfig, DEFAULT_CONFIG
+from .data import normalise_quote_prices
 
 logger = logging.getLogger(__name__)
 
@@ -1483,15 +1484,31 @@ class IBKRExecutor:
             prices = self.order_mgr.get_live_prices(self.conn, all_tickers, self.udef_cfg)
 
             # Fill any tickers that had no IBKR market data (no subscription / market closed)
+            #
+            # The fallback price must be checked for its quote UNIT before it
+            # reaches compute_target_shares, which divides a NAV already scaled
+            # by nav_scale (100 on the LSE) by it.  Yahoo quotes CPG.L and
+            # IHG.L in USD while the rest of the LSE comes back in GBp, and a
+            # ~180 USD quote where ~8500 pence is expected sizes the position
+            # about 47x too large.  normalise_quote_prices rescales a mismatch
+            # and drops any name whose unit it cannot establish.
             if yf_prices:
                 missing = [t for t in all_tickers if t not in prices or prices[t] <= 0]
-                filled  = [t for t in missing if yf_prices.get(t, 0) > 0]
-                for t in filled:
-                    prices[t] = yf_prices[t]
-                if filled:
+                candidates = {t: yf_prices[t] for t in missing if yf_prices.get(t, 0) > 0}
+                usable, unusable = normalise_quote_prices(candidates, self.udef_cfg)
+                for t, px in usable.items():
+                    prices[t] = px
+                if usable:
                     logger.info(
                         "[%s] Used yfinance close prices for %d tickers (no IBKR data): %s",
-                        self.udef_cfg.name, len(filled), filled,
+                        self.udef_cfg.name, len(usable), sorted(usable),
+                    )
+                if unusable:
+                    logger.error(
+                        "[%s] %d ticker(s) left UNPRICED — not sized rather than "
+                        "sized on an unverified quote unit: %s",
+                        self.udef_cfg.name, len(unusable),
+                        ", ".join(f"{t} ({why})" for t, why in sorted(unusable.items())),
                     )
 
             # ── Borrow availability screen (short leg) ──────────────────── #
