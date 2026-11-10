@@ -214,8 +214,8 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_table_id="constituents",
         min_market_cap_usd=2e9,
         fractional_shares=False,            # IBKR API rejects fractional quantities (Error 10243)
-        n_longs=25,
-        n_shorts=25,
+        n_longs=35,
+        n_shorts=35,
     ),
 
     "nasdaq100": UniverseConfig(
@@ -304,8 +304,8 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_table_id="constituents",
         min_market_cap_usd=1e9,
         supports_trail_stop=False,           # Euronext rejects TRAIL on MKT parent
-        n_longs=25,
-        n_shorts=25,
+        n_longs=35,
+        n_shorts=35,
     ),
 
     "stoxx_uk": UniverseConfig(
@@ -324,8 +324,8 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         min_market_cap_usd=1e9,
         nav_scale=100.0,                     # LSE quotes in GBp (pence)
         supports_trail_stop=False,           # LSE: STP sent as a standalone order
-        n_longs=20,
-        n_shorts=20,
+        n_longs=30,
+        n_shorts=30,
     ),
 
     # One pan-European book instead of the two above, EUR and London together.
@@ -365,8 +365,8 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         wikipedia_table_id="constituents",
         min_market_cap_usd=1e9,
         supports_trail_stop=False,
-        n_longs=25,
-        n_shorts=25,
+        n_longs=35,
+        n_shorts=35,
     ),
 
     # ── Asia ──────────────────────────────────────────────────────────────── #
@@ -389,8 +389,8 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         use_wikipedia_scrape=False,       # Wikipedia page has no reliable constituents table; use fallback
         min_market_cap_usd=1e9,
         min_lot_size=100,                 # TSE requires orders in multiples of 100 shares
-        n_longs=20,
-        n_shorts=20,
+        n_longs=30,
+        n_shorts=30,
     ),
 
 

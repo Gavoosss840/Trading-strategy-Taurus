@@ -71,6 +71,33 @@ class TaurusConfig:
     #  Capital structure  (MM screen)                                     #
     # ------------------------------------------------------------------ #
     leverage_gap_threshold: float = 0.25     # 25 % divergence to flag
+    # ── Leg size: one rule, derived from universe breadth ───────────────── #
+    # n per leg = min(n_target, universe_size x max_universe_fraction / 2)
+    #
+    # Replaces five hand-set per-universe values with two global parameters,
+    # because the edge per name is thin and it is DIVERSIFICATION that makes it
+    # usable. Measured across three independent universes, the correlation
+    # between the fraction of the universe held and the Sharpe is +0.78 to
+    # +0.91 — more positions is better, monotonically, up to a point.
+    #
+    # And there IS a point. On stoxx_eur the Sharpe runs 1.74 (n=15), 2.10 (25),
+    # 2.20 (35), 2.03 (50), then COLLAPSES to -0.02 at n=70 with a -17.24%
+    # drawdown — 48% of the universe is no longer selection, it is a long/short
+    # replica of the index. max_universe_fraction is the cap that prevents it.
+    #
+    # On the combined book this rule is worth +0.153 of Sharpe and 0.54pp of
+    # drawdown against the previous settings, at a flat return — the gain is
+    # risk reduction, not extra return. Transaction costs barely move (0.60% to
+    # 0.68% a year across the whole grid), so "more positions costs more fees"
+    # does not hold at these levels.
+    #
+    # Deliberately NOT the per-universe grid maxima: those fit five parameters
+    # on ten years of one sample and score +0.154, i.e. 0.001 better. Taking a
+    # grid maximum in-sample is how this project produced a -97% backtest, and
+    # 0.001 of Sharpe is not evidence of anything.
+    n_target:               int   = 35
+    max_universe_fraction:  float = 0.50
+
     # ── Valuation leg in the selection ──────────────────────────────────── #
     # The residual income divergence enters the stock choice as a third filter,
     # CROSS-SECTIONALLY by rank within the universe and never on an absolute

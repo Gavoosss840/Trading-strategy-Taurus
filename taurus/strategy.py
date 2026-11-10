@@ -340,12 +340,24 @@ class TaurusStrategy:
         # CRITICAL: use window_returns (truncated at as_of), NOT self._returns —
         # the full-sample frame contains post-as_of months, so covariance and
         # the eligibility filter would leak future information into the backtest.
+        # Leg size from universe breadth, one rule for every universe.  The
+        # per-universe n_longs/n_shorts remain the ceiling, so a universe can
+        # ask for fewer but never for more than the rule allows.
+        n_long_eff = effective_leg_size(prices.shape[1], cfg, cfg.n_longs)
+        n_short_eff = effective_leg_size(prices.shape[1], cfg, cfg.n_shorts)
+        if (n_long_eff, n_short_eff) != (cfg.n_longs, cfg.n_shorts):
+            logger.info(
+                "[%s] Leg size %d/%d from breadth rule (universe %d names, "
+                "config said %d/%d).", as_of.date(), n_long_eff, n_short_eff,
+                prices.shape[1], cfg.n_longs, cfg.n_shorts,
+            )
+
         long_weights = build_leg(
-            long_final, long_scores, window_returns, sector_map, cfg, cfg.n_longs,
+            long_final, long_scores, window_returns, sector_map, cfg, n_long_eff,
             prev_weights=self._prev_long_w,
         )
         short_weights = build_leg(
-            short_final, short_scores, window_returns, sector_map, cfg, cfg.n_shorts,
+            short_final, short_scores, window_returns, sector_map, cfg, n_short_eff,
             prev_weights=self._prev_short_w,
         )
 
@@ -806,6 +818,29 @@ class BacktestResult:
             for t, w in snap.short_weights.items():
                 rows.append({"date": snap.date, "ticker": t, "leg": "short", "weight": w})
         return pd.DataFrame(rows)
+
+
+def effective_leg_size(universe_size: int, cfg, configured: int) -> int:
+    """
+    Positions per leg: min(n_target, universe_size x max_universe_fraction / 2).
+
+    THE RULE DECIDES, not the per-universe value. Treating the configured
+    number as a ceiling would defeat the whole point, since every universe was
+    set below what the rule asks for (25/20/20/25/20 against 35/20/30/35/30) and
+    nothing would ever be raised. `configured` is used only when the rule has no
+    target to offer.
+
+    One rule for every universe, so universes differ by their BREADTH and not by
+    a model of their own.
+
+    The floor of 3 exists because a leg of one or two names is not a leg: the
+    position cap would leave it deploying almost nothing and the beta
+    neutralisation would have nothing to work with.
+    """
+    cible = int(getattr(cfg, "n_target", 0) or configured)
+    frac = float(getattr(cfg, "max_universe_fraction", 1.0) or 1.0)
+    plafond_largeur = int(max(1, universe_size) * frac / 2.0)
+    return max(3, min(cible, plafond_largeur))
 
 
 def _compute_turnover(new: pd.Series, old: pd.Series) -> float:
