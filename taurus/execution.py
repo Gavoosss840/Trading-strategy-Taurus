@@ -1448,6 +1448,8 @@ class IBKRExecutor:
 
             # Place fresh standalone STP + LMT
             target_qty    = pos_qty if float(row["quantity"]) > 0 else -pos_qty
+            # Same flat level as the entry path: a restored protective order must
+            # not sit at a different distance from the one originally placed.
             ticker_tp_pct = mm_tp_pcts.get(sym, risk_cfg.take_profit_pct)
             self.order_mgr.place_protective_only(
                 self.conn, sym, target_qty, entry_price,
@@ -1816,39 +1818,39 @@ class IBKRExecutor:
             trail_pct = risk_cfg.stop_loss_pct
             tp_pct    = risk_cfg.take_profit_pct
 
-            # Build per-ticker take-profit from MM fair-value divergence.
-            # divergence_pct = (VL_theoretical - MarketCap) / MarketCap × 100
-            # Long  (+div): stock is undervalued → fair price is div% above current → LMT there
-            # Short (-div): stock is overvalued  → fair price is |div|% below → LMT there
-            # Fallback to flat tp_pct when MM data is missing or divergence ≈ 0.
-            MIN_TP = 0.05   # floor: always at least 5% upside required
-            MAX_TP = 0.80   # cap: discard outlier MM values > 80%
+            # Take-profit: the FLAT level, for every name.
+            #
+            # This used to be derived from the MM divergence, clamped into
+            # [5%, 80%]. Two things were wrong with that. The divergence does
+            # not measure mispricing — it is identically
+            # -(distress + agency)/market_cap, so it cannot say where fair
+            # value is. And it is tiny: -0.00% to -1.32% on current data, so
+            # the clamp pinned essentially every name to the 5% FLOOR. The
+            # comment above it claimed a fallback to the flat tp_pct when the
+            # divergence was near zero; the code clamped instead, and the
+            # fallback never happened.
+            #
+            # A +5% take-profit against a -10% stop is 1:2 reward/risk,
+            # inverted for a momentum strategy, and it fired constantly.
+            # Measured by replaying ten years of DAILY paths through the real
+            # exit rules:
+            #
+            #   S&P 500     no exits  +23.67%/yr  Sharpe 2.09  maxDD -6.70%
+            #               -10/+5     +5.92%/yr        0.29        -8.01%
+            #               -10/+20   +20.80%/yr        2.27        -5.33%
+            #   NASDAQ 100  no exits  +10.91%/yr        0.66       -13.10%
+            #               -10/+5     -0.17%/yr       -0.88       -17.81%
+            #               -10/+20   +11.67%/yr        0.95        -6.39%
+            #
+            # Half the positions exited on the +5% take-profit (50% on the S&P
+            # 500, 46% on the NASDAQ) against 17% on the stop. The flat 20%
+            # level is not merely better than 5% — it beats holding to the next
+            # rebalance on both Sharpe and drawdown.
             mm_tp_pcts: dict = {}
-            try:
-                mm_df = getattr(snapshot, "mm_df", None)
-                if mm_df is not None and not mm_df.empty and "divergence_pct" in mm_df.columns:
-                    for raw_t, mm_row in mm_df.iterrows():
-                        t   = raw_t.split(".")[0] if "." in str(raw_t) else str(raw_t)
-                        div = mm_row.get("divergence_pct", None)
-                        if div is None or pd.isna(div):
-                            continue
-                        tp = abs(float(div)) / 100.0        # always positive; direction handled by place_order
-                        tp = max(MIN_TP, min(tp, MAX_TP))   # clamp
-                        mm_tp_pcts[t] = tp
-                if mm_tp_pcts:
-                    logger.info(
-                        "[%s] MM fair-value take-profits: %d tickers (range %.0f%%–%.0f%%)",
-                        self.udef_cfg.name, len(mm_tp_pcts),
-                        min(mm_tp_pcts.values()) * 100,
-                        max(mm_tp_pcts.values()) * 100,
-                    )
-            except Exception as e:
-                logger.warning("[%s] Could not build MM take-profits: %s — using flat %.0f%%",
-                               self.udef_cfg.name, e, tp_pct * 100)
 
             for _, row in pd.concat([exits, entries]).reset_index(drop=True).iterrows():
                 ticker        = str(row["ticker"])
-                ticker_tp_pct = mm_tp_pcts.get(ticker, tp_pct)   # MM-derived or flat fallback
+                ticker_tp_pct = mm_tp_pcts.get(ticker, tp_pct)   # always the flat level now
                 order_info = self.order_mgr.place_order(
                     self.conn, row["ticker"], float(row["delta"]),
                     self.udef_cfg, dry_run=self.cfg.dry_run,
