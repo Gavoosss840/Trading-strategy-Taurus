@@ -1412,6 +1412,8 @@ def run_orders(args, cfg) -> None:
             universe=name, snapshot=snap, returns=strat._returns,
             nav_base=nav_uni, base_currency=base_ccy,
             cfg=ucfg_cfg, rcfg=rcfg,
+            fundamentals=strat._fundamentals, factors=strat._factors,
+            as_of=as_of,
         )
         rows_by_universe[name] = rows
         alertes = sum(1 for r in rows if r.get("Alerte"))

@@ -103,6 +103,25 @@ EQUITY_RISK_PREMIUM = 0.050
 # measured persistence says: interest expense is revenue for a lender.
 LENDERS = frozenset({"Financial Services", "Financials", "Banks", "Insurance"})
 
+# ── Documented overrides of the rule ─────────────────────────────────────── #
+# Applied ON TOP of the estimation, never by bending the procedure, so the
+# rule's own answer stays visible in the archive next to the override and its
+# reason. Each entry is a judgement call that has to justify itself.
+#
+# Technology: the rule picks ROE on an R2 of 0.723 against 0.667, a gap of
+# 0.056 that sits just above the 0.05 tie-break and is well inside the noise of
+# a 144-transition estimate. Meanwhile its ROE correlates 0.31 with leverage
+# against -0.02 for ROIC, and technology is the sector where buybacks are
+# heaviest — exactly the distortion the capital base was chosen to avoid. The
+# cost is a slightly less well estimated persistence; the gain is a denominator
+# that cannot be hollowed out by capital returns.
+METRIC_OVERRIDES: Dict[str, Tuple[str, str]] = {
+    "Technology": ("roic",
+                   "rule picked ROE on a 0.056 R2 gap (inside the noise) while "
+                   "its ROE is 10x more leverage-contaminated (0.31 vs -0.02) "
+                   "in the sector with the heaviest buybacks"),
+}
+
 
 # --------------------------------------------------------------------------- #
 #  Per-company metrics                                                        #
@@ -310,7 +329,35 @@ def estimate_calibration(panel: pd.DataFrame) -> dict:
                 choix = valides[0][0]
                 motif = f"higher R2 ({valides[0][1]['r2']:.3f})"
 
+        # Documented override, applied after the rule has spoken so both
+        # answers stay in the archive.  It can only move to a metric the rule
+        # itself found VALID — an override is a choice between defensible
+        # options, never a way to resurrect one the data rejected.
+        rule_choice, rule_reason = choix, motif
+        override = METRIC_OVERRIDES.get(sect)
+        if override is not None:
+            want, why = override
+            if want == choix:
+                pass                                  # already there
+            elif cands.get(want, {}).get("valide"):
+                choix = want
+                motif = f"OVERRIDE of the rule ({rule_reason}): {why}"
+                logger.info("Sector %s: override %s -> %s. %s",
+                            sect, (rule_choice or "none").upper(), want.upper(), why)
+            else:
+                logger.warning(
+                    "Sector %s: override to %s ignored — the rule found it "
+                    "INVALID (coverage %.0f%%, phi %s, R2 %s). An override "
+                    "chooses between defensible metrics, it cannot revive a "
+                    "rejected one.", sect, want.upper(),
+                    cands.get(want, {}).get("couverture", 0) * 100,
+                    cands.get(want, {}).get("phi"), cands.get(want, {}).get("r2"),
+                )
+
         sectors[sect] = {"metric": choix, "reason": motif,
+                         "rule_metric": rule_choice,
+                         "rule_reason": rule_reason,
+                         "overridden": bool(choix != rule_choice),
                          "n_firms": int(g["ticker"].nunique()),
                          "candidates": cands,
                          "phi": cands[choix]["phi"] if choix else None,

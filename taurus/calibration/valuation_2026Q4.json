@@ -1,0 +1,379 @@
+{
+  "sectors": {
+    "Basic Materials": {
+      "metric": "roe",
+      "reason": "only metric that passed",
+      "rule_metric": "roe",
+      "rule_reason": "only metric that passed",
+      "overridden": false,
+      "n_firms": 21,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8235,
+          "ancre": 0.112549,
+          "phi": 0.828447,
+          "r2": 0.651314,
+          "n_trans": 63,
+          "corr_levier": 0.6402,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.8235,
+          "ancre": 0.09351,
+          "phi": 0.572086,
+          "r2": 0.187527,
+          "n_trans": 63,
+          "corr_levier": -0.04,
+          "valide": false,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.828447,
+      "anchor": 0.112549
+    },
+    "Communication Services": {
+      "metric": "roic",
+      "reason": "higher R2 (0.867)",
+      "rule_metric": "roic",
+      "rule_reason": "higher R2 (0.867)",
+      "overridden": false,
+      "n_firms": 16,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8312,
+          "ancre": 0.209951,
+          "phi": 0.791813,
+          "r2": 0.60206,
+          "n_trans": 48,
+          "corr_levier": -0.4499,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.7792,
+          "ancre": 0.137669,
+          "phi": 0.934766,
+          "r2": 0.867142,
+          "n_trans": 45,
+          "corr_levier": -0.6494,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.934766,
+      "anchor": 0.137669
+    },
+    "Consumer Cyclical": {
+      "metric": "roic",
+      "reason": "R2 within 0.05, less contaminated by leverage",
+      "rule_metric": "roic",
+      "rule_reason": "R2 within 0.05, less contaminated by leverage",
+      "overridden": false,
+      "n_firms": 42,
+      "candidates": {
+        "roe": {
+          "couverture": 0.7143,
+          "ancre": 0.106941,
+          "phi": 0.962021,
+          "r2": 0.895072,
+          "n_trans": 107,
+          "corr_levier": 0.4165,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.803,
+          "ancre": 0.119668,
+          "phi": 0.96543,
+          "r2": 0.910443,
+          "n_trans": 120,
+          "corr_levier": 0.0962,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.96543,
+      "anchor": 0.119668
+    },
+    "Consumer Defensive": {
+      "metric": "roic",
+      "reason": "R2 within 0.05, less contaminated by leverage",
+      "rule_metric": "roic",
+      "rule_reason": "R2 within 0.05, less contaminated by leverage",
+      "overridden": false,
+      "n_firms": 19,
+      "candidates": {
+        "roe": {
+          "couverture": 0.766,
+          "ancre": 0.143845,
+          "phi": 0.81961,
+          "r2": 0.761104,
+          "n_trans": 54,
+          "corr_levier": 0.6373,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.8085,
+          "ancre": 0.123868,
+          "phi": 0.921182,
+          "r2": 0.774062,
+          "n_trans": 57,
+          "corr_levier": 0.0179,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.921182,
+      "anchor": 0.123868
+    },
+    "Energy": {
+      "metric": "roic",
+      "reason": "only metric that passed",
+      "rule_metric": "roic",
+      "rule_reason": "only metric that passed",
+      "overridden": false,
+      "n_firms": 5,
+      "candidates": {
+        "roe": {
+          "couverture": 0.9091,
+          "ancre": 0.108895,
+          "phi": 0.115695,
+          "r2": 0.026699,
+          "n_trans": 15,
+          "corr_levier": -0.57,
+          "valide": false,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.9091,
+          "ancre": 0.105173,
+          "phi": 0.267936,
+          "r2": 0.266912,
+          "n_trans": 15,
+          "corr_levier": -0.3851,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.267936,
+      "anchor": 0.105173
+    },
+    "Financial Services": {
+      "metric": "roe",
+      "reason": "only metric that passed",
+      "rule_metric": "roe",
+      "rule_reason": "only metric that passed",
+      "overridden": false,
+      "n_firms": 68,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8235,
+          "ancre": 0.130275,
+          "phi": 0.808306,
+          "r2": 0.801032,
+          "n_trans": 199,
+          "corr_levier": -0.0285,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.3282,
+          "ancre": 0.138393,
+          "phi": 0.857691,
+          "r2": 0.754007,
+          "n_trans": 78,
+          "corr_levier": 0.3217,
+          "valide": false,
+          "exclu_preteur": true
+        }
+      },
+      "phi": 0.808306,
+      "anchor": 0.130275
+    },
+    "Healthcare": {
+      "metric": "roic",
+      "reason": "R2 within 0.05, less contaminated by leverage",
+      "rule_metric": "roic",
+      "rule_reason": "R2 within 0.05, less contaminated by leverage",
+      "overridden": false,
+      "n_firms": 32,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8101,
+          "ancre": 0.1485,
+          "phi": 0.790178,
+          "r2": 0.58753,
+          "n_trans": 96,
+          "corr_levier": 0.4502,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.7975,
+          "ancre": 0.111361,
+          "phi": 0.804278,
+          "r2": 0.63528,
+          "n_trans": 94,
+          "corr_levier": -0.0141,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.804278,
+      "anchor": 0.111361
+    },
+    "Industrials": {
+      "metric": "roe",
+      "reason": "higher R2 (0.584)",
+      "rule_metric": "roe",
+      "rule_reason": "higher R2 (0.584)",
+      "overridden": false,
+      "n_firms": 62,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8419,
+          "ancre": 0.150505,
+          "phi": 0.787662,
+          "r2": 0.583757,
+          "n_trans": 183,
+          "corr_levier": -0.1203,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.8522,
+          "ancre": 0.113993,
+          "phi": 0.633024,
+          "r2": 0.339567,
+          "n_trans": 186,
+          "corr_levier": -0.3365,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.787662,
+      "anchor": 0.150505
+    },
+    "Real Estate": {
+      "metric": "roe",
+      "reason": "higher R2 (0.620)",
+      "rule_metric": "roe",
+      "rule_reason": "higher R2 (0.620)",
+      "overridden": false,
+      "n_firms": 9,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8571,
+          "ancre": 0.064449,
+          "phi": 0.513535,
+          "r2": 0.620019,
+          "n_trans": 27,
+          "corr_levier": 0.318,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.8571,
+          "ancre": 0.038355,
+          "phi": 0.374111,
+          "r2": 0.335965,
+          "n_trans": 27,
+          "corr_levier": 0.2293,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.513535,
+      "anchor": 0.064449
+    },
+    "Technology": {
+      "metric": "roic",
+      "reason": "OVERRIDE of the rule (higher R2 (0.723)): rule picked ROE on a 0.056 R2 gap (inside the noise) while its ROE is 10x more leverage-contaminated (0.31 vs -0.02) in the sector with the heaviest buybacks",
+      "rule_metric": "roe",
+      "rule_reason": "higher R2 (0.723)",
+      "overridden": true,
+      "n_firms": 48,
+      "candidates": {
+        "roe": {
+          "couverture": 0.817,
+          "ancre": 0.204431,
+          "phi": 0.825374,
+          "r2": 0.722567,
+          "n_trans": 144,
+          "corr_levier": 0.31,
+          "valide": true,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.7745,
+          "ancre": 0.16002,
+          "phi": 0.828483,
+          "r2": 0.667345,
+          "n_trans": 135,
+          "corr_levier": -0.0155,
+          "valide": true,
+          "exclu_preteur": false
+        }
+      },
+      "phi": 0.828483,
+      "anchor": 0.16002
+    },
+    "Utilities": {
+      "metric": null,
+      "reason": "no metric passed coverage, phi and R2",
+      "rule_metric": null,
+      "rule_reason": "no metric passed coverage, phi and R2",
+      "overridden": false,
+      "n_firms": 14,
+      "candidates": {
+        "roe": {
+          "couverture": 0.8,
+          "ancre": 0.106755,
+          "phi": -0.212005,
+          "r2": 0.0648,
+          "n_trans": 42,
+          "corr_levier": -0.228,
+          "valide": false,
+          "exclu_preteur": false
+        },
+        "roic": {
+          "couverture": 0.8,
+          "ancre": 0.070144,
+          "phi": 0.366384,
+          "r2": 0.146606,
+          "n_trans": 42,
+          "corr_levier": -0.453,
+          "valide": false,
+          "exclu_preteur": false
+        }
+      },
+      "phi": null,
+      "anchor": null
+    }
+  },
+  "n_firms": 338,
+  "n_obs": 1627,
+  "procedure": {
+    "winsor": [
+      -0.5,
+      1.0
+    ],
+    "couv_min": 0.7,
+    "r2_min": 0.25,
+    "phi_bounds": [
+      0.0,
+      1.0
+    ],
+    "r2_tie": 0.05,
+    "min_firms": 4,
+    "min_trans": 15,
+    "equity_risk_premium": 0.05
+  },
+  "sample_note": "Estimated from the first 110 tickers of sp500 and stoxx_eur, 60 of stoxx_uk and 60 of nikkei225 — NOT a random sample. Re-run `--mode calibrate` over the full universes to replace it.",
+  "as_of": "2026-11-10",
+  "quarter": "2026Q4",
+  "previous": null,
+  "alerts": []
+}

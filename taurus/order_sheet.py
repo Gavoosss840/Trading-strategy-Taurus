@@ -36,6 +36,7 @@ import pandas as pd
 from .config import TaurusConfig, DEFAULT_CONFIG
 from .risk import RiskConfig
 from .universe import REGISTRY, ticker_market
+from .valuation import load_calibration, valuation_screen
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,9 @@ def build_rows(
     cfg: TaurusConfig,
     rcfg: RiskConfig,
     prices: Optional[Dict[str, float]] = None,
+    fundamentals: Optional[pd.DataFrame] = None,
+    factors: Optional[pd.DataFrame] = None,
+    as_of=None,
 ) -> List[dict]:
     """One row per position for a single universe."""
     ucfg = REGISTRY.get(universe).config
@@ -157,17 +161,30 @@ def build_rows(
     px = prices if prices is not None else _last_prices(tickers)
     noms = _company_names(tickers)
 
-    # MM-derived take-profit, exactly as execute_rebalance builds it
-    MIN_TP, MAX_TP = 0.05, 0.80
-    mm_tp: Dict[str, float] = {}
-    mm_df = getattr(snapshot, "mm_df", None)
-    if mm_df is not None and not mm_df.empty and "divergence_pct" in mm_df.columns:
-        for raw_t, row in mm_df.iterrows():
-            div = row.get("divergence_pct", None)
-            if div is None or pd.isna(div):
-                continue
-            bare = str(raw_t).split(".")[0] if "." in str(raw_t) else str(raw_t)
-            mm_tp[bare] = max(MIN_TP, min(abs(float(div)) / 100.0, MAX_TP))
+    # ── Target price from the valuation leg ──────────────────────────────── #
+    # The take-profit sits at the TARGET PRICE, not at a fixed percentage. That
+    # needs a valuation that does not take the price as an input, which is what
+    # taurus/valuation.py provides; the MM divergence it replaces ran from
+    # -0.00% to -1.32% on current data and would have put the target on top of
+    # the entry. Names the model refuses to value get NO take-profit and a
+    # stated reason — a fabricated target is worse than none.
+    val = pd.DataFrame()
+    if fundamentals is not None and not fundamentals.empty:
+        calib = load_calibration(as_of)
+        if calib:
+            val = valuation_screen(
+                fundamentals.loc[fundamentals.index.intersection(tickers)],
+                calib, returns=returns,
+                market_returns=((factors["Mkt-RF"] + factors["RF"])
+                                if (factors is not None
+                                    and "Mkt-RF" in factors.columns) else None),
+                factors=factors, cfg=cfg,
+            )
+        else:
+            logger.warning(
+                "[%s] No calibration available — no target price this run. "
+                "Run `--mode calibrate` first.", universe,
+            )
 
     rows: List[dict] = []
     for side, weights in legs:
@@ -197,8 +214,12 @@ def build_rows(
             brut = notional_base / price_base
             shares = float(int(brut) // lot * lot)
 
-            tp_live = mm_tp.get(sym, rcfg.take_profit_pct)
-            tp_cfg  = rcfg.take_profit_pct
+            vr = val.loc[ticker] if (len(val) and ticker in val.index) else None
+            cible = (float(vr["target_factor"]) if (vr is not None
+                     and vr.get("eligible") and vr.get("target_factor") == vr.get("target_factor"))
+                     else np.nan)
+            motif_val = "" if cible == cible else (
+                str(vr["reason"]) if vr is not None else "not valued")
             stop_order = rcfg.stop_loss_pct
             stop_mon   = _vol_stop_pct(returns, ticker, rcfg)
 
@@ -220,10 +241,18 @@ def build_rows(
                 "Stop ordre %":      round(stop_order * 100, 1),
                 "Stop moniteur":     round(price * (1 - sens * stop_mon), 4),
                 "Stop moniteur %":   round(stop_mon * 100, 1),
-                "TP pose (5% plancher)":  round(price * (1 + sens * tp_live), 4),
-                "TP pose %":         round(tp_live * 100, 1),
-                "TP config (20%)":   round(price * (1 + sens * tp_cfg), 4),
-                "TP config %":       round(tp_cfg * 100, 1),
+                "Prix cible":        round(price * cible, 4) if cible == cible else None,
+                "Potentiel %":       round((cible - 1.0) * 100, 1) if cible == cible else None,
+                "Take profit":       round(price * cible, 4) if cible == cible else None,
+                "Valorisation":      (round(float(vr["intrinsic_equity"]), 0)
+                                      if (cible == cible and vr is not None) else None),
+                "Metrique":          (str(vr["metric"]).upper()
+                                      if (vr is not None and vr.get("metric")) else ""),
+                "Cout du capital %": (round(float(vr["cost_of_capital"]) * 100, 2)
+                                      if (vr is not None
+                                          and vr.get("cost_of_capital") == vr.get("cost_of_capital"))
+                                      else None),
+                "Sans prix cible":   motif_val,
                 "Alerte":            "" if shares > 0 else "sous le lot minimum",
             })
     return rows
