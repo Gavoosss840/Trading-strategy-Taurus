@@ -450,71 +450,76 @@ def _fetch_single_fundamental(ticker: str) -> dict:
         rec["sector"] = info.get("sector", "Unknown")
         rec["industry"] = info.get("industry", "Unknown")
 
-        # Balance sheet
-        bs = t.quarterly_balance_sheet
-        if bs is not None and not bs.empty:
-            def _row(keywords):
-                for col in bs.index:
-                    for kw in keywords:
-                        if kw.lower() in col.lower():
-                            vals = bs.loc[col].dropna()
-                            return float(vals.iloc[0]) if len(vals) else np.nan
-                return np.nan
+        # ── Statement lookup with lazy ANNUAL fallback ──────────────────── #
+        # Many European issuers report semi-annually, so quarterly frames are
+        # sparse for them: on a STOXX 600 sample the quarterly income statement
+        # carries EBIT for 32% of names against 80% for the annual one, and
+        # interest_expense / fcf drop to ~45%.  The MM screen reads a third of
+        # the signal from these fields, so it was running partly blind on
+        # CAC 40 and FTSE 100.
+        #
+        # Quarterly is still preferred when present (fresher, and complete for
+        # US names); the annual statement is fetched only when a field is
+        # actually missing, so this costs no extra request in the common case.
+        _annual: dict = {}
 
-            rec["total_debt"] = _row(["Total Debt", "Long Term Debt"])
-            rec["total_equity"] = _row(["Stockholders Equity", "Total Equity"])
-            rec["total_assets"] = _row(["Total Assets"])
-            rec["cash"] = _row(["Cash And Cash Equivalents", "Cash"])
-        else:
-            rec["total_debt"] = rec["total_equity"] = rec["total_assets"] = rec["cash"] = np.nan
+        def _annual_frame(attr: str):
+            if attr not in _annual:
+                try:
+                    _annual[attr] = getattr(t, attr)
+                except Exception:
+                    _annual[attr] = None
+            return _annual[attr]
+
+        def _scan(frame, keywords):
+            if frame is None or getattr(frame, "empty", True):
+                return np.nan
+            for row in frame.index:
+                for kw in keywords:
+                    if kw.lower() in row.lower():
+                        vals = frame.loc[row].dropna()
+                        if len(vals):
+                            return float(vals.iloc[0])
+            return np.nan
+
+        def _pick(quarterly, annual_attr, keywords):
+            val = _scan(quarterly, keywords)
+            if val == val:                       # not NaN
+                return val
+            return _scan(_annual_frame(annual_attr), keywords)
+
+        bs  = t.quarterly_balance_sheet
+        inc = t.quarterly_income_stmt
+        cf  = t.quarterly_cashflow
+
+        # Balance sheet
+        rec["total_debt"]    = _pick(bs, "balance_sheet", ["Total Debt", "Long Term Debt"])
+        rec["total_equity"]  = _pick(bs, "balance_sheet", ["Stockholders Equity", "Total Equity"])
+        rec["total_assets"]  = _pick(bs, "balance_sheet", ["Total Assets"])
+        rec["cash"]          = _pick(bs, "balance_sheet", ["Cash And Cash Equivalents", "Cash"])
 
         # Income statement
-        inc = t.quarterly_income_stmt
-        if inc is not None and not inc.empty:
-            def _inc_row(keywords):
-                for col in inc.index:
-                    for kw in keywords:
-                        if kw.lower() in col.lower():
-                            vals = inc.loc[col].dropna()
-                            return float(vals.iloc[0]) if len(vals) else np.nan
-                return np.nan
+        ebit_raw     = _pick(inc, "income_stmt", ["EBIT", "Operating Income"])
+        interest_raw = _pick(inc, "income_stmt", ["Interest Expense"])
+        tax_exp      = _pick(inc, "income_stmt", ["Tax Provision", "Income Tax"])
+        pretax       = _pick(inc, "income_stmt", ["Pretax Income"])
 
-            ebit_raw = _inc_row(["EBIT", "Operating Income"])
-            interest_raw = _inc_row(["Interest Expense"])
-            tax_exp = _inc_row(["Tax Provision", "Income Tax"])
-            pretax = _inc_row(["Pretax Income"])
-
-            rec["ebit"] = ebit_raw if not np.isnan(ebit_raw) else np.nan
-            rec["interest_expense"] = abs(interest_raw) if not np.isnan(interest_raw) else np.nan
-            if not np.isnan(tax_exp) and not np.isnan(pretax) and pretax > 0:
-                rec["tax_rate"] = min(tax_exp / pretax, 0.40)
-            else:
-                rec["tax_rate"] = 0.21
-
-            # Free Cash Flow
-            cf = t.quarterly_cashflow
-            if cf is not None and not cf.empty:
-                def _cf_row(keywords):
-                    for col in cf.index:
-                        for kw in keywords:
-                            if kw.lower() in col.lower():
-                                vals = cf.loc[col].dropna()
-                                return float(vals.iloc[0]) if len(vals) else np.nan
-                    return np.nan
-                # FCF = Operating Cash Flow – CapEx (proper definition)
-                op_cf  = _cf_row(["Operating Cash Flow", "Cash Flow From Operations"])
-                capex  = _cf_row(["Capital Expenditure"])
-                if not np.isnan(op_cf) and not np.isnan(capex):
-                    rec["fcf"] = op_cf - abs(capex)
-                elif not np.isnan(op_cf):
-                    rec["fcf"] = op_cf
-                else:
-                    rec["fcf"] = _cf_row(["Free Cash Flow"])
-            else:
-                rec["fcf"] = np.nan
+        rec["ebit"] = ebit_raw
+        rec["interest_expense"] = abs(interest_raw) if interest_raw == interest_raw else np.nan
+        if tax_exp == tax_exp and pretax == pretax and pretax > 0:
+            rec["tax_rate"] = min(tax_exp / pretax, 0.40)
         else:
-            rec["ebit"] = rec["interest_expense"] = rec["fcf"] = np.nan
             rec["tax_rate"] = 0.21
+
+        # Free cash flow = operating cash flow − capex
+        op_cf = _pick(cf, "cashflow", ["Operating Cash Flow", "Cash Flow From Operations"])
+        capex = _pick(cf, "cashflow", ["Capital Expenditure"])
+        if op_cf == op_cf and capex == capex:
+            rec["fcf"] = op_cf - abs(capex)
+        elif op_cf == op_cf:
+            rec["fcf"] = op_cf
+        else:
+            rec["fcf"] = _pick(cf, "cashflow", ["Free Cash Flow"])
 
     except Exception as exc:
         logger.debug("Fundamental fetch error for %s: %s", ticker, exc)
