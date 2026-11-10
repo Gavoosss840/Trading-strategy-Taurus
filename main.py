@@ -1429,11 +1429,18 @@ def run_orders(args, cfg) -> None:
     logger.info("=== ORDER SHEET WRITTEN | %d positions%s → %s ===",
                 total, f", {alertes} FLAGGED" if alertes else "", out)
     logger.info(
-        "Take-profit is reported twice on purpose: 'TP pose' is what the "
-        "automated path would place (MM divergence with a 5%% floor, and the MM "
-        "screen returns 0 for ~92%% of names, so it lands on 5%%), 'TP config' "
-        "is RiskConfig.take_profit_pct at 20%%.  The backtest models NEITHER — "
-        "it holds every position for the full month."
+        "Take-profit sits at the TARGET PRICE from the valuation leg, with the "
+        "metric, cost of capital and intrinsic value beside it. A name the "
+        "model refuses to value has no take-profit and carries the reason in "
+        "'Sans prix cible' — a fabricated target is worse than none."
+    )
+    logger.info(
+        "Two things to read with it. The target price moves 3 to 9 points when "
+        "the equity risk premium moves from 4%% to 6%%, and nobody can measure "
+        "that premium, so it is a soft level even though the RANKING is stable. "
+        "And the backtest models NEITHER the stop nor the take-profit: it holds "
+        "every position for the full month, so its Sharpe describes a different "
+        "strategy from the one these orders implement."
     )
 
 

@@ -172,9 +172,13 @@ def build_rows(
     if fundamentals is not None and not fundamentals.empty:
         calib = load_calibration(as_of)
         if calib:
+            # The WHOLE universe is passed, not just the selected leg: the
+            # sector asset betas are medians over sector members, and a leg of
+            # a dozen names has too few per sector to estimate them — one
+            # sector would be measured and the rest would silently fall back
+            # to a global median.  Only the rows needed are read back out.
             val = valuation_screen(
-                fundamentals.loc[fundamentals.index.intersection(tickers)],
-                calib, returns=returns,
+                fundamentals, calib, returns=returns,
                 market_returns=((factors["Mkt-RF"] + factors["RF"])
                                 if (factors is not None
                                     and "Mkt-RF" in factors.columns) else None),
@@ -220,6 +224,27 @@ def build_rows(
                      else np.nan)
             motif_val = "" if cible == cible else (
                 str(vr["reason"]) if vr is not None else "not valued")
+
+            # A take-profit on the WRONG SIDE of the entry is not a
+            # take-profit: on a long it would sit below the stop and close the
+            # position at a loss the moment it filled.  It happens here for a
+            # structural reason, not a bug — a book-anchored residual income
+            # model cannot reach the multiples the market pays for
+            # intangible-heavy companies (it tops out near 1.2-1.6x book with
+            # the measured persistence, against a CAC 40 median of 1.87x and
+            # 8.6x for Safran), because R&D, brands and certifications are
+            # expensed rather than capitalised and so are absent from the
+            # capital base.  The level is therefore suppressed and the reason
+            # stated, rather than handed over as an order.
+            if cible == cible:
+                marge = (cible - 1.0) if side == "LONG" else (1.0 - cible)
+                if marge <= 0:
+                    motif_val = (
+                        f"target {('below' if side == 'LONG' else 'above')} entry "
+                        f"({(cible - 1) * 100:+.0f}%) — book-anchored value cannot "
+                        f"reach the market multiple; not usable as a take-profit"
+                    )
+                    cible = np.nan
             stop_order = rcfg.stop_loss_pct
             stop_mon   = _vol_stop_pct(returns, ticker, rcfg)
 
