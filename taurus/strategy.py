@@ -287,6 +287,35 @@ class TaurusStrategy:
                         len(long_final),
                     )
 
+        # ── 5c. Valuation filter, cross-sectional ────────────────────────── #
+        # A name the model cannot value PASSES rather than being dropped: this
+        # filter ranks, it does not double as an exclusion. Utilities have no
+        # usable metric at all and stay tradable on the other two legs.
+        if getattr(cfg, "use_valuation_in_signal", False):
+            val_df = self._valuation_df(as_of, cfg)
+            if val_df is not None and not val_df.empty:
+                div = val_df.loc[val_df["eligible"], "divergence_pct"].dropna()
+                if len(div) >= 10:
+                    ql = div.quantile(getattr(cfg, "valuation_long_quantile", 0.50))
+                    qs = div.quantile(getattr(cfg, "valuation_short_quantile", 0.50))
+                    chers = set(div[div < ql].index)      # most overvalued
+                    bons = set(div[div > qs].index)       # least overvalued
+                    nl, ns = len(long_final), len(short_final)
+                    lf = long_final.difference(chers)
+                    sf = short_final.difference(bons)
+                    # Same guard as the credit veto: a filter that can empty a
+                    # leg is a worse failure than the edge it chases.
+                    if len(lf) >= max(3, cfg.n_longs // 4):
+                        long_final = lf
+                    if len(sf) >= max(3, cfg.n_shorts // 4):
+                        short_final = sf
+                    logger.info(
+                        "[%s] Valuation filter: longs %d->%d, shorts %d->%d "
+                        "(median divergence %.1f%%, %d valued).",
+                        as_of.date(), nl, len(long_final), ns, len(short_final),
+                        float(div.median()), len(div),
+                    )
+
         logger.info(
             "[%s] Signal (%s): %d long candidates, %d short candidates.",
             as_of.date(), signal_method, len(long_final), len(short_final),
@@ -453,6 +482,40 @@ class TaurusStrategy:
         return long_pool, short_pool, composite
 
     # ── Legacy binary AND-filter signal ──────────────────────────────────── #
+
+    def _valuation_df(self, as_of, cfg):
+        """
+        The valuation screen for this universe, computed once per month.
+
+        Cached on the instance: the screen is deterministic given
+        (fundamentals, calibration), and a backtest calls run() once per month
+        over the same fundamentals, so recomputing it 130 times would only burn
+        time. The calibration is still re-read per as_of, so a stored history
+        of quarterly calibrations takes effect point-in-time.
+        """
+        from .valuation import load_calibration, valuation_screen
+
+        if self._fundamentals is None or self._fundamentals.empty:
+            return None
+        key = str(as_of)[:7]
+        cache = getattr(self, "_val_cache", None)
+        if cache is None:
+            cache = self._val_cache = {}
+        if key in cache:
+            return cache[key]
+
+        calib = load_calibration(as_of)
+        if not calib:
+            cache[key] = None
+            return None
+        mkt = None
+        if self._factors is not None and "Mkt-RF" in self._factors.columns:
+            mkt = self._factors["Mkt-RF"] + self._factors["RF"]
+        out = valuation_screen(self._fundamentals, calib,
+                               returns=self._returns, market_returns=mkt,
+                               factors=self._factors, cfg=cfg)
+        cache[key] = out
+        return out
 
     def _binary_signal(
         self,

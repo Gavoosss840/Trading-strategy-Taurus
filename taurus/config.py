@@ -71,6 +71,17 @@ class TaurusConfig:
     #  Capital structure  (MM screen)                                     #
     # ------------------------------------------------------------------ #
     leverage_gap_threshold: float = 0.25     # 25 % divergence to flag
+    # ── Valuation leg in the selection ──────────────────────────────────── #
+    # The residual income divergence enters the stock choice as a third filter,
+    # CROSS-SECTIONALLY by rank within the universe and never on an absolute
+    # threshold: a book-anchored model values nearly everything below market,
+    # so an absolute cut would reject the whole universe. Its RANKING is what
+    # survived the sensitivity test, including across the full equity-risk-
+    # premium range, so a rank is what it is allowed to express.
+    use_valuation_in_signal: bool  = False
+    valuation_long_quantile: float = 0.50   # longs: divergence above this rank
+    valuation_short_quantile: float = 0.50  # shorts: divergence below this rank
+
     # ── Credit veto (what the MM module is actually for) ────────────────── #
     # MM cannot value a business — it takes the price as an input — but it can
     # read a balance sheet. These three thresholds drive credit_risk, a veto on

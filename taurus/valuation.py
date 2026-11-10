@@ -459,12 +459,20 @@ def load_calibration(as_of=None, directory: Optional[Path] = None) -> Optional[d
     history of quarterly calibrations exists the parameters can no longer leak
     backwards.
     """
+    # Normalised through pd.Timestamp for every input type.  Testing
+    # `isinstance(x, date)` to decide whether to convert does NOT work:
+    # pd.Timestamp subclasses datetime.datetime which subclasses datetime.date,
+    # so a Timestamp passes that test, skips the conversion, and then raises on
+    # the comparison in _latest. strategy.run passes a Timestamp, so that path
+    # failed on every call.
     if as_of is None:
         as_of = date.today()
-    elif isinstance(as_of, str):
-        as_of = pd.Timestamp(as_of).date()
-    elif hasattr(as_of, "date") and not isinstance(as_of, date):
-        as_of = as_of.date()
+    else:
+        try:
+            as_of = pd.Timestamp(as_of).date()
+        except Exception:
+            logger.error("Cannot read %r as a date — no calibration loaded.", as_of)
+            return None
     path, calib = _latest(directory or CALIBRATION_DIR, as_of)
     if calib is None:
         logger.warning("No calibration dated on or before %s — the valuation leg "
