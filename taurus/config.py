@@ -127,11 +127,20 @@ class TaurusConfig:
     #   0.50  1.19 | +16.25% | 1.37 | -8.28%      1.00  1.71 | +24.59% | 1.84 | -11.53%
     #
     # 0.80 takes 98% of the attainable Sharpe with 20% less drawdown than no
-    # cap at all, and still beats the pre-fix behaviour (Sharpe 1.45, maxDD
-    # -11.67%) on both counts.  The Nikkei disagrees mildly — its legs are
-    # spread widely enough that 0.30 never binds there (gross 1.79) and its
-    # Sharpe peaks at 0.30-0.40 — but the S&P 500 gain (+0.82) dwarfs the
-    # Nikkei loss (-0.04) at this allocation.
+    # cap at all.  The throttling is specific to the S&P 500, whose legs pile
+    # into 2-3 sectors (semiconductors and tech): elsewhere the legs are spread
+    # widely enough that the cap never binds and gross exposure does not move
+    # with it at all.  Against the behaviour before the fix, at 0.80:
+    #
+    #   universe     Sharpe        maxDD              gross across 0.30-1.00
+    #   S&P 500      1.45 -> 1.80  -11.67% -> -9.24%  0.83 .. 1.71  (throttled)
+    #   stoxx_eur    1.93 -> 1.98   -8.09% -> -6.97%  1.60 flat
+    #   Nikkei 225   1.01 -> 0.97   -5.89% -> -5.80%  1.79 flat
+    #
+    # Two of the three improve on BOTH Sharpe and drawdown; the Nikkei gives
+    # up 0.04 of Sharpe and gains a little drawdown.  Its Sharpe peaks at
+    # 0.30-0.40 and stoxx_eur's at 0.40, so a per-universe cap would be worth
+    # roughly +0.04 and +0.00 respectively — small, but see the note below.
     #
     # The real fix is structural, not a number: a cap applied at SIZING cannot
     # diversify a leg that only had 3 sectors to choose from, it can only
