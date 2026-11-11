@@ -241,9 +241,21 @@ class TaurusStrategy:
             return self._empty_snapshot(as_of)
 
         # ── 3. MM valuation screen ────────────────────────────────────────── #
+        # The credit screen reads equity volatility to invert Merton, and that
+        # volatility belongs to the ISSUER, in the currency its balance sheet is
+        # written in.  It must therefore come from the book's own returns, not
+        # from the regression window: converting a Tokyo line to USD for the
+        # regression adds the yen/dollar variance to it, which would raise every
+        # Japanese default probability for a reason that has nothing to do with
+        # the company's credit.
+        if self._regress_returns is None:
+            mm_window = window_returns          # same frame, no conversion
+        else:
+            mm_window = returns.iloc[start_loc : end_loc + 1].reindex(
+                index=window_returns.index, columns=window_returns.columns)
         logger.info("[%s] Running MM valuation screen...", as_of.date())
         live_fund = fund.loc[fund.index.intersection(alpha_df.index)]
-        mm_df     = mm_capital_structure_screen(live_fund, cfg, returns=window_returns) \
+        mm_df     = mm_capital_structure_screen(live_fund, cfg, returns=mm_window) \
                     if not live_fund.empty else pd.DataFrame()
 
         # ── 4. Momentum signal ────────────────────────────────────────────── #
