@@ -147,16 +147,24 @@ def load_universe_history(
         except Exception as e:
             logger.warning("[%s] Unreadable backtest history (%s).", universe, e)
 
+    # ONLY the live record is appended.
+    #
+    # output/<universe>/monthly_returns.csv is NOT a live file: `--mode
+    # backtest` writes the whole simulated series there.  Reading it here let
+    # a stale backtest dump — run at some earlier date, under some earlier
+    # configuration — override the committed seed completely, since live wins
+    # on overlap.  Observed: the allocator derived Sharpe 1.03 for the S&P 500
+    # where the committed measurement is 2.35, which would have meant a 48%
+    # loss over eight months on an account that is down about one percent.
+    # The live record lives under output/live/, written by live_reporting.
     if output_dir:
-        for p in (Path(output_dir) / universe / "monthly_returns.csv",
-                  Path(output_dir) / "live" / universe / "monthly_returns.csv"):
-            if p.exists():
-                try:
-                    s = pd.read_csv(p, index_col=0, parse_dates=True).squeeze("columns")
-                    morceaux.append(pd.Series(s).dropna())
-                    break
-                except Exception as e:
-                    logger.debug("Could not read %s: %s", p, e)
+        p = Path(output_dir) / "live" / universe / "monthly_returns.csv"
+        if p.exists():
+            try:
+                s = pd.read_csv(p, index_col=0, parse_dates=True).squeeze("columns")
+                morceaux.append(pd.Series(s).dropna())
+            except Exception as e:
+                logger.debug("Could not read %s: %s", p, e)
 
     if not morceaux:
         return pd.Series(dtype=float)
