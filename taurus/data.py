@@ -393,7 +393,11 @@ def get_fundamentals(
         ]
         return pd.DataFrame(columns=_empty_cols)
 
-    key = f"fundamentals_{'_'.join(sorted(tickers[:5]))}_{len(tickers)}"
+    # v2 : la lecture EDGAR (flux sur 12 mois, secteur SIC, nombre d'actions)
+    # et la normalisation des secteurs changent le contenu sans changer la
+    # taille de la liste — la clé doit changer, sinon un cache écrit avant les
+    # correctifs continuerait à servir les anciens chiffres pendant 12 h.
+    key = f"fundamentals_v2_{'_'.join(sorted(tickers[:5]))}_{len(tickers)}"
     cached = _cache_load(key, cfg)
     if cached is not None:
         return cached

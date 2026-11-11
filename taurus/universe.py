@@ -758,7 +758,10 @@ class UniverseDef:
                 return pd.DataFrame(columns=_empty_cols)
 
             import hashlib as _hl
-            _fb_key = f"fundamentals_{self.config.name}_v1"
+            # v2 : secteurs normalisés en GICS et correspondance des lignes
+            # d'états financiers corrigée — un cache antérieur servirait des
+            # secteurs inconnus et un EBIT lu sur la mauvaise ligne.
+            _fb_key = f"fundamentals_{self.config.name}_v2"
             cached = _cache_load(_fb_key, cfg)
             if cached is not None:
                 return cached
