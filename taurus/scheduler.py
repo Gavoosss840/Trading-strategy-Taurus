@@ -100,6 +100,29 @@ def _apply_weight_cap(weights: Dict[str, float], cap: float) -> Dict[str, float]
     return {k: v / total for k, v in out.items()} if total > 0 else out
 
 
+# Sharpe measured in the backtest, per universe, on the configuration that is
+# committed: 48-month regression window, resolved sectors, 2016-01 to 2026-10,
+# gross leverage 1.0, deploy_only_what_fits, beta neutralised by shrinking.
+# These are the per-universe figures behind the combined book's +18.71% and
+# Sharpe 2.40.
+#
+# They are the PRIOR used to allocate a universe that has not yet accumulated
+# enough live history to be scored on its own record — the same rule and the
+# same evidence that decided the book's composition in the first place, rather
+# than a placeholder. A universe switches to its own live Sharpe as soon as it
+# has `min_months` of returns on disk.
+#
+# Re-measure and update these when the strategy changes materially; they are a
+# record of a measurement, not a tuning knob.
+BACKTEST_SHARPE: Dict[str, float] = {
+    "sp500":     2.35,
+    "nasdaq100": 0.97,
+    "nikkei225": 1.31,
+    "stoxx_eur": 2.47,
+    "stoxx_uk":  1.36,
+}
+
+
 def sharpe_allocation_weights(
     returns: Dict[str, pd.Series],
     universes: List[str],
@@ -140,36 +163,49 @@ def sharpe_allocation_weights(
         if window and window > 0:
             r = r.tail(window)
         if len(r) < min_months:
-            # NOT a Sharpe of zero.  A universe with too little history has an
-            # UNKNOWN Sharpe, and scoring it zero sends its weight to zero once
-            # the others are normalised — silently, because the equal-weight
-            # fallback only fires when fewer than two universes are scorable.
-            # A freshly added universe was therefore allocated nothing while
-            # its positions were still computed and its existing holdings still
-            # ordered sold, which is how a sheet came to liquidate a whole
-            # region. Absence of evidence is not evidence of zero.
+            # NOT a Sharpe of zero.  A universe with too little live history
+            # has an unmeasured-here Sharpe, and scoring it zero sends its
+            # weight to zero once the others are normalised — silently,
+            # because the equal-weight fallback only fires when fewer than two
+            # universes are scorable.  A freshly added universe was therefore
+            # allocated nothing while its positions were still computed and
+            # its existing holdings still ordered sold, which is how a sheet
+            # came to liquidate a whole region.
             sans_historique.append(u)
             continue
         ann = float((1 + r).prod() ** (12 / len(r)) - 1)   # geometric
         vol = float(r.std() * np.sqrt(12))
         sharpes[u] = (ann - rf_annual) / vol if vol > 0 else 0.0
 
+    # A universe without enough live history is allocated on its BACKTEST
+    # Sharpe — the same rule and the same measurement that set the book's
+    # composition — and switches to its own live record as soon as it has
+    # min_months of returns.  A universe absent from that table falls back to
+    # the mean of the scored ones, so an unmeasured addition is neither
+    # favoured nor erased.
+    #
+    # This runs BEFORE the equal-weight fallback below, and deliberately so:
+    # at a cold start no universe has live history, and falling back to equal
+    # weights there would throw away the one thing actually measured about
+    # them.  The rule is the same on day one as on day four hundred.
+    if sans_historique:
+        moyen = (sum(sharpes.values()) / len(sharpes)) if sharpes else None
+        for u in sans_historique:
+            ref = BACKTEST_SHARPE.get(u)
+            if ref is None and moyen is None:
+                continue                      # nothing to go on: left unscored
+            sharpes[u] = float(ref) if ref is not None else moyen
+            logger.warning(
+                "%s: under %d months of live history — allocated on its "
+                "backtest Sharpe (%.2f)%s. It will be scored on its own "
+                "record once the history exists.",
+                u, min_months, sharpes[u],
+                "" if ref is not None else " [mean of the others, no backtest "
+                                           "figure recorded]",
+            )
+
     if len(sharpes) < 2:
         return equal
-
-    # An unscored universe is given the MEAN of the scored ones: neither
-    # favoured nor erased, and it earns its own place once six months of live
-    # returns exist.
-    if sans_historique:
-        moyen = sum(sharpes.values()) / len(sharpes)
-        logger.warning(
-            "No usable return history for %s — each given the mean Sharpe of "
-            "the others (%.2f) rather than zero. Their weight will be set by "
-            "their own record once %d months exist.",
-            ", ".join(sans_historique), moyen, min_months,
-        )
-        for u in sans_historique:
-            sharpes[u] = moyen
 
     raw   = {u: max(v, 0.0) for u, v in sharpes.items()}
     total = sum(raw.values())
