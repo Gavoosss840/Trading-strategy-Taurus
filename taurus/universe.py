@@ -993,9 +993,25 @@ class UniverseDef:
         if cached is not None:
             return cached
 
-        from .data import _fetch_single_fundamental
+        from .data import _fetch_single_fundamental, fetch_profiles
         from concurrent.futures import (ThreadPoolExecutor, as_completed,
                                         TimeoutError as FuturesTimeout)
+
+        # Sector / industry FIRST, before the statements.
+        #
+        # This pass was originally placed after the statement download, on the
+        # reasoning that `info` answers again once the statements are done.  On
+        # the author's machine it did; on the user's it did not — the quota was
+        # still spent, pass 1 resolved 14 names of 495 and the two retries
+        # resolved none.  The run was saved only by the fallback to whatever
+        # sector the statement pass had happened to collect, which is the very
+        # thing this pass exists to stop depending on.
+        #
+        # Asking for `info` alone costs ONE call per ticker and was measured at
+        # 288 successes out of 289 on a cold quota.  The statements cost six to
+        # seven calls each and are what exhausts it.  So the cheap, reliable
+        # request goes first and the expensive one absorbs the rationing.
+        fetch_profiles(tickers, cfg)
 
         records = []
         logger.info("[%s] Downloading fundamentals for %d tickers (parallel)…",
@@ -1012,10 +1028,10 @@ class UniverseDef:
 
         df = pd.DataFrame(records).set_index("ticker")
 
-        # Sector / industry on their own, after the statements: the statement
-        # calls are what exhausts the Yahoo quota, and `info` answers again
-        # once they are done.  Measured on this universe, a dedicated pass
-        # resolves the sector for every name the statement pass had lost.
+        # Fill the frame from the profile store populated above.  Anything the
+        # pre-pass could not resolve is retried here, in case the quota has
+        # recovered; a name that still fails keeps whatever the statement pass
+        # saw, and failing that stays an explicit "Unknown".
         from .data import apply_profiles
         df = apply_profiles(df, cfg)
 

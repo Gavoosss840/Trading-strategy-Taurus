@@ -1059,7 +1059,18 @@ def fetch_profiles(
         logger.info("Profile pass %d: %d resolved, %d left.",
                     p + 1, len(fresh), len(todo))
         if todo and p + 1 < passes:
-            time.sleep(15.0)
+            # A refused pass means the Yahoo quota is spent, and a quota does
+            # not come back in fifteen seconds.  Measured on a real run: three
+            # passes fifteen seconds apart resolved 14 names of 495, then 0,
+            # then 0 — the retries were pure ceremony.  Back off properly, and
+            # give up early rather than idle for minutes when a pass resolved
+            # nothing at all (the names are then simply unobtainable, or the
+            # quota needs far longer than this run can wait).
+            if not fresh:
+                logger.info("Profile pass %d resolved nothing — stopping early.",
+                            p + 1)
+                break
+            time.sleep(min(60.0 * (p + 1), 180.0))
 
     if todo:
         logger.warning("No sector for %d tickers (left blank, not guessed): %s",

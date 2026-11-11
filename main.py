@@ -33,6 +33,12 @@ from pathlib import Path
 
 from taurus.config import TaurusConfig as _TaurusConfig
 
+# The five universes the measured book is made of.  CAC 40 and FTSE 100 were
+# retired in November 2026 (too few names to diversify, and both subsumed by
+# the STOXX Europe 600 subsets), so the help text that still named them was
+# pointing at universes the strategy no longer trades.
+DEFAULT_UNIVERSES = ("sp500", "nasdaq100", "nikkei225", "stoxx_eur", "stoxx_uk")
+
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -113,15 +119,25 @@ def parse_args() -> argparse.Namespace:
                    help="Explicit ticker list (defaults to full S&P 500)")
 
     # Live trading
+    # The default used to be sp500 alone, while the strategy that was measured,
+    # documented and Sharpe-weighted is the five together.  An order sheet built
+    # on the default therefore covered one fifth of the book and split the NAV
+    # equally, with only a warning buried in the log to show for it.
     p.add_argument("--universes", nargs="+",
-                   default=["sp500"],
-                   help="Universes to trade: sp500 nasdaq100 cac40 ftse100 nikkei225")
+                   default=list(DEFAULT_UNIVERSES),
+                   help="Universes to trade (default: the five that make up the "
+                        "measured book). Available: "
+                        + " ".join(DEFAULT_UNIVERSES))
     p.add_argument("--live",      action="store_true",
                    help="Live trading (port 7496). Default: paper (7497)")
     p.add_argument("--no-dry-run", action="store_true",
                    help="Submit real orders. Default: dry-run (log only)")
-    p.add_argument("--nav",       type=float, default=100_000.0,
-                   help="Total portfolio NAV in USD for position sizing")
+    # No default: a wrong NAV sizes every line in the sheet wrongly and says
+    # nothing.  See run_orders, which asks IBKR when --from-ibkr is given.
+    p.add_argument("--nav",       type=float, default=None,
+                   help="Account value for position sizing, in the base "
+                        "currency. With --from-ibkr it is read from the "
+                        "account when omitted.")
 
     return p.parse_args()
 
@@ -147,7 +163,7 @@ def build_config(args: argparse.Namespace):
         ibkr_port=7496 if args.live else 7497,
         live_trading=args.live,
         dry_run=not args.no_dry_run,
-        nav_usd=args.nav,
+        nav_usd=(args.nav if args.nav else 100_000.0),
     )
 
 
@@ -1354,13 +1370,37 @@ def run_orders(args, cfg) -> None:
     from taurus.strategy import TaurusStrategy
     from taurus.universe import REGISTRY
 
-    universes = args.universes or ["sp500"]
-    nav = float(getattr(args, "nav", 0.0) or 0.0)
-    if nav <= 0:
-        logger.error("--mode orders requires --nav (account value, e.g. --nav 1000000).")
-        return
-
+    universes = args.universes or list(DEFAULT_UNIVERSES)
     base_ccy = (getattr(args, "base_currency", None) or "EUR").upper()
+
+    # NAV.  The flag used to default to 100_000, so the guard below could never
+    # fire and a sheet would be built, silently, for a tenth or a hundredth of
+    # the real account — every quantity in it wrong, nothing in the log to say
+    # so.  The default is now absent: with --from-ibkr the account is asked,
+    # and without it the value must be given.
+    nav = float(getattr(args, "nav", 0.0) or 0.0)
+    if nav <= 0 and getattr(args, "from_ibkr", False):
+        try:
+            from taurus.execution import IBKRConnection, OrderExecutor
+            _conn = IBKRConnection(cfg)
+            if _conn.ensure_connected():
+                try:
+                    nav = float(OrderExecutor(cfg).get_account_nav(
+                        _conn, currency=base_ccy) or 0.0)
+                    if nav > 0:
+                        logger.info("NAV read from IBKR: %.2f %s", nav, base_ccy)
+                finally:
+                    try:
+                        _conn.ib.disconnect()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("Could not read NAV from IBKR (%s).", e)
+    if nav <= 0:
+        logger.error("--mode orders needs the account value: pass --nav "
+                     "(e.g. --nav 1000000), or --from-ibkr to read it from the "
+                     "account.")
+        return
     rcfg = RiskConfig()
     # NOT args.end: its default is a backtest end date, which would silently
     # build the sheet for a past month.
