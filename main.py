@@ -1401,6 +1401,26 @@ def run_orders(args, cfg) -> None:
                      "(e.g. --nav 1000000), or --from-ibkr to read it from the "
                      "account.")
         return
+
+    # Record the NAV, so running the sheet builds a track record.
+    #
+    # Nothing in the manual workflow wrote one: record_nav_snapshot is called
+    # by the live scheduler and by force-rebalance, neither of which runs here.
+    # Someone generating a sheet every month would therefore accumulate no
+    # live history at all, and the allocation would sit on the backtest seed
+    # for ever while appearing to be expanding.  The sheet is generated once
+    # per rebalance against the real account, which is exactly when the NAV is
+    # worth stamping; the call is idempotent per date, so regenerating a sheet
+    # the same day overwrites rather than duplicates.
+    try:
+        from taurus.live_reporting import record_nav_snapshot
+        record_nav_snapshot(nav, base_ccy, args.output, note="order sheet")
+        logger.info("NAV recorded in %s/live/nav_history.csv (%.2f %s).",
+                    args.output, nav, base_ccy)
+    except Exception as e:
+        logger.warning("Could not record the NAV (%s) — the sheet is "
+                       "unaffected, but this month will be missing from the "
+                       "live track record.", e)
     rcfg = RiskConfig()
     # NOT args.end: its default is a backtest end date, which would silently
     # build the sheet for a past month.
