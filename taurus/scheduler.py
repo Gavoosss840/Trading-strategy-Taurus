@@ -133,25 +133,43 @@ def sharpe_allocation_weights(
     equal = {u: 1.0 / n for u in universes}
 
     sharpes: Dict[str, float] = {}
-    n_valid = 0
+    sans_historique: List[str] = []
     for u in universes:
         s = returns.get(u)
-        if s is None:
-            sharpes[u] = 0.0
-            continue
-        r = pd.Series(s).dropna()
+        r = pd.Series(s).dropna() if s is not None else pd.Series(dtype=float)
         if window and window > 0:
             r = r.tail(window)
         if len(r) < min_months:
-            sharpes[u] = 0.0
+            # NOT a Sharpe of zero.  A universe with too little history has an
+            # UNKNOWN Sharpe, and scoring it zero sends its weight to zero once
+            # the others are normalised — silently, because the equal-weight
+            # fallback only fires when fewer than two universes are scorable.
+            # A freshly added universe was therefore allocated nothing while
+            # its positions were still computed and its existing holdings still
+            # ordered sold, which is how a sheet came to liquidate a whole
+            # region. Absence of evidence is not evidence of zero.
+            sans_historique.append(u)
             continue
-        n_valid += 1
         ann = float((1 + r).prod() ** (12 / len(r)) - 1)   # geometric
         vol = float(r.std() * np.sqrt(12))
         sharpes[u] = (ann - rf_annual) / vol if vol > 0 else 0.0
 
-    if n_valid < 2:
+    if len(sharpes) < 2:
         return equal
+
+    # An unscored universe is given the MEAN of the scored ones: neither
+    # favoured nor erased, and it earns its own place once six months of live
+    # returns exist.
+    if sans_historique:
+        moyen = sum(sharpes.values()) / len(sharpes)
+        logger.warning(
+            "No usable return history for %s — each given the mean Sharpe of "
+            "the others (%.2f) rather than zero. Their weight will be set by "
+            "their own record once %d months exist.",
+            ", ".join(sans_historique), moyen, min_months,
+        )
+        for u in sans_historique:
+            sharpes[u] = moyen
 
     raw   = {u: max(v, 0.0) for u, v in sharpes.items()}
     total = sum(raw.values())

@@ -399,6 +399,10 @@ def build_rows(
                 "Run `--mode calibrate` first.", universe,
             )
 
+    # ── Lot rounding leaves capital on the table — put it back to work ───── #
+    plan_titres = _repartir_restant(legs, px, ucfg, cfg, nav_base, half,
+                                    base_currency, universe)
+
     rows: List[dict] = []
     for side, weights in legs:
         for ticker, w in weights.items():
@@ -422,10 +426,9 @@ def build_rows(
                 continue
 
             price_base    = price / float(minor) * rate
-            notional_base = float(w) * nav_base * half
-            lot  = max(int(getattr(ucfg, "min_lot_size", 1) or 1), 1)
-            brut = notional_base / price_base
-            shares = float(int(brut) // lot * lot)
+            # Share count comes from the leg-level plan, which rounds to whole
+            # lots AND redistributes what the rounding leaves over.
+            shares = float(plan_titres.get((side, ticker), 0.0))
 
             vr = val.loc[ticker] if (len(val) and ticker in val.index) else None
             cible = (float(vr["target_factor"]) if (vr is not None
@@ -519,7 +522,7 @@ def build_rows(
                 "Titres cibles":     cible_titres,
                 "A passer":          delta,
                 "Ordre":             sens_ordre,
-                "Alerte":            "" if shares > 0 else "sous le lot minimum",
+                "Alerte":            "" if shares > 0 else "lot minimum au-dessus du plafond par ligne",
             })
 
     # ── Positions a SOLDER ───────────────────────────────────────────────── #
@@ -590,6 +593,173 @@ def build_rows(
     return rows
 
 
+def _repartir_restant(
+    legs,
+    px: Dict[str, float],
+    ucfg,
+    cfg: TaurusConfig,
+    nav_base: float,
+    half: float,
+    base_currency: str,
+    universe: str,
+) -> Dict[tuple, float]:
+    """
+    Share count per line, after putting the lot-rounding remainder back to work.
+
+    Every target notional is rounded DOWN to a whole lot, so each line leaves a
+    fraction of a lot in cash and a line whose target is smaller than one lot
+    is dropped outright.  On the Tokyo book, where the lot is 100 shares, that
+    was 17 of 51 lines unsized and only 55.6% of the allocation deployed,
+    against 88% elsewhere — the capital was not held back by choice, it simply
+    could not be spent.
+
+    The remainder is handed out one lot at a time to the line with the largest
+    unmet demand, and the per-position cap is enforced throughout: a line is
+    only offered another lot if that lot keeps it under max_position_weight.
+    So the leftover of a name the lot size prices out of the book moves to the
+    names that can carry it, and no position grows past the risk limit that
+    the cap exists to impose.
+    """
+    plan: Dict[tuple, float] = {}
+    cap_w = float(getattr(cfg, "max_position_weight", 0.08) or 0.08)
+    lot = max(int(getattr(ucfg, "min_lot_size", 1) or 1), 1)
+
+    for side, weights in legs:
+        budget = nav_base * half
+        if budget <= 0 or not len(weights):
+            for t in weights:
+                plan[(side, t)] = 0.0
+            continue
+
+        infos: Dict[str, dict] = {}
+        for ticker, w in weights.items():
+            price = px.get(ticker, 0.0)
+            if not price or price <= 0:
+                continue
+            sym, ccy, minor, _primary = ticker_market(ticker, ucfg)
+            rate = _fx(ccy, base_currency)
+            if rate is None:
+                continue
+            pb = price / float(minor) * rate
+            if pb <= 0:
+                continue
+            vise = float(w) * budget
+            cap_titres = float(int((cap_w * budget) / pb) // lot * lot)
+            base = float(int(vise / pb) // lot * lot)
+            base = min(base, cap_titres)
+            infos[ticker] = {"pb": pb, "vise": vise, "titres": base,
+                             "cap": cap_titres}
+            plan[(side, ticker)] = base
+
+        if not infos:
+            continue
+
+        restant = budget - sum(i["titres"] * i["pb"] for i in infos.values())
+        ajoutes = 0
+        while restant > 0:
+            # Largest shortfall against the intended notional, among the lines
+            # that can still take a lot without breaching the position cap and
+            # without overspending what is left.
+            cand = [
+                (i["vise"] - i["titres"] * i["pb"], t)
+                for t, i in infos.items()
+                if i["titres"] + lot <= i["cap"] and lot * i["pb"] <= restant
+            ]
+            if not cand:
+                break
+            _manque, t = max(cand)
+            infos[t]["titres"] += lot
+            plan[(side, t)] = infos[t]["titres"]
+            restant -= lot * infos[t]["pb"]
+            ajoutes += 1
+            if ajoutes > 10_000:            # never spin on a pathological price
+                break
+
+        if ajoutes:
+            deploye = sum(i["titres"] * i["pb"] for i in infos.values())
+            logger.info(
+                "[%s] %s leg: %d extra lot(s) placed from the rounding "
+                "remainder — deployed %.1f%% of the leg budget (cap %.0f%% "
+                "per line respected).",
+                universe, side, ajoutes, 100.0 * deploye / budget, cap_w * 100,
+            )
+    return plan
+
+
+def consolider_entre_univers(rows_by_universe: Dict[str, List[dict]]) -> None:
+    """
+    Net the orders of a ticker that several universes hold at once.
+
+    The S&P 500 contains most of the NASDAQ 100, so the same company is
+    selected by two universes and legitimately held twice: the combined book
+    is the Sharpe-weighted sum of the universe books, so two target lines ARE
+    the intended exposure and must be added, not deduplicated.
+
+    What cannot be added is the POSITION ALREADY HELD.  Each universe reads the
+    broker independently and sees the whole holding, so each subtracted it in
+    full.  Measured on a real sheet: MU was held 3 shares and both universes
+    ordered 3 sold — six for a three-share line.  HON was held 9.5 with a
+    combined target of -57; one sheet ordered -66.5 and the other -9.5, so
+    executing both would have sold 76.  PEP and PYPL were worse than wrong in
+    size, they were opposite in direction: one sheet said buy to close, the
+    other said sell to deepen.
+
+    The holding is therefore attributed ONCE, to the line carrying the largest
+    target, and the delta of every line of that ticker is recomputed against
+    the consolidated figures.  The other lines keep their target for the record
+    and carry no order, with the reason written in the alert column so nobody
+    re-adds by hand what was deliberately removed.
+    """
+    par_ticker: Dict[str, List[dict]] = {}
+    for rs in rows_by_universe.values():
+        for r in rs:
+            par_ticker.setdefault(str(r.get("Ticker", "")), []).append(r)
+
+    for ticker, lignes in par_ticker.items():
+        if len(lignes) < 2:
+            continue
+
+        cible_totale = sum(float(r.get("Titres cibles", 0.0) or 0.0) for r in lignes)
+        # The holding is the same number read several times, not several
+        # holdings: take the largest magnitude rather than the sum.
+        detenu = max((float(r.get("Titres actuels", 0.0) or 0.0) for r in lignes),
+                     key=abs, default=0.0)
+        delta_total = cible_totale - detenu
+
+        porteur = max(lignes, key=lambda r: abs(float(r.get("Titres cibles", 0.0) or 0.0)))
+        univers_tous = ", ".join(sorted(str(r.get("Univers", "")) for r in lignes))
+
+        for r in lignes:
+            if r is porteur:
+                r["Titres actuels"] = detenu
+                r["A passer"] = delta_total
+                r["Ordre"] = ("" if abs(delta_total) < 1
+                              else ("ACHAT" if delta_total > 0 else "VENTE"))
+                if abs(cible_totale) < 1e-9 and abs(detenu) > 0:
+                    r["Action"] = "SOLDER"
+                elif detenu == 0:
+                    r["Action"] = "NOUVELLE"
+                elif cible_totale * detenu < 0:
+                    r["Action"] = "RETOURNEMENT"
+                elif abs(cible_totale) > abs(detenu):
+                    r["Action"] = "RENFORCER"
+                elif abs(cible_totale) < abs(detenu):
+                    r["Action"] = "REDUIRE"
+                else:
+                    r["Action"] = "INCHANGEE"
+                note = (f"ordre consolide sur {univers_tous} — "
+                        f"cible totale {cible_totale:+.0f}, detenu {detenu:+.0f}")
+                r["Alerte"] = f"{r.get('Alerte') or ''} {note}".strip()
+            else:
+                r["Titres actuels"] = 0.0
+                r["A passer"] = 0.0
+                r["Ordre"] = ""
+                r["Action"] = "VOIR " + str(porteur.get("Univers", "")).upper()
+                note = (f"titre partage ({univers_tous}) — ordre porte par la "
+                        f"ligne {porteur.get('Univers', '')}, ne pas passer deux fois")
+                r["Alerte"] = f"{r.get('Alerte') or ''} {note}".strip()
+
+
 def write_workbook(
     rows_by_universe: Dict[str, List[dict]],
     path: Path,
@@ -599,6 +769,7 @@ def write_workbook(
 ) -> Path:
     """Write one sheet per universe, a combined sheet and a summary."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    consolider_entre_univers(rows_by_universe)
     toutes = [r for rs in rows_by_universe.values() for r in rs]
     combined = pd.DataFrame(toutes)
 
