@@ -105,6 +105,43 @@ _SIC_RANGES: List[Tuple[int, int, str]] = [
 ]
 
 
+# yfinance publie sa propre nomenclature, qui n'est PAS celle du GICS :
+# « Financial Services » au lieu de « Financials », « Consumer Cyclical » au
+# lieu de « Consumer Discretionary »…  Les titres hors SEC passant uniquement
+# par yfinance, leurs libellés ne correspondaient à aucune entrée de
+# `_SECTOR_DISTRESS_RATE` (donc 20 % forfaitaire), ni de `_NO_COVERAGE_GUARD`
+# et `_NO_MM_VALUATION` — l'exemption des financières ne s'appliquait à
+# aucune banque européenne ou asiatique.
+_YFINANCE_TO_GICS: dict[str, str] = {
+    "technology":             "Information Technology",
+    "financial services":     "Financials",
+    "financial":              "Financials",
+    "healthcare":             "Health Care",
+    "consumer cyclical":      "Consumer Discretionary",
+    "consumer defensive":     "Consumer Staples",
+    "industrials":            "Industrials",
+    "basic materials":        "Materials",
+    "energy":                 "Energy",
+    "utilities":              "Utilities",
+    "real estate":            "Real Estate",
+    "communication services": "Communication Services",
+}
+
+# Les libellés déjà en GICS passent tels quels : la même fonction sert aux deux
+# sources, et un secteur déjà correct ne doit pas être dégradé en « Unknown ».
+_GICS_SECTORS = frozenset(_YFINANCE_TO_GICS.values())
+
+
+def normalise_sector(label: Optional[str]) -> str:
+    """Ramène un libellé de secteur, yfinance ou GICS, à la nomenclature GICS."""
+    if not label:
+        return "Unknown"
+    text = str(label).strip()
+    if text in _GICS_SECTORS:
+        return text
+    return _YFINANCE_TO_GICS.get(text.lower(), "Unknown")
+
+
 def sector_from_sic(sic: Optional[str | int]) -> str:
     """Traduit un code SIC en secteur GICS, ou "Unknown" si indéterminable."""
     if sic is None or sic == "":

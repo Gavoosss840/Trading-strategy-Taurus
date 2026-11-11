@@ -31,6 +31,7 @@ import yfinance as yf
 _HAS_PDR = False  # lazy-loaded inside get_ff5_factors to avoid import-time errors
 
 from .config import TaurusConfig, DEFAULT_CONFIG
+from .sectors import normalise_sector
 
 try:
     from .sec_edgar import get_fundamentals_batch as _edgar_batch
@@ -426,7 +427,10 @@ def get_fundamentals(
                 try:
                     info = yf.Ticker(ticker).info or {}
                     df.loc[ticker, "market_cap"] = info.get("marketCap", np.nan)
-                    df.loc[ticker, "sector"]     = info.get("sector", "Unknown")
+                    # Ne pas écraser le secteur déduit du code SIC : il est
+                    # déjà en GICS et plus fiable que le libellé yfinance.
+                    if df.loc[ticker, "sector"] in (None, "", "Unknown"):
+                        df.loc[ticker, "sector"] = normalise_sector(info.get("sector"))
                 except Exception:
                     pass
     else:
@@ -485,6 +489,57 @@ def _revenue_cagr_yf(ticker_obj) -> float:
         return np.nan
 
 
+# Libellés qui contiennent le mot cherché tout en désignant autre chose.
+# yfinance n'expose pas de ligne « Operating Income » pour les banques : la
+# recherche par sous-chaîne attrapait alors « Other NON Operating Income
+# Expenses », une ligne résiduelle.  Mesuré : BNP Paribas ressortait à
+# −41 M€ d'EBIT le trimestre où elle gagnait 3,46 Md€, Barclays à 20 M£ et
+# ICBC à 33 M — et BNP était classée en VENTE sur ce chiffre.
+_ROW_EXCLUSIONS: dict[str, tuple[str, ...]] = {
+    "operating income": ("non operating", "non-operating"),
+    "ebit":             ("ebitda",),
+    "interest expense": ("net interest",),
+}
+
+
+def _match_statement_row(frame, keywords) -> float:
+    """Valeur la plus récente d'une ligne d'état financier, par mots-clés.
+
+    Un libellé exact l'emporte sur une correspondance partielle, et un libellé
+    qui nie le mot cherché est écarté : sans quoi « Other Non Operating Income
+    Expenses » répond à une recherche de « Operating Income ».
+
+    Renvoie NaN plutôt qu'une ligne approchante : une valorisation absente se
+    lit comme telle en aval, un EBIT faux produit un signal de vente.
+    """
+    if frame is None or frame.empty:
+        return np.nan
+
+    labels = [(str(label), label) for label in frame.index]
+
+    def _value(label):
+        values = frame.loc[label].dropna()
+        return float(values.iloc[0]) if len(values) else np.nan
+
+    # 1. Libellé exact.
+    for keyword in keywords:
+        target = keyword.strip().lower()
+        for text, label in labels:
+            if text.strip().lower() == target:
+                return _value(label)
+
+    # 2. Correspondance partielle, hors libellés qui nient le mot cherché.
+    for keyword in keywords:
+        target = keyword.lower()
+        banned = _ROW_EXCLUSIONS.get(target, ())
+        for text, label in labels:
+            lowered = text.lower()
+            if target in lowered and not any(bad in lowered for bad in banned):
+                return _value(label)
+
+    return np.nan
+
+
 def _fetch_single_fundamental(ticker: str) -> dict:
     rec: dict = {"ticker": ticker}
     try:
@@ -492,19 +547,17 @@ def _fetch_single_fundamental(ticker: str) -> dict:
         info = t.info or {}
 
         rec["market_cap"] = info.get("marketCap", np.nan)
-        rec["sector"] = info.get("sector", "Unknown")
+        # yfinance a sa propre nomenclature : on la ramène au GICS, seule
+        # nomenclature que connaissent le taux de détresse sectoriel, le
+        # plafond par secteur et l'exemption des financières.
+        rec["sector"] = normalise_sector(info.get("sector"))
         rec["industry"] = info.get("industry", "Unknown")
 
         # Balance sheet
         bs = t.quarterly_balance_sheet
         if bs is not None and not bs.empty:
             def _row(keywords):
-                for col in bs.index:
-                    for kw in keywords:
-                        if kw.lower() in col.lower():
-                            vals = bs.loc[col].dropna()
-                            return float(vals.iloc[0]) if len(vals) else np.nan
-                return np.nan
+                return _match_statement_row(bs, keywords)
 
             rec["total_debt"] = _row(["Total Debt", "Long Term Debt"])
             rec["total_equity"] = _row(["Stockholders Equity", "Total Equity"])
@@ -522,12 +575,7 @@ def _fetch_single_fundamental(ticker: str) -> dict:
         inc = t.quarterly_income_stmt
         if inc is not None and not inc.empty:
             def _inc_row(keywords):
-                for col in inc.index:
-                    for kw in keywords:
-                        if kw.lower() in col.lower():
-                            vals = inc.loc[col].dropna()
-                            return float(vals.iloc[0]) if len(vals) else np.nan
-                return np.nan
+                return _match_statement_row(inc, keywords)
 
             ebit_raw = _inc_row(["EBIT", "Operating Income"])
             interest_raw = _inc_row(["Interest Expense"])
@@ -545,12 +593,7 @@ def _fetch_single_fundamental(ticker: str) -> dict:
             cf = t.quarterly_cashflow
             if cf is not None and not cf.empty:
                 def _cf_row(keywords):
-                    for col in cf.index:
-                        for kw in keywords:
-                            if kw.lower() in col.lower():
-                                vals = cf.loc[col].dropna()
-                                return float(vals.iloc[0]) if len(vals) else np.nan
-                    return np.nan
+                    return _match_statement_row(cf, keywords)
                 # FCF = Operating Cash Flow – CapEx (proper definition)
                 op_cf  = _cf_row(["Operating Cash Flow", "Cash Flow From Operations"])
                 capex  = _cf_row(["Capital Expenditure"])
