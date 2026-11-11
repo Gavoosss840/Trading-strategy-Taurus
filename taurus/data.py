@@ -19,7 +19,9 @@ import json
 import logging
 import os
 import pickle
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -313,6 +315,70 @@ def _fx_rate(from_ccy: str, to_ccy: str) -> Optional[float]:
         logger.debug("FX rate %s->%s failed: %s", from_ccy, to_ccy, e)
     _FX_RATE_CACHE[k] = rate
     return rate
+
+
+def monthly_fx_series(
+    from_ccy: str,
+    to_ccy: str,
+    index: pd.DatetimeIndex,
+) -> Optional[pd.Series]:
+    """
+    Month-end rate, one unit of `from_ccy` in `to_ccy`, aligned on `index`.
+
+    Returns None when the pair cannot be downloaded — the caller must then
+    refuse to convert rather than invent a rate.
+    """
+    if (from_ccy or "").upper() == (to_ccy or "").upper():
+        return pd.Series(1.0, index=index)
+    try:
+        raw = yf.download(f"{from_ccy}{to_ccy}=X",
+                          start=index.min() - pd.DateOffset(months=2),
+                          end=index.max() + pd.DateOffset(days=5),
+                          interval="1mo", auto_adjust=True,
+                          progress=False, threads=False)
+    except Exception as exc:
+        logger.error("FX series %s->%s failed: %s", from_ccy, to_ccy, exc)
+        return None
+    if raw is None or raw.empty:
+        logger.error("FX series %s->%s returned nothing.", from_ccy, to_ccy)
+        return None
+    s = raw["Close"] if "Close" in raw else raw.iloc[:, [0]]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    if s.empty:
+        return None
+    s.index = pd.to_datetime(s.index).to_period("M").to_timestamp("M")
+    s = s[~s.index.duplicated(keep="last")]
+    return s.reindex(index).ffill()
+
+
+def returns_in_currency(
+    returns: pd.DataFrame,
+    from_ccy: str,
+    to_ccy: str,
+) -> Optional[pd.DataFrame]:
+    """
+    Re-express a frame of simple returns in another currency.
+
+    A return earned in `from_ccy` is worth, to a holder who measures in
+    `to_ccy`,  (1 + r_local) * (1 + r_fx) - 1.  The FX term is common to every
+    column, which is exactly why it cancels out of a cross-sectional ranking
+    and does NOT cancel out of a regression intercept.
+
+    Returns None when the rate is unavailable: converting with a made-up rate
+    would be worse than not converting at all.
+    """
+    if (from_ccy or "").upper() == (to_ccy or "").upper():
+        return returns
+    rate = monthly_fx_series(from_ccy, to_ccy, returns.index)
+    if rate is None or rate.notna().sum() == 0:
+        return None
+    r_fx = rate.pct_change()
+    out = returns.add(1.0).mul(r_fx.add(1.0), axis=0).sub(1.0)
+    # The first month has no FX return; leave it out rather than treat it as 0.
+    out.iloc[0] = np.nan
+    return out
 
 
 def normalise_quote_prices(
@@ -676,9 +742,19 @@ def _fetch_single_fundamental(ticker: str) -> dict:
         t = yf.Ticker(ticker)
         info = t.info or {}
 
+        # An empty `info` means the quoteSummary call was refused (Yahoo answers
+        # 401 "Invalid Crumb" once a run has spent its quota), NOT that the
+        # issuer has no sector.  Writing "Unknown" here made the two
+        # indistinguishable and cached the refusal as if it were a measurement:
+        # 90% of the S&P 500 and 91% of the eurozone universe carried
+        # sector="Unknown", which silently disabled the credit veto's lender
+        # exemption and the sector distress rates.  Leave the field ABSENT so
+        # `fetch_profiles` can fill it from its own pass or from the store.
         rec["market_cap"] = info.get("marketCap", np.nan)
-        rec["sector"]     = info.get("sector", "Unknown")
-        rec["industry"]   = info.get("industry", "Unknown")
+        if info.get("sector"):
+            rec["sector"] = info["sector"]
+        if info.get("industry"):
+            rec["industry"] = info["industry"]
 
         _cache: dict = {}
 
@@ -859,11 +935,167 @@ def _fetch_single_fundamental(ticker: str) -> dict:
                   "effective_tax_rate", "tax_rate", "roe", "roe_normalized",
                   "book_per_share", "shares_outstanding", "fcf"):
         rec.setdefault(field, np.nan)
-    rec.setdefault("sector", "Unknown")
-    rec.setdefault("industry", "Unknown")
+    # sector / industry are deliberately NOT defaulted here — see above.
     rec.setdefault("equity_negative", False)
     rec.setdefault("tax_rate_source", "missing")
     return rec
+
+
+# --------------------------------------------------------------------------- #
+#  Issuer profile (sector / industry) — fetched on its own, stored for good    #
+# --------------------------------------------------------------------------- #
+#
+# Why this is a separate pass rather than a field of the fundamentals record:
+#
+# `_fetch_single_fundamental` makes six to seven Yahoo calls per ticker (info,
+# then the annual and quarterly income statement, balance sheet and cash flow).
+# Run over an index at eight threads, the quota runs out part way through —
+# measured on the 289-name eurozone universe, the first refusal landed at
+# ticker 182 — and from there `t.info` answers 401 and returns {}.  Asking for
+# `info` ALONE over the same 289 names succeeds 288 times, so the sector is
+# perfectly obtainable; it was being lost as collateral damage of the statement
+# calls, and the loss was then written to disk as sector="Unknown".
+#
+# Sector and industry change at most once in a company's life, so a value that
+# was ever read correctly is kept for good and a later refusal can never
+# degrade it.  This is the one field in the cache that is allowed to outlive a
+# cache bump.
+
+_PROFILE_LOCK = threading.Lock()
+_PROFILE_MEM: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _profile_path(cfg: TaurusConfig = DEFAULT_CONFIG) -> Path:
+    return Path(getattr(cfg, "cache_dir", ".cache")) / "profile_map.json"
+
+
+def _profile_load(cfg: TaurusConfig = DEFAULT_CONFIG) -> Dict[str, Dict[str, str]]:
+    global _PROFILE_MEM
+    with _PROFILE_LOCK:
+        if _PROFILE_MEM is None:
+            p = _profile_path(cfg)
+            try:
+                _PROFILE_MEM = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                _PROFILE_MEM = {}
+        return dict(_PROFILE_MEM)
+
+
+def _profile_store(new: Dict[str, Dict[str, str]],
+                   cfg: TaurusConfig = DEFAULT_CONFIG) -> None:
+    """Merge freshly read profiles into the store.  Never deletes, never
+    overwrites a known sector with a missing one."""
+    global _PROFILE_MEM
+    if not new:
+        return
+    with _PROFILE_LOCK:
+        if _PROFILE_MEM is None:
+            _PROFILE_MEM = {}
+        for tkr, prof in new.items():
+            if not prof.get("sector"):
+                continue
+            _PROFILE_MEM[tkr] = {"sector": prof["sector"],
+                                 "industry": prof.get("industry") or ""}
+        p = _profile_path(cfg)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(_PROFILE_MEM, ensure_ascii=False,
+                                      indent=0, sort_keys=True),
+                           encoding="utf-8")
+            tmp.replace(p)
+        except Exception as exc:          # a cache write must never be fatal
+            logger.debug("Could not persist profile map: %s", exc)
+
+
+def fetch_profiles(
+    tickers: List[str],
+    cfg: TaurusConfig = DEFAULT_CONFIG,
+    passes: int = 3,
+    max_workers: int = 8,
+) -> Dict[str, Dict[str, str]]:
+    """
+    {ticker: {"sector", "industry"}} for every ticker that can be resolved.
+
+    Reads the persistent store first and only goes to Yahoo for what is
+    missing, retrying the stragglers at lower concurrency.  A ticker Yahoo
+    refuses outright (delisted, renamed) is simply absent from the result —
+    the caller decides what to do, instead of receiving a fabricated
+    "Unknown".
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    stored = _profile_load(cfg)
+    for tkr in tickers:
+        prof = stored.get(tkr)
+        if prof and prof.get("sector"):
+            out[tkr] = dict(prof)
+
+    todo = [t for t in tickers if t not in out]
+    if not todo:
+        return out
+
+    def _one(tkr: str):
+        try:
+            info = yf.Ticker(tkr).info or {}
+        except Exception:
+            return tkr, None
+        sec = info.get("sector")
+        if not sec:
+            return tkr, None
+        return tkr, {"sector": sec, "industry": info.get("industry") or ""}
+
+    for p in range(passes):
+        if not todo:
+            break
+        workers = max(1, max_workers // (1 if p == 0 else 2))
+        fresh: Dict[str, Dict[str, str]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for tkr, prof in pool.map(_one, todo):
+                if prof:
+                    fresh[tkr] = prof
+        out.update(fresh)
+        _profile_store(fresh, cfg)
+        todo = [t for t in todo if t not in out]
+        logger.info("Profile pass %d: %d resolved, %d left.",
+                    p + 1, len(fresh), len(todo))
+        if todo and p + 1 < passes:
+            time.sleep(15.0)
+
+    if todo:
+        logger.warning("No sector for %d tickers (left blank, not guessed): %s",
+                       len(todo), ", ".join(sorted(todo)[:10]))
+    return out
+
+
+def apply_profiles(
+    df: pd.DataFrame,
+    cfg: TaurusConfig = DEFAULT_CONFIG,
+) -> pd.DataFrame:
+    """Fill the `sector` / `industry` columns of a fundamentals frame.
+
+    Rows Yahoo never resolved keep sector="Unknown" — but it now means
+    "genuinely unresolved", and the log above says how many there are.
+    """
+    if df is None or df.empty:
+        return df
+    prof = fetch_profiles(df.index.tolist(), cfg)
+    sec = pd.Series({t: p["sector"] for t, p in prof.items()})
+    ind = pd.Series({t: p.get("industry", "") for t, p in prof.items()})
+
+    if "sector" not in df.columns:
+        df["sector"] = np.nan
+    if "industry" not in df.columns:
+        df["industry"] = np.nan
+    # A value already present in the frame wins only if the profile pass found
+    # nothing; the profile pass is the more reliable of the two.
+    df["sector"] = sec.reindex(df.index).fillna(df["sector"]).fillna("Unknown")
+    df["industry"] = ind.reindex(df.index).replace("", np.nan) \
+                        .fillna(df["industry"]).fillna("Unknown")
+
+    n_unk = int((df["sector"] == "Unknown").sum())
+    logger.info("Sector resolved for %d/%d tickers (%d unresolved).",
+                len(df) - n_unk, len(df), n_unk)
+    return df
 
 
 # --------------------------------------------------------------------------- #

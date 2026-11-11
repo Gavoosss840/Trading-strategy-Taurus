@@ -131,6 +131,9 @@ class TaurusStrategy:
         self.cfg              = cfg
         self._prices:         Optional[pd.DataFrame] = None
         self._returns:        Optional[pd.DataFrame] = None
+        # Returns expressed in the factors' currency, for the FF regression
+        # only (see run(), step 1).  None → regress in the book's currency.
+        self._regress_returns: Optional[pd.DataFrame] = None
         self._factors:        Optional[pd.DataFrame] = None
         self._fundamentals:   Optional[pd.DataFrame] = None
         self._tickers:        Optional[List[str]]    = None
@@ -205,10 +208,21 @@ class TaurusStrategy:
         fund    = self._fundamentals
 
         # ── 1. Rolling window of returns for FF5/FF6 regression ──────────── #
+        # The regression window may be expressed in a different currency from
+        # the book.  Kenneth French publishes the regional factor sets in USD,
+        # so a eurozone or Tokyo line regressed in its own currency is matched
+        # against a market factor measured in another one, and the EUR/USD or
+        # JPY/USD drift — common to every name in the universe — has nowhere to
+        # go but the intercept.  The ranking of alphas survives a common shift;
+        # the SIGNAL GATE does not, because |t| >= crit is a test on the level.
+        # `_regress_returns`, when set, carries the same returns converted to
+        # the factors' currency and is used for the regression ONLY: the book,
+        # its covariance and its P&L stay in the base currency.
+        reg_src   = self._regress_returns if self._regress_returns is not None else returns
         idx       = prices.index
         end_loc   = idx.get_loc(as_of) if as_of in idx else len(idx) - 1
         start_loc = max(0, end_loc - cfg.lookback_months + 1)
-        window_returns = returns.iloc[start_loc : end_loc + 1]
+        window_returns = reg_src.iloc[start_loc : end_loc + 1]
 
         valid_cols = window_returns.columns[
             window_returns.notna().sum() >= cfg.min_obs

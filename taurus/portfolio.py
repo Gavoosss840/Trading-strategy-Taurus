@@ -177,17 +177,42 @@ def min_variance_weights(
     turnover_penalty = float(getattr(cfg, "turnover_penalty", 0.002))
     w_prev = prev_weights if prev_weights is not None else np.full(N, 1.0 / N)
 
+    # ── Put the two terms on the same scale ──────────────────────────────── #
+    #
+    # w'Σw is an annualised variance (measured on real S&P 500 legs: 0.007 to
+    # 0.025) while w·a_norm is a mean of scores in [0, 1] (0.16 to 0.23).  Added
+    # raw, the alpha term was a median 15.5x the variance term, so
+    # alpha_tilt_strength=0.30 bought an EFFECTIVE alpha weight of 93.9%: the
+    # covariance matrix barely entered the problem and every leg pinned its
+    # top names at the position cap.  "Minimum variance with a 30% tilt" was
+    # neither.
+    #
+    # Both terms are therefore divided by their own value at the equal-weight
+    # portfolio, where each becomes exactly 1.  The trade-off parameter then
+    # means what its name says, at every universe size and in every volatility
+    # regime — a 0.30 tilt is 30% of the objective whether the leg sits in 2017
+    # or in 2023, which the raw form could not deliver (its effective tilt
+    # moved between 90% and 95% with the volatility of the period alone).
+    #
+    # The turnover penalty is divided by the SAME denominator as the variance
+    # term, which leaves its strength relative to risk exactly where it was.
+    w_eq     = np.full(N, 1.0 / N)
+    var_ref  = float(w_eq @ cov @ w_eq)
+    var_ref  = var_ref if var_ref > 1e-12 else 1.0
+    alpha_ref = float(w_eq @ a_norm)
+    alpha_ref = alpha_ref if alpha_ref > 1e-6 else 1.0
+
     def objective(w: np.ndarray) -> float:
-        var_term      = (1.0 - tilt_strength) * float(w @ cov @ w)
-        alpha_term    = -tilt_strength * float(w @ a_norm)
-        turnover_term = turnover_penalty * float(np.abs(w - w_prev).sum())
+        var_term      = (1.0 - tilt_strength) * float(w @ cov @ w) / var_ref
+        alpha_term    = -tilt_strength * float(w @ a_norm) / alpha_ref
+        turnover_term = turnover_penalty * float(np.abs(w - w_prev).sum()) / var_ref
         return var_term + alpha_term + turnover_term
 
     def objective_grad(w: np.ndarray) -> np.ndarray:
-        d_var      = 2.0 * (1.0 - tilt_strength) * (cov @ w)
-        d_alpha    = -tilt_strength * a_norm
+        d_var      = 2.0 * (1.0 - tilt_strength) * (cov @ w) / var_ref
+        d_alpha    = -tilt_strength * a_norm / alpha_ref
         # L1 gradient (subgradient at 0 → 0)
-        d_turnover = turnover_penalty * np.sign(w - w_prev)
+        d_turnover = turnover_penalty * np.sign(w - w_prev) / var_ref
         return d_var + d_alpha + d_turnover
 
     # Per-position caps: dynamic so small portfolios don't concentrate

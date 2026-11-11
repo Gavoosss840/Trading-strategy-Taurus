@@ -983,7 +983,12 @@ class UniverseDef:
         # "_v2": the record gained the valuation fields and the field
         # definitions changed (exact row matching, twelve-month flows,
         # effective tax rate), so v1 entries must not be reused.
-        _key = f"fundamentals_{self.config.name}_v2"
+        # "_v3": sector / industry are now resolved by a dedicated pass rather
+        # than taken from whatever `t.info` happened to return during the
+        # statement download.  v2 entries carry sector="Unknown" for 68% to 91%
+        # of the non-US names — a quota refusal cached as a measurement — and
+        # must not be reused.
+        _key = f"fundamentals_{self.config.name}_v3"
         cached = _cache_load(_key, cfg)
         if cached is not None:
             return cached
@@ -1006,6 +1011,14 @@ class UniverseDef:
                     records.append({"ticker": ticker})   # NaN-filled downstream
 
         df = pd.DataFrame(records).set_index("ticker")
+
+        # Sector / industry on their own, after the statements: the statement
+        # calls are what exhausts the Yahoo quota, and `info` answers again
+        # once they are done.  Measured on this universe, a dedicated pass
+        # resolves the sector for every name the statement pass had lost.
+        from .data import apply_profiles
+        df = apply_profiles(df, cfg)
+
         _cache_save(_key, df, cfg)
         return df
 
