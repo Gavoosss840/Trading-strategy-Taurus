@@ -375,6 +375,77 @@ Trois corrections :
 
 ---
 
+## Univers hors US — trois correctifs de données
+
+### Codes de Hong Kong : 15 titres sur 35 absents
+
+Yahoo n'accepte les codes de la bourse de Hong Kong que **sur quatre
+chiffres** : `700.HK` renvoie 404, `0700.HK` renvoie la série de Tencent. La
+liste du Hang Seng en contenait quinze sans remplissage — dont **Tencent,
+HSBC, CK Hutchison, HKEX et China Mobile**. Le téléchargement de cours
+échouant sans erreur bloquante, rien ne le signalait : l'univers tournait sur
+vingt titres au lieu de trente-cinq, **43 % de l'indice manquant, les plus
+grosses capitalisations en tête**.
+
+Les codes sont désormais complétés au chargement (`ticker_pad = 4` sur
+`hangseng`, appliqué aux deux chemins — liste de secours et scrape). La clé de
+cache passe à `_v2_` : elle encodait la *taille* de la liste, que le
+remplissage ne change pas, et un cache antérieur aurait continué à servir les
+tickers 404.
+
+Mesuré après correctif : **34 des 35 titres renvoient des cours**, contre 20
+avant. Le seul restant, `0011.HK`, renvoie 404 même seul et même en 4 chiffres
+— à vérifier côté cotation ; le chargeur de cours l'écarte automatiquement.
+
+### Libellés de secteur : exemption des financières inopérante hors US
+
+yfinance publie sa propre nomenclature, pas le GICS : `Financial Services`,
+`Consumer Cyclical`, `Basic Materials`, `Healthcare`. Les titres hors SEC ne
+passant que par yfinance, **aucun de leurs libellés ne correspondait** à une
+entrée de `_SECTOR_DISTRESS_RATE` (donc 20 % forfaitaire), ni de
+`_NO_COVERAGE_GUARD` / `_NO_MM_VALUATION`. L'exemption des financières ne
+s'appliquait donc **à aucune banque européenne ou asiatique**.
+
+`sectors.normalise_sector` traduit maintenant les deux nomenclatures vers le
+GICS ; un libellé déjà en GICS passe tel quel, et le secteur déduit du code SIC
+n'est plus écrasé par le libellé yfinance.
+
+Vérifié sur BNP, Crédit Agricole, Société Générale, HSBC, Barclays, Lloyds,
+MUFG, Mizuho, HSBC HK et ICBC : **10 / 10 classées `Financials`**, aucune
+retenue par le garde-fou de couverture, aucune dans les deux jambes.
+
+> ⚠️ Le secteur hors US dépend entièrement de `yf.Ticker().info`, qui renvoie
+> par intermittence un HTTP 401 en appel parallèle. Quand c'est le cas le
+> secteur retombe à `Unknown` **silencieusement**, et l'exemption comme le
+> plafond sectoriel redeviennent inertes pour ce titre. Observé sur 4 titres
+> sur 10 à 6 requêtes simultanées ; les mêmes titres répondent correctement en
+> séquentiel.
+
+### Lignes d'états financiers : un EBIT faux pour les banques
+
+yfinance n'expose **pas** de ligne « Operating Income » pour les banques. La
+recherche par sous-chaîne attrapait alors `Other NON Operating Income
+Expenses`, une ligne résiduelle :
+
+| Titre | EBIT lu (avant) | Réalité du trimestre |
+|---|---|---|
+| BNP Paribas | **−41 M€** | 3,46 Md€ de résultat net |
+| Barclays | 20 M£ | — |
+| ICBC | 33 M | — |
+
+BNP était classée **en VENTE** sur ce −41 M€, via le garde-fou « EBIT négatif
+avec dette ». Le même défaut touche tout titre dont la ligne exacte est
+absente du relevé.
+
+`_match_statement_row` remplace la recherche naïve : libellé exact d'abord,
+puis correspondance partielle **en écartant les libellés qui nient le mot
+cherché** (`non operating` pour « operating income », `ebitda` pour « ebit »,
+`net interest` pour « interest expense »). En l'absence de la ligne, le
+résultat est `NaN` — une valorisation absente se lit comme telle en aval, un
+EBIT faux produit un ordre.
+
+---
+
 ## Paramètres clés (config.py)
 
 | Paramètre | Valeur | Description |
@@ -397,6 +468,7 @@ Trois corrections :
 | `mm_sector_neutral` | `True` | `z_mm` calculé au sein du secteur (mode composite) |
 | `mm_sector_min_members` | 4 | En deçà, le secteur est classé contre l'univers |
 | `mm_skip_financials` | `True` | L'écran MM s'abstient sur les financières |
+| `ticker_pad` (par univers) | 4 sur `hangseng` | Longueur du code numérique exigée par Yahoo |
 | `use_umd_factor` | `False` | FF5 uniquement (pas de facteur UMD) |
 | `vol_adjust_momentum` | `True` | Momentum ajusté par la volatilité (Sharpe-momentum) |
 | `cov_halflife` | 0 | Covariance Ledoit-Wolf (0 = pas d'EWMA) |
