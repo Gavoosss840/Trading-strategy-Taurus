@@ -1366,7 +1366,7 @@ def run_orders(args, cfg) -> None:
                                     load_current_positions,
                                     load_positions_from_ibkr)
     from taurus.risk import RiskConfig
-    from taurus.scheduler import sharpe_allocation_weights
+    from taurus.scheduler import sharpe_allocation_weights, load_universe_history
     from taurus.strategy import TaurusStrategy
     from taurus.universe import REGISTRY
 
@@ -1410,18 +1410,14 @@ def run_orders(args, cfg) -> None:
                 universes, nav, base_ccy, as_of)
 
     # ── NAV split across universes, by the same Sharpe weighting as live ──── #
+    # Backtest seed + every live month, so the sheet allocates on the SAME
+    # expanding series the backtest used rather than on the handful of months
+    # since the switch to production.
     hist: dict = {}
     for u in universes:
-        for p in (Path(args.output) / u / "monthly_returns.csv",
-                  Path(args.output) / "live" / u / "monthly_returns.csv"):
-            if p.exists():
-                try:
-                    s = pd.read_csv(p, index_col=0, parse_dates=True).squeeze("columns")
-                    if len(s) >= 6:
-                        hist[u] = s
-                        break
-                except Exception as e:
-                    logger.debug("Could not read %s: %s", p, e)
+        s = load_universe_history(u, args.output)
+        if len(s) >= 6:
+            hist[u] = s
     if len(hist) >= 2:
         weights = sharpe_allocation_weights(
             hist, universes, rf_annual=getattr(cfg, "risk_free_rate", 0.045),

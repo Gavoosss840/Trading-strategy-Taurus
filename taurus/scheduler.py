@@ -100,27 +100,70 @@ def _apply_weight_cap(weights: Dict[str, float], cap: float) -> Dict[str, float]
     return {k: v / total for k, v in out.items()} if total > 0 else out
 
 
-# Sharpe measured in the backtest, per universe, on the configuration that is
-# committed: 48-month regression window, resolved sectors, 2016-01 to 2026-10,
-# gross leverage 1.0, deploy_only_what_fits, beta neutralised by shrinking.
-# These are the per-universe figures behind the combined book's +18.71% and
-# Sharpe 2.40.
+# ── Backtest history, as the seed of the live record ───────────────────────
 #
-# They are the PRIOR used to allocate a universe that has not yet accumulated
-# enough live history to be scored on its own record — the same rule and the
-# same evidence that decided the book's composition in the first place, rather
-# than a placeholder. A universe switches to its own live Sharpe as soon as it
-# has `min_months` of returns on disk.
+# taurus/history/<universe>.csv holds 129 monthly returns per universe
+# (2016-02 to 2026-10) on the committed configuration: 48-month regression
+# window, resolved sectors, gross leverage 1.0, deploy_only_what_fits, beta
+# neutralised by shrinking.  These are the series behind the combined book's
+# +18.71% and Sharpe 2.40.
 #
-# Re-measure and update these when the strategy changes materially; they are a
-# record of a measurement, not a tuning knob.
-BACKTEST_SHARPE: Dict[str, float] = {
-    "sp500":     2.35,
-    "nasdaq100": 0.97,
-    "nikkei225": 1.31,
-    "stoxx_eur": 2.47,
-    "stoxx_uk":  1.36,
-}
+# The allocation rule is expanding (window=0, since inception), so in the
+# backtest the weights were recomputed every month over ALL history to that
+# date.  Live, the code read only the months accumulated since March, which is
+# the same rule in form but not in substance: at the switch to production the
+# allocator forgot ten years of measurement and started counting again.  That
+# is what sent a freshly added universe to a 0% weight, and what would let one
+# bad month out of eight zero an established one.
+#
+# Seeding the live record with these series makes the live allocation the
+# CONTINUATION of the backtest rather than a restart: at the first live month
+# the weights equal the backtest's closing weights, and each month appended
+# moves them exactly as it did in the backtest.
+#
+# Re-run the measurement and replace these files when the strategy changes
+# materially — they are a record of a measurement, not a tuning knob.
+_HISTORY_DIR = Path(__file__).resolve().parent / "history"
+
+
+def load_universe_history(
+    universe: str,
+    output_dir: Optional[str] = None,
+) -> pd.Series:
+    """
+    Full monthly return history for one universe: backtest seed, then every
+    live month appended.
+
+    Live months override the seed where the two overlap, so a re-measured
+    backtest can never silently overwrite what actually happened.
+    """
+    morceaux = []
+
+    seed = _HISTORY_DIR / f"{universe}.csv"
+    if seed.exists():
+        try:
+            s = pd.read_csv(seed, index_col=0, parse_dates=True).squeeze("columns")
+            morceaux.append(pd.Series(s).dropna())
+        except Exception as e:
+            logger.warning("[%s] Unreadable backtest history (%s).", universe, e)
+
+    if output_dir:
+        for p in (Path(output_dir) / universe / "monthly_returns.csv",
+                  Path(output_dir) / "live" / universe / "monthly_returns.csv"):
+            if p.exists():
+                try:
+                    s = pd.read_csv(p, index_col=0, parse_dates=True).squeeze("columns")
+                    morceaux.append(pd.Series(s).dropna())
+                    break
+                except Exception as e:
+                    logger.debug("Could not read %s: %s", p, e)
+
+    if not morceaux:
+        return pd.Series(dtype=float)
+    plein = pd.concat(morceaux)
+    plein.index = pd.to_datetime(plein.index).to_period("M").to_timestamp("M")
+    # keep="last": the live month wins over the seeded one.
+    return plein[~plein.index.duplicated(keep="last")].sort_index()
 
 
 def sharpe_allocation_weights(
@@ -177,31 +220,19 @@ def sharpe_allocation_weights(
         vol = float(r.std() * np.sqrt(12))
         sharpes[u] = (ann - rf_annual) / vol if vol > 0 else 0.0
 
-    # A universe without enough live history is allocated on its BACKTEST
-    # Sharpe — the same rule and the same measurement that set the book's
-    # composition — and switches to its own live record as soon as it has
-    # min_months of returns.  A universe absent from that table falls back to
-    # the mean of the scored ones, so an unmeasured addition is neither
-    # favoured nor erased.
-    #
-    # This runs BEFORE the equal-weight fallback below, and deliberately so:
-    # at a cold start no universe has live history, and falling back to equal
-    # weights there would throw away the one thing actually measured about
-    # them.  The rule is the same on day one as on day four hundred.
-    if sans_historique:
-        moyen = (sum(sharpes.values()) / len(sharpes)) if sharpes else None
+    # A universe with no history at all — no backtest seed and no live months
+    # — takes the mean of the scored ones: neither favoured nor erased.  With
+    # the seed in place this should not happen; it is the floor under a
+    # universe added without a measurement.
+    if sans_historique and sharpes:
+        moyen = sum(sharpes.values()) / len(sharpes)
         for u in sans_historique:
-            ref = BACKTEST_SHARPE.get(u)
-            if ref is None and moyen is None:
-                continue                      # nothing to go on: left unscored
-            sharpes[u] = float(ref) if ref is not None else moyen
+            sharpes[u] = moyen
             logger.warning(
-                "%s: under %d months of live history — allocated on its "
-                "backtest Sharpe (%.2f)%s. It will be scored on its own "
-                "record once the history exists.",
-                u, min_months, sharpes[u],
-                "" if ref is not None else " [mean of the others, no backtest "
-                                           "figure recorded]",
+                "%s: under %d months of history, seed included — given the "
+                "mean Sharpe of the others (%.2f) rather than zero. Measure it "
+                "and add taurus/history/%s.csv.",
+                u, min_months, moyen, u,
             )
 
     if len(sharpes) < 2:
@@ -429,14 +460,9 @@ class RebalanceScheduler:
 
         returns = {}
         for name in self.universes:
-            path = Path(self.output_dir) / name / "monthly_returns.csv"
-            if path.exists():
-                try:
-                    returns[name] = pd.read_csv(
-                        path, index_col=0, parse_dates=True
-                    ).squeeze("columns")
-                except Exception as e:
-                    logger.warning("[%s] Could not read monthly_returns.csv: %s", name, e)
+            s = load_universe_history(name, self.output_dir)
+            if len(s):
+                returns[name] = s
 
         weights = sharpe_allocation_weights(
             returns, self.universes,
