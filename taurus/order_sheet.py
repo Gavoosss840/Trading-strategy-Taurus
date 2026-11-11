@@ -791,7 +791,17 @@ def write_workbook(
             "Positions": len(rs),
             "Longs": sum(1 for r in rs if r.get("Sens") == "LONG"),
             "Shorts": sum(1 for r in rs if r.get("Sens") == "SHORT"),
-            "Non dimensionnees": sum(1 for r in rs if r.get("Alerte")),
+            # Lines that carry NO position, not lines that carry a note.  The
+            # cross-universe consolidation writes its reasoning into the alert
+            # column, so counting alerts made this read 70 when only 5 lines
+            # were actually unsized — the column said the sheet was broken when
+            # it was explaining itself.
+            "Non dimensionnees": sum(
+                1 for r in rs
+                if not float(r.get("Titres", 0.0) or 0.0)
+                and str(r.get("Action", "")) not in ("SOLDER",)
+                and not str(r.get("Action", "")).startswith("VOIR")
+            ),
             f"Jambe longue {base_currency}": round(longs, 2),
             f"Jambe courte {base_currency}": round(shorts, 2),
             f"Brut deploye {base_currency}": round(brut, 2),
