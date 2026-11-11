@@ -27,6 +27,9 @@ class UniverseConfig:
     wikipedia_table_id:   str              # HTML table id on Wikipedia page
     ticker_suffix:        str   = ""       # appended after scrape: ".T" Japan, ".HK" HK, ".SR" Saudi
     ticker_col_index:     int   = 0        # column index of ticker in Wikipedia table
+    # Longueur du code numérique exigée par Yahoo Finance. Hong Kong veut
+    # quatre chiffres : « 700.HK » renvoie 404, « 0700.HK » fonctionne.
+    ticker_pad:           int   = 0        # 0 = aucun remplissage ; 4 = SEHK
     min_market_cap_usd:   float = 2e9
     min_lot_size:         int   = 1        # minimum order size (TSE=100, most others=1)
     nav_scale:            float = 1.0     # multiply NAV to match price units (LSE=100: GBP→GBp pence)

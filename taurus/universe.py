@@ -118,6 +118,35 @@ def _download_ff5_europe(start: str, end: str):
 
 
 # --------------------------------------------------------------------------- #
+#  Normalisation des symboles                                                  #
+# --------------------------------------------------------------------------- #
+
+def _normalise_symbol(symbol: str, config: UniverseConfig) -> str:
+    """Complète un code numérique à la longueur exigée par Yahoo Finance.
+
+    Hong Kong cote sur des codes de 1 à 5 chiffres, mais Yahoo ne les accepte
+    que sur quatre : « 700.HK » renvoie 404, « 0700.HK » renvoie la série de
+    Tencent.  Quinze des trente-cinq valeurs du Hang Seng étaient écrites sans
+    remplissage — Tencent, HSBC, CK Hutchison, HKEX et China Mobile incluses —
+    et disparaissaient donc silencieusement de l'univers : 43 % de l'indice,
+    dont les plus grosses capitalisations.
+
+    Le téléchargement de cours échouant sans erreur bloquante, rien ne le
+    signalait : l'univers tournait simplement sur vingt titres au lieu de
+    trente-cinq.
+    """
+    pad = getattr(config, "ticker_pad", 0)
+    if pad <= 0 or not symbol:
+        return symbol
+
+    suffix = config.ticker_suffix
+    code = symbol[: -len(suffix)] if suffix and symbol.endswith(suffix) else symbol
+    if not code.isdigit() or len(code) >= pad:
+        return symbol
+    return code.zfill(pad) + (suffix if suffix and symbol.endswith(suffix) else "")
+
+
+# --------------------------------------------------------------------------- #
 #  Universe definitions                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -237,8 +266,9 @@ _UNIVERSE_CONFIGS: Dict[str, UniverseConfig] = {
         ibkr_exchange="SEHK",             # Stock Exchange of Hong Kong
         wikipedia_url="https://en.wikipedia.org/wiki/Hang_Seng_Index",
         wikipedia_table_id="constituents",
-        ticker_suffix=".HK",              # Yahoo Finance: 700.HK
+        ticker_suffix=".HK",              # Yahoo Finance: 0700.HK (4 chiffres)
         ticker_col_index=0,
+        ticker_pad=4,                     # SEHK: Yahoo exige un code à 4 chiffres
         min_market_cap_usd=1e9,
         n_longs=15,
         n_shorts=15,
@@ -564,7 +594,10 @@ class UniverseDef:
         column and require manual mapping.
         """
         _fb_len = len(_FALLBACKS.get(self.config.name, []))
-        cache_key = f"tickers_{self.config.name}_v{_fb_len}"
+        # v2 : le remplissage des codes Hong Kong change la liste à taille
+        # constante, donc la clé doit changer aussi — sinon un cache écrit
+        # avant le correctif continuerait à servir les tickers 404.
+        cache_key = f"tickers_{self.config.name}_v2_{_fb_len}"
         cached = _cache_load(cache_key, cfg)
         if cached is not None:
             return cached
@@ -583,6 +616,10 @@ class UniverseDef:
             tickers = _FALLBACKS.get(self.config.name, [])
             if not tickers:
                 logger.warning("[%s] No fallback tickers defined.", self.config.name)
+
+        # Normalisation commune aux deux chemins : la liste de secours comme le
+        # scrape Wikipédia écrivent les codes de Hong Kong sans remplissage.
+        tickers = [_normalise_symbol(t, self.config) for t in tickers]
 
         _cache_save(cache_key, tickers, cfg)
         logger.info("[%s] %d tickers loaded.", self.config.name, len(tickers))
