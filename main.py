@@ -1381,11 +1381,11 @@ def run_orders(args, cfg) -> None:
     nav = float(getattr(args, "nav", 0.0) or 0.0)
     if nav <= 0 and getattr(args, "from_ibkr", False):
         try:
-            from taurus.execution import IBKRConnection, OrderExecutor
+            from taurus.execution import IBKRConnection, PositionReconciler
             _conn = IBKRConnection(cfg)
             if _conn.ensure_connected():
                 try:
-                    nav = float(OrderExecutor(cfg).get_account_nav(
+                    nav = float(PositionReconciler().get_account_nav(
                         _conn, currency=base_ccy) or 0.0)
                     if nav > 0:
                         logger.info("NAV read from IBKR: %.2f %s", nav, base_ccy)
