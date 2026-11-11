@@ -31,6 +31,8 @@ import os
 import sys
 from pathlib import Path
 
+from taurus.config import TaurusConfig as _TaurusConfig
+
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -80,7 +82,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-longs",     type=int,   default=25)
     p.add_argument("--n-shorts",    type=int,   default=25)
     p.add_argument("--alpha-t",     type=float, default=2.0, help="|t-stat| threshold for alpha")
-    p.add_argument("--lookback",    type=int,   default=60,  help="FF5 regression window (months)")
+    # Default read from TaurusConfig so the window lives in ONE place: this
+    # flag carried its own hard-coded 60 and would silently have overridden
+    # the configured value on every CLI run.
+    p.add_argument("--lookback",    type=int,
+                   default=_TaurusConfig().lookback_months,
+                   help="FF5 regression window (months)")
     p.add_argument("--leverage-gap",type=float, default=0.25,help="MM leverage gap threshold")
     p.add_argument("--rf-rate",     type=float, default=0.045, help="Annual risk-free rate")
     p.add_argument("--no-shrinkage",action="store_true", help="Disable Ledoit-Wolf shrinkage")

@@ -51,7 +51,31 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     #  Factor model  (FF5/FF6 + SML alpha)                                #
     # ------------------------------------------------------------------ #
-    lookback_months: int = 60            # Rolling OLS window
+    # Rolling OLS window.  60 → 48 months, measured, not guessed.
+    #
+    # The ±20% sensitivity sweep found this to be the one parameter that
+    # genuinely moves the result: of seven parameters displaced in both
+    # directions, five shifted the combined Sharpe by 0.01 to 0.12 while this
+    # one moved it by 0.68.  Mapping the whole curve on the combined book:
+    #
+    #     36 months  Sharpe 1.77     48 months  Sharpe 2.40
+    #     42 months  Sharpe 2.68     60 months  Sharpe 2.00  (previous)
+    #                                72 months  Sharpe 1.72
+    #
+    # The curve has an interior maximum, which is what makes the effect
+    # credible: had the Sharpe simply climbed to the floor, the measurement
+    # would have been the regression degrading rather than a shorter window
+    # helping.  48 beats 60 in ALL FOUR sub-periods (2.21/1.70, 3.52/2.77,
+    # 2.46/1.89, 1.91/1.90), so the gain is not one period's accident.
+    #
+    # 42 scores higher still and is NOT taken.  Its edge over 48 comes almost
+    # entirely from 2016-2018 (+1.11 Sharpe; the other three periods give
+    # +0.29, -0.05, +0.14), and it sits six months from a point that loses
+    # 0.91 — a cliff that is partly mechanical, since at a 36-month window
+    # min_obs=36 demands a complete history and discards much of the universe.
+    # Taking the sample maximum next to a cliff is the overfitting this sweep
+    # exists to catch.  48 is on the safe side and still well clear of 60.
+    lookback_months: int = 48            # Rolling OLS window
     min_obs: int = 36                    # Minimum observations for fit
     alpha_tstat_threshold: float = 2.0   # |t| > threshold (Student-t when return_df set)
     use_umd_factor: bool = False         # FF6: include UMD momentum factor in regression
