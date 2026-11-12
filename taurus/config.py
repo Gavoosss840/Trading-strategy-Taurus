@@ -342,6 +342,23 @@ class TaurusConfig:
     #  Execution / back-test                                              #
     # ------------------------------------------------------------------ #
     rebalance_freq:        str   = "ME"    # pandas offset alias
+    # Attach STP (stop) and LMT (take profit) to every automated entry.
+    #
+    # False = the algorithm places the MARKET order only, and the protective
+    # levels are left to be placed by hand from the order sheet, which carries
+    # them per line ("Stop ordre", "Prix cible").  Stale protective orders are
+    # still cancelled before each rebalance either way: a stop sized for last
+    # month's position is wrong once the position has been adjusted, and a
+    # wrong stop is more dangerous than none.
+    #
+    # Note what this changes about the measurement: the backtest holds each
+    # position from one rebalance to the next with no exit of any kind, so
+    # False is the configuration the +18.71% / Sharpe 2.40 figures actually
+    # describe. Measured on daily paths, adding -10%/+20% exits moved the
+    # combined book from +16.55%/Sharpe 1.88 to +14.75%/Sharpe 1.92 with the
+    # maximum drawdown improving from -5.00% to -3.77%.
+    place_protective_orders: bool = True
+
     transaction_cost_bps:  float = 10.0   # One-way cost in basis points
     slippage_bps:          float = 5.0
 

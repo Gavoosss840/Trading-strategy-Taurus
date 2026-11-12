@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--leverage-gap",type=float, default=0.25,help="MM leverage gap threshold")
     p.add_argument("--rf-rate",     type=float, default=0.045, help="Annual risk-free rate")
     p.add_argument("--no-shrinkage",action="store_true", help="Disable Ledoit-Wolf shrinkage")
+    p.add_argument("--no-protective", action="store_true",
+                   help="place the MARKET order only and leave the stop and "
+                        "take-profit to be entered by hand from the order "
+                        "sheet, which carries both levels per line. Stale "
+                        "protective orders are still cancelled each rebalance.")
     p.add_argument("--cache-dir",   default=".cache")
     p.add_argument("--cache-ttl",   type=float, default=12.0, help="Cache TTL in hours")
 
@@ -164,6 +169,7 @@ def build_config(args: argparse.Namespace):
         live_trading=args.live,
         dry_run=not args.no_dry_run,
         nav_usd=(args.nav if args.nav else 100_000.0),
+        place_protective_orders=not getattr(args, "no_protective", False),
     )
 
 

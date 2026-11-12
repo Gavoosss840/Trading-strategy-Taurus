@@ -869,6 +869,12 @@ class OrderManager:
         else:
             stop_action = "SELL" if delta > 0 else "BUY"
 
+        # Protective orders are placed by the algorithm unless the book is run
+        # with them left to the operator.  Stale ones are cancelled either way:
+        # a stop sized for last month's position is wrong the moment the
+        # position is adjusted, and a wrong stop is worse than none.
+        protect = bool(getattr(conn.cfg, "place_protective_orders", True))
+
         # Cancel stale protective orders before placing new ones
         if not dry_run:
             self.cancel_protective_orders(conn, ticker, dry_run=False)
@@ -885,7 +891,7 @@ class OrderManager:
             "ticker":     ticker,
             "action":     action,
             "quantity":   qty,
-            "type":       "MKT+STP+LMT",
+            "type":       "MKT+STP+LMT" if protect else "MKT",
             "stop_price": round(stop_price, 4) if stop_price else None,
             "tp_price":   round(tp_price, 4)   if tp_price   else None,
             "stop_pct":   stop_pct,
@@ -896,12 +902,19 @@ class OrderManager:
         }
 
         if dry_run:
-            logger.info(
-                "[DRY RUN] %s %d %s @ MKT | STP %.4f (-%.0f%%) | LMT %.4f (+%.0f%%)",
-                action, qty, ticker,
-                stop_price, stop_pct * 100,
-                tp_price, take_profit_pct * 100,
-            )
+            if protect:
+                logger.info(
+                    "[DRY RUN] %s %d %s @ MKT | STP %.4f (-%.0f%%) | LMT %.4f (+%.0f%%)",
+                    action, qty, ticker,
+                    stop_price, stop_pct * 100,
+                    tp_price, take_profit_pct * 100,
+                )
+            else:
+                logger.info(
+                    "[DRY RUN] %s %d %s @ MKT | no STP/LMT (placed by hand from "
+                    "the order sheet: stop %.4f, target %.4f)",
+                    action, qty, ticker, stop_price, tp_price,
+                )
             order_info["status"] = "dry_run"
             return order_info
 
@@ -938,8 +951,10 @@ class OrderManager:
                 parent          = MarketOrder(action, qty)
                 parent.tif      = "DAY"
 
-                if entry_price > 0:
+                if entry_price > 0 and protect:
                     parent.transmit = False   # STP+LMT children will trigger transmission
+                elif not protect:
+                    parent.transmit = True    # protective orders left to the operator
                 else:
                     # No price available — transmit MKT immediately, skip STP/LMT
                     # (avoids MKT stuck in PreSubmitted when LMT price=0 gets rejected)
@@ -952,7 +967,7 @@ class OrderManager:
                 parent_trade = conn.ib.placeOrder(contract, parent)
                 order_info["ibkr_order_id"] = parent_trade.order.orderId
 
-                if entry_price > 0:
+                if entry_price > 0 and protect:
                     # STP (stop loss) — second child, hold transmission
                     stp               = Order()
                     stp.action        = stop_action
@@ -976,11 +991,19 @@ class OrderManager:
                     order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
                     order_info["ibkr_lmt_order_id"] = lmt_trade.order.orderId
                 order_info["status"] = "submitted"
-                logger.info(
-                    "Bracket submitted: %s %d %s | mkt=%d stp=%.2f lmt=%.2f",
-                    action, qty, ticker,
-                    parent_trade.order.orderId, stop_price, tp_price,
-                )
+                if protect and entry_price > 0:
+                    logger.info(
+                        "Bracket submitted: %s %d %s | mkt=%d stp=%.2f lmt=%.2f",
+                        action, qty, ticker,
+                        parent_trade.order.orderId, stop_price, tp_price,
+                    )
+                else:
+                    logger.info(
+                        "MKT submitted: %s %d %s | mkt=%d | no STP/LMT — place "
+                        "them by hand (stop %.2f, target %.2f)",
+                        action, qty, ticker, parent_trade.order.orderId,
+                        stop_price, tp_price,
+                    )
             else:
                 # ── EU markets: MKT transmits immediately; STP + LMT as standalone GTC ──
                 # If exchange rejects stop/limit, MKT is already through — no PreSubmitted freeze.
@@ -1000,7 +1023,7 @@ class OrderManager:
                         logger.warning("Standalone %s failed for %s: %s", label, ticker, err)
                         return None
 
-                if entry_price > 0:
+                if entry_price > 0 and protect:
                     # OCA group: when STP fills, IBKR auto-cancels LMT and vice-versa.
                     # Prevents zombie orders after position is closed by one of them.
                     oca_group = f"TRS_{ibkr_ticker}_{parent_trade.order.orderId}"
