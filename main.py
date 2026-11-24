@@ -1385,6 +1385,7 @@ def run_beta(args, cfg) -> None:
 
     lignes, total_net, total_brut, total_long, total_short = [], 0.0, 0.0, 0.0, 0.0
     sans_beta: list = []
+    deja_vues: set = set()        # a holding belongs to one universe only
 
     for name in universes:
         try:
@@ -1400,6 +1401,25 @@ def run_beta(args, cfg) -> None:
             logger.error("Positions NOT read from IBKR — start TWS. Aborting.")
             return
         tenus = {plein.get(k, k): q for k, q in pos.items() if q}
+
+        # A position is counted ONCE across universes.
+        #
+        # 38 tickers belong to both the S&P 500 and the NASDAQ 100 lists, and
+        # the reader is asked per universe, so each returns the whole holding:
+        # a share held once was being valued twice, inflating gross exposure
+        # and beta for exactly those names. The order sheet had the same defect
+        # and it mattered more there, because it produced duplicate orders; here
+        # it merely overstates the measurement, which is worse in its own way —
+        # a measurement nobody can see is wrong.
+        doublons = {t: q for t, q in tenus.items() if t in deja_vues}
+        if doublons:
+            logger.info(
+                "[%s] %d position(s) already counted in another universe, "
+                "left out of this one: %s",
+                name, len(doublons), ", ".join(sorted(doublons)[:8]),
+            )
+            tenus = {t: q for t, q in tenus.items() if t not in deja_vues}
+        deja_vues.update(tenus)
         if not tenus:
             logger.info("[%s] no position held.", name)
             continue
