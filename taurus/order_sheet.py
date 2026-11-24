@@ -193,6 +193,9 @@ def load_current_positions(
     return {}, "none"
 
 
+_POSITIONS_BRUTES = None      # read once per process; see below
+
+
 def load_positions_from_ibkr(
     cfg: TaurusConfig,
     universe: Optional[str] = None,
@@ -218,22 +221,36 @@ def load_positions_from_ibkr(
         logger.error("IBKR layer unavailable (%s) — cannot read positions.", e)
         return {}, {}, "IBKR unavailable"
 
-    conn = IBKRConnection(cfg)
-    if not conn.ensure_connected():
-        logger.error("Cannot reach IBKR TWS/Gateway — is it running, and is the "
-                     "API enabled? No positions read.")
-        return {}, {}, "IBKR unreachable"
-
-    try:
-        brutes = conn.ib.positions(account=conn.cfg.ibkr_account or "")
-    except Exception as e:
-        logger.error("Reading positions from IBKR failed: %s", e)
-        brutes = []
-    finally:
+    # Read the account ONCE per process, not once per universe.
+    #
+    # This function is called for each of the five universes and each call
+    # opened a connection, read every position, filtered to that universe and
+    # disconnected. Five connect/disconnect cycles on the same clientId, plus
+    # one for the NAV and one for the borrow check, is enough to make TWS stop
+    # answering: the socket is accepted and the API handshake then times out,
+    # and on a bad day the terminal itself hangs. The positions are identical
+    # across the five calls anyway — only the filtering differs.
+    global _POSITIONS_BRUTES
+    if _POSITIONS_BRUTES is None:
+        conn = IBKRConnection(cfg)
+        if not conn.ensure_connected():
+            logger.error("Cannot reach IBKR TWS/Gateway — is it running, and "
+                         "is the API enabled? No positions read.")
+            return {}, {}, "IBKR unreachable"
         try:
-            conn.ib.disconnect()
-        except Exception:
-            pass
+            _POSITIONS_BRUTES = list(
+                conn.ib.positions(account=conn.cfg.ibkr_account or ""))
+            logger.info("IBKR: %d raw position(s) read once for this run.",
+                        len(_POSITIONS_BRUTES))
+        except Exception as e:
+            logger.error("Reading positions from IBKR failed: %s", e)
+            _POSITIONS_BRUTES = []
+        finally:
+            try:
+                conn.ib.disconnect()
+            except Exception:
+                pass
+    brutes = list(_POSITIONS_BRUTES)
 
     brutes = [p for p in brutes if getattr(p, "position", 0)]
     if not brutes:
