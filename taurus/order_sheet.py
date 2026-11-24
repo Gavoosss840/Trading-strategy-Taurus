@@ -724,10 +724,28 @@ def annoter_emprunt(rows_by_universe: Dict[str, List[dict]],
         logger.warning("IBKR layer unavailable (%s) — borrow not checked.", e)
         return
 
-    conn = IBKRConnection(cfg)
-    if not conn.ensure_connected():
-        logger.warning("Cannot reach IBKR — borrow availability not checked. "
-                       "Every short in the sheet is unverified.")
+    # A SEPARATE clientId, and a single attempt.
+    #
+    # The sheet already opens and closes a connection per universe, plus one
+    # for the NAV. Reusing clientId 10 for one more made TWS time out the API
+    # handshake — the socket connects, the handshake does not — and
+    # ensure_connected then backs off 60s, 120s, 240s, 480s, so a check meant
+    # to take fifteen seconds blocked the sheet from ever being written.
+    # Nothing here is worth delaying the sheet: one try, then carry on
+    # unverified.
+    import dataclasses
+    cfg_emprunt = dataclasses.replace(
+        cfg, ibkr_client_id=int(getattr(cfg, "ibkr_client_id", 10)) + 7)
+    conn = IBKRConnection(cfg_emprunt)
+    try:
+        ok = conn.connect() if hasattr(conn, "connect") else conn.ensure_connected()
+    except Exception as e:
+        logger.warning("Borrow check could not connect (%s).", e)
+        ok = False
+    if not ok:
+        logger.warning("Cannot reach IBKR on clientId %d — borrow availability "
+                       "NOT checked. Every short in the sheet is unverified.",
+                       cfg_emprunt.ibkr_client_id)
         return
 
     om = OrderManager()
