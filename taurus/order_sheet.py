@@ -193,7 +193,23 @@ def load_current_positions(
     return {}, "none"
 
 
-_POSITIONS_BRUTES = None      # read once per process; see below
+# Raw IBKR positions, read once and reused across the five universes.
+#
+# Keeping them for the lifetime of the process is NOT safe: run_orders spends
+# up to twenty minutes downloading fundamentals between the read and the
+# sheet, and run_flatten places real closing orders from this same function.
+# Positions that moved in between would be acted on as if they had not. The
+# read is therefore stamped and expires, so a long run re-reads rather than
+# serving a stale broker state silently.
+_POSITIONS_BRUTES = None
+_POSITIONS_LUES_A = 0.0
+_POSITIONS_TTL_S = 300.0      # 5 minutes
+
+
+def reset_positions_cache() -> None:
+    """Force the next read to go back to the broker."""
+    global _POSITIONS_BRUTES, _POSITIONS_LUES_A
+    _POSITIONS_BRUTES, _POSITIONS_LUES_A = None, 0.0
 
 
 def load_positions_from_ibkr(
@@ -230,8 +246,14 @@ def load_positions_from_ibkr(
     # answering: the socket is accepted and the API handshake then times out,
     # and on a bad day the terminal itself hangs. The positions are identical
     # across the five calls anyway — only the filtering differs.
-    global _POSITIONS_BRUTES
-    if _POSITIONS_BRUTES is None:
+    global _POSITIONS_BRUTES, _POSITIONS_LUES_A
+    import time as _time
+    perime = (_POSITIONS_BRUTES is None
+              or _time.time() - _POSITIONS_LUES_A > _POSITIONS_TTL_S)
+    if perime:
+        if _POSITIONS_BRUTES is not None:
+            logger.info("IBKR positions older than %.0fs — reading again.",
+                        _POSITIONS_TTL_S)
         conn = IBKRConnection(cfg)
         if not conn.ensure_connected():
             logger.error("Cannot reach IBKR TWS/Gateway — is it running, and "
@@ -240,11 +262,13 @@ def load_positions_from_ibkr(
         try:
             _POSITIONS_BRUTES = list(
                 conn.ib.positions(account=conn.cfg.ibkr_account or ""))
+            _POSITIONS_LUES_A = _time.time()
             logger.info("IBKR: %d raw position(s) read once for this run.",
                         len(_POSITIONS_BRUTES))
         except Exception as e:
             logger.error("Reading positions from IBKR failed: %s", e)
             _POSITIONS_BRUTES = []
+            _POSITIONS_LUES_A = _time.time()
         finally:
             try:
                 conn.ib.disconnect()
@@ -417,8 +441,11 @@ def build_rows(
             )
 
     # ── Lot rounding leaves capital on the table — put it back to work ───── #
+    secteurs = {}
+    if fundamentals is not None and "sector" in getattr(fundamentals, "columns", []):
+        secteurs = fundamentals["sector"].fillna("Unknown").astype(str).to_dict()
     plan_titres = _repartir_restant(legs, px, ucfg, cfg, nav_base, half,
-                                    base_currency, universe)
+                                    base_currency, universe, secteurs)
 
     rows: List[dict] = []
     for side, weights in legs:
@@ -610,6 +637,11 @@ def build_rows(
     return rows
 
 
+def _secteur_contraint(s) -> bool:
+    """True when the sector is a real one the cap can be applied to."""
+    return bool(s) and str(s).strip().lower() not in ("unknown", "", "nan", "none")
+
+
 def _repartir_restant(
     legs,
     px: Dict[str, float],
@@ -619,6 +651,7 @@ def _repartir_restant(
     half: float,
     base_currency: str,
     universe: str,
+    secteurs: Optional[Dict[str, str]] = None,
 ) -> Dict[tuple, float]:
     """
     Share count per line, after putting the lot-rounding remainder back to work.
@@ -639,7 +672,9 @@ def _repartir_restant(
     """
     plan: Dict[tuple, float] = {}
     cap_w = float(getattr(cfg, "max_position_weight", 0.08) or 0.08)
+    cap_sect = float(getattr(cfg, "max_sector_weight", 1.0) or 1.0)
     lot = max(int(getattr(ucfg, "min_lot_size", 1) or 1), 1)
+    secteurs = secteurs or {}
 
     for side, weights in legs:
         budget = nav_base * half
@@ -665,7 +700,8 @@ def _repartir_restant(
             base = float(int(vise / pb) // lot * lot)
             base = min(base, cap_titres)
             infos[ticker] = {"pb": pb, "vise": vise, "titres": base,
-                             "cap": cap_titres}
+                             "cap": cap_titres,
+                             "sect": str(secteurs.get(ticker, "Unknown"))}
             plan[(side, ticker)] = base
 
         if not infos:
@@ -677,10 +713,33 @@ def _repartir_restant(
             # Largest shortfall against the intended notional, among the lines
             # that can still take a lot without breaching the position cap and
             # without overspending what is left.
+            # The sector cap applies here too.  These weights were trimmed
+            # upstream by apply_sector_constraints; handing the remainder out
+            # on unmet demand alone would put back exactly what that trimming
+            # removed, and silently, since nothing downstream re-checks it.
+            # A name with no resolved sector is EXEMPT, not lumped together:
+            # putting every unclassified line in one "Unknown" bucket made that
+            # bucket breach the cap immediately and blocked redistribution
+            # altogether, which silently undid the deployment this function
+            # exists for — 60% of the leg instead of 100% whenever sector data
+            # was missing, and sector data has been missing before.
+            par_sect: Dict[str, float] = {}
+            for i in infos.values():
+                if not _secteur_contraint(i["sect"]):
+                    continue
+                par_sect[i["sect"]] = par_sect.get(i["sect"], 0.0) + i["titres"] * i["pb"]
+
+            def _tient(i) -> bool:
+                if not _secteur_contraint(i["sect"]):
+                    return True
+                return (par_sect.get(i["sect"], 0.0) + lot * i["pb"]) <= cap_sect * budget
+
             cand = [
                 (i["vise"] - i["titres"] * i["pb"], t)
                 for t, i in infos.items()
-                if i["titres"] + lot <= i["cap"] and lot * i["pb"] <= restant
+                if i["titres"] + lot <= i["cap"]
+                and lot * i["pb"] <= restant
+                and _tient(i)
             ]
             if not cand:
                 break
@@ -726,10 +785,24 @@ def annoter_emprunt(rows_by_universe: Dict[str, List[dict]],
     """
     from .universe import REGISTRY
 
+    # The need is the COMBINED short across universes, not each universe's
+    # own line.  A ticker shorted by both the S&P 500 and the NASDAQ 100 is
+    # executed as the sum of the two, so checking 55 and 13 separately against
+    # 60 available lets both pass and the 68-share order then fails — the very
+    # one-sided book this function exists to prevent.
+    besoin_total: Dict[str, float] = {}
     courts: Dict[str, List[str]] = {}
     for uni, rs in rows_by_universe.items():
-        noms = [str(r.get("Ticker", "")) for r in rs
-                if r.get("Sens") == "SHORT" and float(r.get("Titres", 0.0) or 0.0)]
+        noms = []
+        for r in rs:
+            if r.get("Sens") != "SHORT":
+                continue
+            n = abs(float(r.get("Titres", 0.0) or 0.0))
+            if not n:
+                continue
+            t = str(r.get("Ticker", ""))
+            besoin_total[t] = besoin_total.get(t, 0.0) + n
+            noms.append(t)
         if noms:
             courts[uni] = noms
     if not courts:
@@ -778,19 +851,24 @@ def annoter_emprunt(rows_by_universe: Dict[str, List[dict]],
             for r in rows_by_universe[uni]:
                 if r.get("Sens") != "SHORT":
                     continue
-                besoin = abs(float(r.get("Titres", 0.0) or 0.0))
-                if not besoin:
+                tkr = str(r.get("Ticker", ""))
+                if not abs(float(r.get("Titres", 0.0) or 0.0)):
                     continue
+                besoin = besoin_total.get(tkr, 0.0)
                 total += 1
-                n = dispo.get(str(r.get("Ticker", "")))
+                n = dispo.get(tkr)
                 if n is None or n != n:
                     r["Emprunt"] = "INCONNU"
                     continue
                 r["Emprunt"] = f"{n:,.0f}"
                 if n < besoin:
                     bloques += 1
+                    combine = ("" if besoin_total.get(tkr, 0.0)
+                               == abs(float(r.get("Titres", 0.0) or 0.0))
+                               else " tous univers confondus")
                     r["Alerte"] = (f"{r.get('Alerte') or ''} EMPRUNT INSUFFISANT "
-                                   f"({n:,.0f} dispo pour {besoin:,.0f})").strip()
+                                   f"({n:,.0f} dispo pour {besoin:,.0f}"
+                                   f"{combine})").strip()
     finally:
         try:
             conn.ib.disconnect()

@@ -1515,11 +1515,22 @@ def run_beta(args, cfg) -> None:
             if prix <= 0:
                 sans_beta.append(f"{tkr} (no price)")
                 continue
-            _sym, ccy, minor, _px = ticker_market(tkr, ucfg)
-            taux = _fx(ccy, base_ccy)
-            if taux is None:
-                sans_beta.append(f"{tkr} (no {ccy}->{base_ccy} rate)")
-                continue
+            # get_prices has ALREADY converted and rescaled a universe
+            # declared multi_currency, so converting again here would square
+            # the FX rate and divide by the minor unit twice.
+            if getattr(ucfg, "multi_currency", False):
+                src_ccy = str(getattr(ucfg, "currency", base_ccy) or base_ccy)
+                taux = _fx(src_ccy, base_ccy)
+                minor = 1.0
+                if taux is None:
+                    sans_beta.append(f"{tkr} (no {src_ccy}->{base_ccy} rate)")
+                    continue
+            else:
+                _sym, ccy, minor, _px = ticker_market(tkr, ucfg)
+                taux = _fx(ccy, base_ccy)
+                if taux is None:
+                    sans_beta.append(f"{tkr} (no {ccy}->{base_ccy} rate)")
+                    continue
             valeur = qte * prix / float(minor) * taux        # signed, base currency
             b = betas.get(tkr)
             if b is None or b != b:
