@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns", "beta"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns", "beta", "cancel-orders"], default="backtest")
     p.add_argument("--from-ibkr", action="store_true",
                    help="orders: read the held positions from IBKR instead of a "
                         "file. READ-ONLY — it reads and disconnects, it never "
@@ -1351,6 +1351,82 @@ def run_calibrate(args, cfg) -> None:
         logger.error("Written but not loadable — investigate before relying on it.")
 
 
+def run_cancel_orders(args, cfg) -> None:
+    """
+    List, and optionally cancel, every open order sitting in the account.
+
+    Why this exists.  The automated rebalance wipes the slate itself:
+    cancel_all_orders_for_tickers runs at the start of each pass, so a stop
+    left over from last month never survives into this one.  The MANUAL
+    workflow has no such step.  Orders placed as GTC stay live for months,
+    outlive the position they were sized for, and then fire against whatever
+    happens to be held under the same symbol — closing one leg at a time,
+    rebalancing nothing, and quietly turning a neutral book directional.
+
+    Dry-run by default: it lists and changes nothing.
+    """
+    from collections import Counter
+
+    from taurus.execution import IBKRConnection
+
+    ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot reach IBKR TWS/Gateway — is it running and the "
+                     "API enabled?")
+        return
+
+    try:
+        trades = [t for t in conn.ib.openTrades()
+                  if t.orderStatus.status in ACTIVE]
+        if not trades:
+            print("\nNo open order in the account.")
+            return
+
+        garder = {s.strip().upper()
+                  for s in (getattr(args, "tickers", None) or []) if s.strip()}
+        types_c = Counter(t.order.orderType for t in trades)
+        print(f"\n{len(trades)} open order(s): "
+              + ", ".join(f"{n}x {k}" for k, n in types_c.most_common()))
+        print(f"\n{'symbol':10s} {'ccy':4s} {'side':5s} {'type':6s} {'qty':>9s} "
+              f"{'price':>11s} {'tif':4s} {'status':13s}")
+        for t in sorted(trades, key=lambda z: (z.contract.symbol, z.order.orderType)):
+            o, c = t.order, t.contract
+            prix = o.lmtPrice or o.auxPrice or 0.0
+            print(f"{c.symbol:10s} {c.currency:4s} {o.action:5s} "
+                  f"{o.orderType:6s} {o.totalQuantity:9.0f} {prix:11.4f} "
+                  f"{o.tif:4s} {t.orderStatus.status:13s}")
+
+        cibles = [t for t in trades
+                  if not garder or t.contract.symbol.upper() in garder]
+        if garder:
+            print(f"\nRestricted to {sorted(garder)}: {len(cibles)} order(s).")
+
+        if cfg.dry_run:
+            print(f"\n[DRY RUN] {len(cibles)} order(s) would be cancelled. "
+                  f"Re-run with --no-dry-run to apply.")
+            return
+
+        n = 0
+        for t in cibles:
+            try:
+                conn.ib.cancelOrder(t.order)
+                n += 1
+            except Exception as e:
+                logger.warning("Could not cancel %s %s: %s",
+                               t.contract.symbol, t.order.orderType, e)
+        conn.ib.sleep(2)
+        print(f"\n{n} order(s) cancelled.")
+        restants = [t for t in conn.ib.openTrades()
+                    if t.orderStatus.status in ACTIVE]
+        print(f"{len(restants)} open order(s) remain.")
+    finally:
+        try:
+            conn.ib.disconnect()
+        except Exception:
+            pass
+
+
 def run_beta(args, cfg) -> None:
     """
     Market beta of the portfolio ACTUALLY HELD, read from IBKR.
@@ -2238,6 +2314,8 @@ def main() -> None:
         run_refresh_protective(args, cfg)
     elif args.mode == "beta":
         run_beta(args, cfg)
+    elif args.mode == "cancel-orders":
+        run_cancel_orders(args, cfg)
     elif args.mode == "backfill-returns":
         run_backfill_returns(args, cfg)
     else:
