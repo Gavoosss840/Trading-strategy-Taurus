@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns", "beta"], default="backtest")
     p.add_argument("--from-ibkr", action="store_true",
                    help="orders: read the held positions from IBKR instead of a "
                         "file. READ-ONLY — it reads and disconnects, it never "
@@ -1351,6 +1351,137 @@ def run_calibrate(args, cfg) -> None:
         logger.error("Written but not loadable — investigate before relying on it.")
 
 
+def run_beta(args, cfg) -> None:
+    """
+    Market beta of the portfolio ACTUALLY HELD, read from IBKR.
+
+    What already existed was a single log line at selection time, per
+    universe, stating the net beta of the weights the optimiser had just
+    produced.  That is the beta of an intention.  Between two rebalances the
+    prices move, a protective order fills, an order is only partly executed,
+    and the book drifts away from it with nothing measuring the drift — while
+    the whole strategy rests on the claim that the book is market neutral.
+
+    This reads the live positions, values them in the base currency, estimates
+    each name's beta on the same window and against the same regional market
+    factor the strategy itself uses, and reports the net exposure.
+
+    Read-only: it connects, reads and disconnects.
+    """
+    import dataclasses
+    from datetime import date
+
+    import pandas as pd
+
+    from taurus.order_sheet import load_positions_from_ibkr, _fx
+    from taurus.portfolio import estimate_betas
+    from taurus.universe import REGISTRY, ticker_market
+
+    universes = args.universes or list(DEFAULT_UNIVERSES)
+    base_ccy  = (getattr(args, "base_currency", None) or "EUR").upper()
+    as_of     = getattr(args, "as_of", None) or date.today().isoformat()
+
+    logger.info("=== PORTFOLIO BETA | universes=%s | as_of=%s ===", universes, as_of)
+
+    lignes, total_net, total_brut, total_long, total_short = [], 0.0, 0.0, 0.0, 0.0
+    sans_beta: list = []
+
+    for name in universes:
+        try:
+            udef = REGISTRY.get(name)
+        except Exception as e:
+            logger.error("[%s] Unknown universe (%s) — skipped.", name, e)
+            continue
+        ucfg     = udef.config
+        ucfg_cfg = dataclasses.replace(cfg, n_longs=ucfg.n_longs, n_shorts=ucfg.n_shorts)
+
+        pos, plein, source = load_positions_from_ibkr(ucfg_cfg, universe=name)
+        if source in ("IBKR unreachable", "IBKR unavailable"):
+            logger.error("Positions NOT read from IBKR — start TWS. Aborting.")
+            return
+        tenus = {plein.get(k, k): q for k, q in pos.items() if q}
+        if not tenus:
+            logger.info("[%s] no position held.", name)
+            continue
+
+        warm  = ucfg_cfg.lookback_months + 6
+        start = (pd.Timestamp(as_of) - pd.DateOffset(months=warm)).strftime("%Y-%m-%d")
+        px    = udef.get_prices(start, as_of, udef.get_tickers(ucfg_cfg), ucfg_cfg)
+        rets  = px.pct_change(fill_method=None).dropna(how="all")
+        fac   = udef.get_ff5_factors(start, as_of, ucfg_cfg)
+        mkt   = (fac["Mkt-RF"] + fac["RF"]).reindex(rets.index)
+        betas = estimate_betas(rets.tail(ucfg_cfg.lookback_months), mkt, ucfg_cfg)
+
+        dernier = px.ffill().iloc[-1] if len(px) else pd.Series(dtype=float)
+        net_u = brut_u = long_u = short_u = 0.0
+        for tkr, qte in tenus.items():
+            prix = float(dernier.get(tkr, 0.0) or 0.0)
+            if prix <= 0:
+                sans_beta.append(f"{tkr} (no price)")
+                continue
+            _sym, ccy, minor, _px = ticker_market(tkr, ucfg)
+            taux = _fx(ccy, base_ccy)
+            if taux is None:
+                sans_beta.append(f"{tkr} (no {ccy}->{base_ccy} rate)")
+                continue
+            valeur = qte * prix / float(minor) * taux        # signed, base currency
+            b = betas.get(tkr)
+            if b is None or b != b:
+                sans_beta.append(f"{tkr} (no beta, counted at 1.0)")
+                b = 1.0
+            net_u  += valeur * float(b)
+            brut_u += abs(valeur)
+            long_u  += valeur if valeur > 0 else 0.0
+            short_u += valeur if valeur < 0 else 0.0
+
+        lignes.append({"univers": name, "positions": len(tenus),
+                       "long": long_u, "short": short_u,
+                       "brut": brut_u, "beta_eur": net_u})
+        total_net   += net_u
+        total_brut  += brut_u
+        total_long  += long_u
+        total_short += short_u
+
+    if not lignes:
+        logger.warning("No position read — nothing to measure.")
+        return
+
+    nav = float(getattr(args, "nav", 0.0) or 0.0)
+    if nav <= 0:
+        # Without the account value, express beta against gross exposure, and
+        # say so: a beta per euro of NAV and a beta per euro deployed are not
+        # the same number and must never be shown as if they were.
+        base_lbl, base_val = "gross exposure", total_brut
+    else:
+        base_lbl, base_val = "NAV", nav
+
+    print()
+    print(f"{'universe':12s} {'pos':>4s} {'long ' + base_ccy:>14s} "
+          f"{'short ' + base_ccy:>15s} {'gross ' + base_ccy:>14s} "
+          f"{'beta x ' + base_ccy:>15s} {'beta/gross':>11s}")
+    for l in lignes:
+        # Per universe, beta is shown against that universe's OWN gross, so a
+        # small book cannot hide a large tilt behind a small euro figure: this
+        # is the column that says where a drift comes from.
+        ratio = l["beta_eur"] / l["brut"] if l["brut"] > 0 else float("nan")
+        print(f"{l['univers']:12s} {l['positions']:4d} {l['long']:14,.0f} "
+              f"{l['short']:15,.0f} {l['brut']:14,.0f} {l['beta_eur']:15,.0f} "
+              f"{ratio:+11.4f}")
+    print(f"{'TOTAL':12s} {sum(l['positions'] for l in lignes):4d} "
+          f"{total_long:14,.0f} {total_short:15,.0f} {total_brut:14,.0f} "
+          f"{total_net:15,.0f} "
+          f"{(total_net / total_brut if total_brut > 0 else float('nan')):+11.4f}")
+
+    print(f"\nNet market beta of the book held, per euro of {base_lbl}: "
+          f"{total_net / base_val:+.4f}" if base_val > 0 else "")
+    print(f"Net exposure {total_long + total_short:+,.0f} {base_ccy}  "
+          f"({(total_long + total_short) / base_val:+.2%} of {base_lbl})"
+          if base_val > 0 else "")
+    if sans_beta:
+        print(f"\n{len(sans_beta)} position(s) not fully measured: "
+              + ", ".join(sans_beta[:12]))
+
+
 def run_orders(args, cfg) -> None:
     """
     Produce the month's positions as an Excel workbook instead of trading them.
@@ -2051,6 +2182,8 @@ def main() -> None:
         run_check_protective(args, cfg)
     elif args.mode == "refresh-protective":
         run_refresh_protective(args, cfg)
+    elif args.mode == "beta":
+        run_beta(args, cfg)
     elif args.mode == "backfill-returns":
         run_backfill_returns(args, cfg)
     else:
