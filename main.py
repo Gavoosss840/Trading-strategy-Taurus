@@ -1780,6 +1780,16 @@ def run_orders(args, cfg) -> None:
                     name, len(rows),
                     f", {alertes} flagged" if alertes else "", nav_uni, base_ccy)
 
+    # Borrow availability, before the sheet is written: a short the broker
+    # cannot lend is not an order, it is a line that will silently fail and
+    # leave the book long on the other side.
+    if getattr(args, "from_ibkr", False):
+        try:
+            from taurus.order_sheet import annoter_emprunt
+            annoter_emprunt(rows_by_universe, cfg)
+        except Exception as e:
+            logger.warning("Borrow check skipped (%s) — shorts unverified.", e)
+
     out = Path(args.output) / f"ordres_{as_of}.xlsx"
     write_workbook(rows_by_universe, out, base_ccy, nav, weights)
 

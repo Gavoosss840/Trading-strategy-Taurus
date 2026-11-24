@@ -686,6 +686,91 @@ def _repartir_restant(
     return plan
 
 
+def annoter_emprunt(rows_by_universe: Dict[str, List[dict]],
+                    cfg: TaurusConfig) -> None:
+    """
+    Ask IBKR, per short line, whether the name can actually be borrowed.
+
+    The automated path already does this — execute_rebalance calls
+    get_shortable_shares when check_borrow_availability is set — but the
+    manual sheet never did. It printed every short the optimiser wanted and
+    left the operator to discover at the terminal which ones IBKR would
+    refuse or queue, one rejection at a time.
+
+    The consequence is not a missing line, it is a one-sided book: the buys
+    go through, the short sales do not, and what was meant to be market
+    neutral ends up long. Measured on a real rebalance, 733,511 EUR was
+    bought against 367,476 EUR sold — two to one — and 44 shorts never
+    opened, leaving the book 94,521 EUR net long.
+
+    IBKR's tick 236 answers with the shares available. A name it does not
+    quote is reported as UNKNOWN, not as unborrowable: a missing market-data
+    subscription must not look like a refusal.
+    """
+    from .universe import REGISTRY
+
+    courts: Dict[str, List[str]] = {}
+    for uni, rs in rows_by_universe.items():
+        noms = [str(r.get("Ticker", "")) for r in rs
+                if r.get("Sens") == "SHORT" and float(r.get("Titres", 0.0) or 0.0)]
+        if noms:
+            courts[uni] = noms
+    if not courts:
+        return
+
+    try:
+        from .execution import IBKRConnection, OrderManager
+    except Exception as e:
+        logger.warning("IBKR layer unavailable (%s) — borrow not checked.", e)
+        return
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.warning("Cannot reach IBKR — borrow availability not checked. "
+                       "Every short in the sheet is unverified.")
+        return
+
+    om = OrderManager()
+    total, bloques = 0, 0
+    try:
+        for uni, noms in courts.items():
+            try:
+                dispo = om.get_shortable_shares(conn, noms,
+                                                REGISTRY.get(uni).config)
+            except Exception as e:
+                logger.warning("[%s] borrow query failed (%s).", uni, e)
+                continue
+            for r in rows_by_universe[uni]:
+                if r.get("Sens") != "SHORT":
+                    continue
+                besoin = abs(float(r.get("Titres", 0.0) or 0.0))
+                if not besoin:
+                    continue
+                total += 1
+                n = dispo.get(str(r.get("Ticker", "")))
+                if n is None or n != n:
+                    r["Emprunt"] = "INCONNU"
+                    continue
+                r["Emprunt"] = f"{n:,.0f}"
+                if n < besoin:
+                    bloques += 1
+                    r["Alerte"] = (f"{r.get('Alerte') or ''} EMPRUNT INSUFFISANT "
+                                   f"({n:,.0f} dispo pour {besoin:,.0f})").strip()
+    finally:
+        try:
+            conn.ib.disconnect()
+        except Exception:
+            pass
+
+    if bloques:
+        logger.warning(
+            "%d short(s) of %d cannot be borrowed in the size requested — see "
+            "the Emprunt column. Placing them anyway leaves the book LONG.",
+            bloques, total)
+    else:
+        logger.info("Borrow checked on %d short line(s): all available.", total)
+
+
 def consolider_entre_univers(rows_by_universe: Dict[str, List[dict]]) -> None:
     """
     Net the orders of a ticker that several universes hold at once.
