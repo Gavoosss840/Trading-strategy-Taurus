@@ -1446,11 +1446,35 @@ def run_beta(args, cfg) -> None:
         logger.warning("No position read — nothing to measure.")
         return
 
+    # The account knows its own value, so do not make the operator type it.
+    # Falling back to gross exposure is correct but answers a different
+    # question — "beta per euro deployed" rather than "beta per euro of
+    # capital" — so the account is asked first and the label always says
+    # which of the two is on screen.
     nav = float(getattr(args, "nav", 0.0) or 0.0)
     if nav <= 0:
-        # Without the account value, express beta against gross exposure, and
-        # say so: a beta per euro of NAV and a beta per euro deployed are not
-        # the same number and must never be shown as if they were.
+        try:
+            from taurus.execution import IBKRConnection, PositionReconciler
+            _conn = IBKRConnection(cfg)
+            if _conn.ensure_connected():
+                try:
+                    nav = float(PositionReconciler().get_account_nav(
+                        _conn, currency=base_ccy) or 0.0)
+                    if nav > 0:
+                        logger.info("NAV read from IBKR: %.2f %s", nav, base_ccy)
+                finally:
+                    try:
+                        _conn.ib.disconnect()
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("Could not read the NAV from IBKR (%s).", e)
+
+    if nav <= 0:
+        logger.warning(
+            "No account value — beta is reported per euro DEPLOYED, not per "
+            "euro of capital. The two differ by the share of the account that "
+            "is in cash.")
         base_lbl, base_val = "gross exposure", total_brut
     else:
         base_lbl, base_val = "NAV", nav
@@ -1472,11 +1496,21 @@ def run_beta(args, cfg) -> None:
           f"{total_net:15,.0f} "
           f"{(total_net / total_brut if total_brut > 0 else float('nan')):+11.4f}")
 
-    print(f"\nNet market beta of the book held, per euro of {base_lbl}: "
-          f"{total_net / base_val:+.4f}" if base_val > 0 else "")
-    print(f"Net exposure {total_long + total_short:+,.0f} {base_ccy}  "
-          f"({(total_long + total_short) / base_val:+.2%} of {base_lbl})"
-          if base_val > 0 else "")
+    if base_val > 0:
+        print()
+        if nav > 0:
+            print(f"Account value          {nav:>15,.0f} {base_ccy}")
+            print(f"Deployed (gross)       {total_brut:>15,.0f} {base_ccy}"
+                  f"   {total_brut / nav:6.1%} of the account")
+            print(f"Cash / undeployed      {max(nav - total_brut, 0.0):>15,.0f} "
+                  f"{base_ccy}   {max(nav - total_brut, 0.0) / nav:6.1%}")
+        print(f"Net exposure           {total_long + total_short:>+15,.0f} "
+              f"{base_ccy}   {(total_long + total_short) / base_val:+6.2%} "
+              f"of {base_lbl}")
+        print(f"\nNET MARKET BETA of the book held, per euro of {base_lbl}: "
+              f"{total_net / base_val:+.4f}")
+        print("  (backtest reference: -0.029, t = -0.67 — indistinguishable "
+              "from zero)")
     if sans_beta:
         print(f"\n{len(sans_beta)} position(s) not fully measured: "
               + ", ".join(sans_beta[:12]))
