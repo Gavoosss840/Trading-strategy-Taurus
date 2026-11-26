@@ -106,6 +106,13 @@ def parse_args() -> argparse.Namespace:
                         "take-profit to be entered by hand from the order "
                         "sheet, which carries both levels per line. Stale "
                         "protective orders are still cancelled each rebalance.")
+    p.add_argument("--protective", action="store_true",
+                   help="execute-sheet only: also place the stop and "
+                        "take-profit. Off by default — the book is rebalanced "
+                        "monthly and runs without them. On US names the "
+                        "bracket is sent parent-first and transmits only once "
+                        "its last child is accepted, so a refused stop leaves "
+                        "the market order held and unsent.")
     p.add_argument("--cache-dir",   default=".cache")
     p.add_argument("--cache-ttl",   type=float, default=12.0, help="Cache TTL in hours")
 
@@ -1380,6 +1387,7 @@ def run_execute_sheet(args, cfg) -> None:
     Dry-run by default.  No protective orders: the stop and target are in the
     sheet for the operator to place.
     """
+    import dataclasses
     from datetime import date
 
     import pandas as pd
@@ -1395,6 +1403,21 @@ def run_execute_sheet(args, cfg) -> None:
         return
 
     df = pd.read_excel(chemin, sheet_name="Toutes positions", engine="openpyxl")
+
+    # A missing column must abort.  Every target was read with
+    # r.get("Titres cibles", 0.0), so renaming that column in the sheet
+    # builder would make every target zero — and a book whose target is zero
+    # everywhere is a book sold in full.  The failure would be silent and
+    # total, so it is checked rather than defaulted.
+    REQUISES = ("Ticker", "Univers", "Titres cibles")
+    manquantes = [c for c in REQUISES if c not in df.columns]
+    if manquantes:
+        logger.error(
+            "Sheet is missing column(s): %s. Aborting — a missing target "
+            "column would read as zero on every line and flatten the book.",
+            ", ".join(manquantes))
+        return
+
     for c in ("Action", "Ordre", "Alerte", "Univers", "Ticker"):
         if c in df.columns:
             df[c] = df[c].fillna("")
@@ -1408,7 +1431,23 @@ def run_execute_sheet(args, cfg) -> None:
             "know why you are executing a stale one.", age_h)
 
     # Lines carrying no order of their own: the consolidated duplicates.
-    df = df[~df["Action"].str.startswith("VOIR")]
+    if "Action" in df.columns:
+        df = df[~df["Action"].astype(str).str.startswith("VOIR")]
+
+    # Every universe on the sheet must be one we can configure, or its lot
+    # size, exchange and currency would silently fall back to US defaults.
+    univers = sorted(set(df["Univers"].astype(str)) - {""})
+    inconnus = []
+    for u in univers:
+        try:
+            if REGISTRY.get(u) is None:
+                inconnus.append(u)
+        except Exception:
+            inconnus.append(u)
+    if inconnus:
+        logger.error("Sheet references unknown universe(s): %s — aborting.",
+                     ", ".join(inconnus))
+        return
 
     # Positions FIRST, on their own connection, which load_positions_from_ibkr
     # opens and closes itself.  Opening ours before calling it put two
@@ -1416,7 +1455,7 @@ def run_execute_sheet(args, cfg) -> None:
     # 326 — "this client id is already in use" — which then looked like the
     # broker dropping the link. One connection at a time, in order.
     tenus: dict = {}
-    for uni in sorted(set(df["Univers"]) - {""}):
+    for uni in univers:
         try:
             pos, plein, source = load_positions_from_ibkr(cfg, universe=uni)
         except Exception as e:
@@ -1429,43 +1468,52 @@ def run_execute_sheet(args, cfg) -> None:
         for k, q in pos.items():
             tenus[plein.get(k, k)] = q
     logger.info("%d held position(s) resolved across %d universe(s).",
-                len(tenus), len(set(df["Univers"]) - {""}))
+                len(tenus), len(univers))
 
-    conn = IBKRConnection(cfg)
+    # No stops, no take-profits on this path.  The book is rebalanced monthly
+    # and the operator chose to run it without them; the sheet carries the
+    # levels in its own columns for anyone who wants to place them by hand.
+    #
+    # The flag defaulted to ON, which this mode's own docstring denied, so an
+    # ordinary run placed a bracket on all 300-odd lines.  On US names the
+    # bracket is sent parent-first with transmit=False, and only the LMT child
+    # transmits the three together: a stop or target the exchange refuses
+    # leaves the MARKET order sitting in PreSubmitted, unsent and invisible.
+    # That is a mechanism which turns "252 orders submitted" into a book that
+    # never moved, and it was live on this path.
+    protect = bool(getattr(args, "protective", False))
+    cfg_exec = dataclasses.replace(cfg, place_protective_orders=protect)
+    if protect:
+        logger.warning("Protective orders are ON for this run (--protective).")
+    else:
+        logger.info("Protective orders OFF: plain market orders only.")
+
+    conn = IBKRConnection(cfg_exec)
     if not conn.ensure_connected():
         logger.error("Cannot reach IBKR TWS/Gateway — nothing sent.")
         return
 
     om, rec = OrderManager(), PositionReconciler()
     try:
-        pending = rec.get_pending_shares(conn)
-        if len(pending):
-            logger.info("%d ticker(s) have unfilled entry orders; their "
-                        "quantities are subtracted.", len(pending))
-
+        # Raw lines first: ticker, universe, target, held.  The in-flight
+        # subtraction and the share rounding both wait until the contract is
+        # qualified, because both need facts only IBKR can give — the symbol
+        # it files open orders under, and whole shares.
         lignes = []
         for _, r in df.iterrows():
-            tkr = str(r["Ticker"])
-            uni = str(r["Univers"])
+            tkr = str(r["Ticker"]).strip()
+            uni = str(r["Univers"]).strip()
             if not tkr or not uni:
                 continue
-            cible = float(r.get("Titres cibles", 0.0) or 0.0)
-            detenu = float(tenus.get(tkr, 0.0))
-            en_cours = float(pending.get(tkr.split(".")[0], 0.0)) if len(pending) else 0.0
-            delta = cible - detenu - en_cours
-
-            ucfg = REGISTRY.get(uni).config
-            lot = max(int(getattr(ucfg, "min_lot_size", 1) or 1), 1)
-            if lot > 1:
-                delta = float(int(abs(delta)) // lot * lot) * (1 if delta > 0 else -1)
-            if abs(delta) < 1:
-                continue
-            lignes.append({"ticker": tkr, "universe": uni, "delta": delta,
-                           "cible": cible, "detenu": detenu,
-                           "prix": float(r.get("Prix entree", 0.0) or 0.0)})
+            lignes.append({
+                "ticker": tkr, "universe": uni,
+                "cible": float(r.get("Titres cibles", 0.0) or 0.0),
+                "detenu": float(tenus.get(tkr, 0.0)),
+                "prix": float(r.get("Prix entree", 0.0) or 0.0),
+            })
 
         if not lignes:
-            print("\nNothing to send: the book already matches the sheet.")
+            print("\nNothing to send: the sheet carries no actionable line.")
             return
 
         # ── Pre-flight: every line must resolve to a contract at IBKR ────────
@@ -1528,10 +1576,96 @@ def run_execute_sheet(args, cfg) -> None:
                 _sym, _ccy, _m, _pri = ticker_market(l["ticker"], ucfg)
                 print(f"   {l['ticker']:12s} {l['universe']:11s} "
                       f"{_sym}/{_pri or ucfg.ibkr_exchange}/{_ccy:3s} "
-                      f"{l['delta']:+8.0f}")
+                      f"held {l['detenu']:+8.0f} target {l['cible']:+8.0f}")
         if not lignes:
             print("\nNo line resolves — nothing to send.")
             return
+
+        # ── In-flight orders, keyed by the symbol IBKR actually files ────────
+        # get_pending_shares keys on trade.contract.symbol.  This loop looked
+        # it up as ticker.split(".")[0], which agrees for most names and not
+        # for the ones where IBKR's symbol differs from the Yahoo stem — UNI.MI
+        # is filed as UNIm, NWG.L as NWGI.  On those, a rerun before the fills
+        # settled would not have subtracted the working order and would have
+        # sent it a second time.  The qualified contract carries IBKR's own
+        # symbol, so it is used.
+        pending = rec.get_pending_shares(conn)
+        if len(pending):
+            logger.info("%d ticker(s) have unfilled entry orders; their "
+                        "quantities are subtracted.", len(pending))
+
+        for l in lignes:
+            sym = l["_contrat"].symbol
+            en_cours = float(pending.get(sym, 0.0)) if len(pending) else 0.0
+            brut = l["cible"] - l["detenu"] - en_cours
+
+            # Whole shares, always.  Rounding was applied only where the lot
+            # size exceeded one, so US and European lines kept whatever
+            # fraction the arithmetic produced — and IBKR reports fractional
+            # holdings when fractional trading is enabled, which is enough to
+            # make a delta like 272.5 and have the order refused outright.
+            ucfg = REGISTRY.get(l["universe"]).config
+            lot = max(int(getattr(ucfg, "min_lot_size", 1) or 1), 1)
+            signe = 1.0 if brut > 0 else -1.0
+            l["delta"] = float(int(abs(brut)) // lot * lot) * signe
+            l["en_cours"] = en_cours
+
+        ignorees = [l for l in lignes if abs(l["delta"]) < 1]
+        lignes = [l for l in lignes if abs(l["delta"]) >= 1]
+        if ignorees:
+            sous_lot = [l for l in ignorees
+                        if abs(l["cible"] - l["detenu"] - l["en_cours"]) >= 1]
+            logger.info("%d line(s) need no order; %d of those are a non-zero "
+                        "adjustment smaller than one lot.",
+                        len(ignorees), len(sous_lot))
+        if not lignes:
+            print("\nNothing to send: the book already matches the sheet.")
+            return
+
+        # ── Which markets are open right now ────────────────────────────────
+        # A market order is only an order where there is a session to fill it
+        # in.  Sent to an exchange whose day is over, it waits — and a sheet
+        # run at 11:00 Paris reaches Tokyo after the close, London mid-session
+        # and New York before the open, so the three legs of a book meant to
+        # be neutral do not start together. Worth knowing before, not after.
+        vus, etat_marche = {}, []
+        for l in lignes:
+            ex = l["_contrat"].primaryExchange or l["_contrat"].exchange
+            vus.setdefault(ex, l)
+        for ex, l in sorted(vus.items()):
+            heures, fuseau = "", ""
+            try:
+                det = conn.ib.reqContractDetails(l["_contrat"])
+                if det:
+                    heures = (det[0].tradingHours or "").split(";")[0]
+                    fuseau = det[0].timeZoneId or ""
+            except Exception as e:
+                logger.debug("reqContractDetails failed for %s: %s", ex, e)
+            n = sum(1 for z in lignes
+                    if (z["_contrat"].primaryExchange or z["_contrat"].exchange) == ex)
+            ferme = "CLOSED" in heures.upper()
+            etat_marche.append((ex, n, heures, fuseau, ferme))
+        if etat_marche:
+            print(f"\n{'exchange':12s} {'orders':>6s}  {'session (exchange time)':34s} tz")
+            for ex, n, heures, fuseau, ferme in etat_marche:
+                marque = "  <-- CLOSED TODAY" if ferme else ""
+                print(f"{ex:12s} {n:6d}  {heures or '?':34s} {fuseau}{marque}")
+            if any(f for *_, f in etat_marche):
+                print("\nOrders to an exchange closed today will not fill "
+                      "today. They sit as DAY orders and IBKR may expire them "
+                      "at its daily reset rather than carry them to the next "
+                      "session — check them tomorrow with --mode cancel-orders.")
+
+        # ── Reducing orders before increasing ones ──────────────────────────
+        # execution.py states "exits before entries (margin safety)" as a
+        # principle of the module; this path sent in sheet order, so 152 buys
+        # and 156 sells went out interleaved. Sending the buys of a 1.0-gross
+        # book before its sells asks the account to carry both legs at once,
+        # and the orders refused for margin are then whichever happened to be
+        # late in the list. Sorted by how much each line shrinks the position
+        # it touches, the capital is freed before it is spent.
+        lignes.sort(key=lambda z: (abs(z["cible"]) - abs(z["detenu"]),
+                                   z["universe"], z["ticker"]))
 
         achats = [l for l in lignes if l["delta"] > 0]
         ventes = [l for l in lignes if l["delta"] < 0]
@@ -1575,14 +1709,29 @@ def run_execute_sheet(args, cfg) -> None:
         # on a night when 44 of them were refused — which is how November's
         # missing shorts went unnoticed for two weeks.  So the account is read
         # back and asked what it has.
-        conn.ib.sleep(4)
         from collections import Counter as _Counter
 
+        # Let the statuses settle. 300-odd acknowledgements do not all arrive
+        # in one tick, and a status read too early reads PendingSubmit for an
+        # order that is about to be refused.
+        for _ in range(12):
+            conn.ib.sleep(2)
+            if not any(t.orderStatus.status in ("PendingSubmit", "ApiPending")
+                       for t in conn.ib.trades()):
+                break
+
         REFUSE = {"Inactive", "Cancelled", "ApiCancelled", "Expired"}
-        etats, refuses = _Counter(), []
+        etats, refuses, retenus = _Counter(), [], []
         for t in conn.ib.trades():
             st = t.orderStatus.status
             etats[st] += 1
+            # PreSubmitted on a plain market order means IBKR is holding it:
+            # outside session hours, or a parent waiting on a child that never
+            # transmitted. Not a refusal, but not working either, and it is
+            # exactly what a frozen bracket looks like.
+            if st == "PreSubmitted" and not protect:
+                retenus.append((t.contract.symbol, t.order.action,
+                                t.order.totalQuantity, t.order.orderType))
             if st in REFUSE:
                 motif = ""
                 for e in reversed(t.log):
@@ -1604,6 +1753,14 @@ def run_execute_sheet(args, cfg) -> None:
                   "leaving it overnight.")
         else:
             print("No order refused.")
+        if retenus:
+            print(f"\n{len(retenus)} order(s) HELD by IBKR, not working — "
+                  f"normally an exchange outside its session:")
+            print(f"{'symbol':10s} {'side':5s} {'qty':>9s} {'type':6s}")
+            for s, a, q, ty in sorted(retenus):
+                print(f"{s:10s} {a:5s} {q:9.0f} {ty:6s}")
+            print("These fill at the next open if IBKR carries them. Verify "
+                  "with --mode cancel-orders before the next sheet.")
     finally:
         try:
             conn.ib.disconnect()
