@@ -1410,6 +1410,27 @@ def run_execute_sheet(args, cfg) -> None:
     # Lines carrying no order of their own: the consolidated duplicates.
     df = df[~df["Action"].str.startswith("VOIR")]
 
+    # Positions FIRST, on their own connection, which load_positions_from_ibkr
+    # opens and closes itself.  Opening ours before calling it put two
+    # connections on the same clientId and IBKR refused the second with error
+    # 326 — "this client id is already in use" — which then looked like the
+    # broker dropping the link. One connection at a time, in order.
+    tenus: dict = {}
+    for uni in sorted(set(df["Univers"]) - {""}):
+        try:
+            pos, plein, source = load_positions_from_ibkr(cfg, universe=uni)
+        except Exception as e:
+            logger.error("[%s] could not read positions (%s) — aborting.", uni, e)
+            return
+        if source in ("IBKR unreachable", "IBKR unavailable"):
+            logger.error("Positions NOT read from IBKR — aborting rather than "
+                         "sending orders blind.")
+            return
+        for k, q in pos.items():
+            tenus[plein.get(k, k)] = q
+    logger.info("%d held position(s) resolved across %d universe(s).",
+                len(tenus), len(set(df["Univers"]) - {""}))
+
     conn = IBKRConnection(cfg)
     if not conn.ensure_connected():
         logger.error("Cannot reach IBKR TWS/Gateway — nothing sent.")
@@ -1421,23 +1442,6 @@ def run_execute_sheet(args, cfg) -> None:
         if len(pending):
             logger.info("%d ticker(s) have unfilled entry orders; their "
                         "quantities are subtracted.", len(pending))
-
-        # Positions held now, per universe, through the same reader the sheet
-        # used — so a ticker resolves to the same contract on both sides.
-        tenus: dict = {}
-        for uni in sorted(set(df["Univers"]) - {""}):
-            try:
-                ucfg_u = dataclasses.replace(cfg)
-                pos, plein, source = load_positions_from_ibkr(ucfg_u, universe=uni)
-            except Exception as e:
-                logger.error("[%s] could not read positions (%s) — aborting.", uni, e)
-                return
-            if source in ("IBKR unreachable", "IBKR unavailable"):
-                logger.error("Positions NOT read from IBKR — aborting rather "
-                             "than sending orders blind.")
-                return
-            for k, q in pos.items():
-                tenus[plein.get(k, k)] = q
 
         lignes = []
         for _, r in df.iterrows():
