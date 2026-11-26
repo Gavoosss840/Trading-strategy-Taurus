@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sys
+import dataclasses
 from pathlib import Path
 
 from taurus.config import TaurusConfig as _TaurusConfig
@@ -54,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns", "beta", "cancel-orders"], default="backtest")
+    p.add_argument("--mode",    choices=["snapshot", "backtest", "live", "report", "live-report", "calibrate", "orders", "flatten", "force-rebalance", "check-protective", "refresh-protective", "backfill-returns", "beta", "cancel-orders", "execute-sheet"], default="backtest")
     p.add_argument("--from-ibkr", action="store_true",
                    help="orders: read the held positions from IBKR instead of a "
                         "file. READ-ONLY — it reads and disconnects, it never "
@@ -97,6 +98,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--leverage-gap",type=float, default=0.25,help="MM leverage gap threshold")
     p.add_argument("--rf-rate",     type=float, default=0.045, help="Annual risk-free rate")
     p.add_argument("--no-shrinkage",action="store_true", help="Disable Ledoit-Wolf shrinkage")
+    p.add_argument("--sheet", default=None,
+                   help="execute-sheet: the order sheet to execute. Defaults "
+                        "to output/ordres_<today>.xlsx.")
     p.add_argument("--no-protective", action="store_true",
                    help="place the MARKET order only and leave the stop and "
                         "take-profit to be entered by hand from the order "
@@ -1351,6 +1355,156 @@ def run_calibrate(args, cfg) -> None:
         logger.error("Written but not loadable — investigate before relying on it.")
 
 
+def run_execute_sheet(args, cfg) -> None:
+    """
+    Place the orders of an order sheet, as market orders.
+
+    This mode exists because --mode force-rebalance takes a DIFFERENT code
+    path.  Everything verified this week — the lot-remainder redistribution,
+    the cross-universe consolidation that stops a shared ticker being ordered
+    twice, the borrow check — lives in order_sheet.py, which builds the
+    spreadsheet.  execute_rebalance has its own universe-isolation logic that
+    none of those measurements covered.  Automating through it would place
+    orders by a route whose correctness was never shown, while the sheet in
+    the operator's hands was checked line by line.
+
+    So the sheet IS the instruction.  Nothing is recomputed: what was reviewed
+    is what is sent.
+
+    Two properties make it safe to run twice.  The quantity to send is derived
+    from the sheet's TARGET against the positions held RIGHT NOW, not from the
+    sheet's own "A passer" column — so a partly executed sheet completes
+    rather than doubling.  And open entry orders are subtracted, so a rerun
+    before fills settle does not re-send what is already working.
+
+    Dry-run by default.  No protective orders: the stop and target are in the
+    sheet for the operator to place.
+    """
+    from datetime import date
+
+    import pandas as pd
+
+    from taurus.execution import IBKRConnection, OrderManager, PositionReconciler
+    from taurus.order_sheet import load_positions_from_ibkr
+    from taurus.universe import REGISTRY, ticker_market
+
+    chemin = Path(getattr(args, "sheet", None)
+                  or Path(args.output) / f"ordres_{date.today().isoformat()}.xlsx")
+    if not chemin.exists():
+        logger.error("Sheet not found: %s — run --mode orders first.", chemin)
+        return
+
+    df = pd.read_excel(chemin, sheet_name="Toutes positions", engine="openpyxl")
+    for c in ("Action", "Ordre", "Alerte", "Univers", "Ticker"):
+        if c in df.columns:
+            df[c] = df[c].fillna("")
+    logger.info("Executing %s — %d line(s).", chemin, len(df))
+
+    age_h = (pd.Timestamp.now() - pd.Timestamp(chemin.stat().st_mtime, unit="s")).total_seconds() / 3600
+    if age_h > 8:
+        logger.warning(
+            "This sheet is %.0f hours old. Prices, and therefore the share "
+            "counts it targets, have moved since. Regenerate it unless you "
+            "know why you are executing a stale one.", age_h)
+
+    # Lines carrying no order of their own: the consolidated duplicates.
+    df = df[~df["Action"].str.startswith("VOIR")]
+
+    conn = IBKRConnection(cfg)
+    if not conn.ensure_connected():
+        logger.error("Cannot reach IBKR TWS/Gateway — nothing sent.")
+        return
+
+    om, rec = OrderManager(), PositionReconciler()
+    try:
+        pending = rec.get_pending_shares(conn)
+        if len(pending):
+            logger.info("%d ticker(s) have unfilled entry orders; their "
+                        "quantities are subtracted.", len(pending))
+
+        # Positions held now, per universe, through the same reader the sheet
+        # used — so a ticker resolves to the same contract on both sides.
+        tenus: dict = {}
+        for uni in sorted(set(df["Univers"]) - {""}):
+            try:
+                ucfg_u = dataclasses.replace(cfg)
+                pos, plein, source = load_positions_from_ibkr(ucfg_u, universe=uni)
+            except Exception as e:
+                logger.error("[%s] could not read positions (%s) — aborting.", uni, e)
+                return
+            if source in ("IBKR unreachable", "IBKR unavailable"):
+                logger.error("Positions NOT read from IBKR — aborting rather "
+                             "than sending orders blind.")
+                return
+            for k, q in pos.items():
+                tenus[plein.get(k, k)] = q
+
+        lignes = []
+        for _, r in df.iterrows():
+            tkr = str(r["Ticker"])
+            uni = str(r["Univers"])
+            if not tkr or not uni:
+                continue
+            cible = float(r.get("Titres cibles", 0.0) or 0.0)
+            detenu = float(tenus.get(tkr, 0.0))
+            en_cours = float(pending.get(tkr.split(".")[0], 0.0)) if len(pending) else 0.0
+            delta = cible - detenu - en_cours
+
+            ucfg = REGISTRY.get(uni).config
+            lot = max(int(getattr(ucfg, "min_lot_size", 1) or 1), 1)
+            if lot > 1:
+                delta = float(int(abs(delta)) // lot * lot) * (1 if delta > 0 else -1)
+            if abs(delta) < 1:
+                continue
+            lignes.append({"ticker": tkr, "universe": uni, "delta": delta,
+                           "cible": cible, "detenu": detenu,
+                           "prix": float(r.get("Prix entree", 0.0) or 0.0)})
+
+        if not lignes:
+            print("\nNothing to send: the book already matches the sheet.")
+            return
+
+        achats = [l for l in lignes if l["delta"] > 0]
+        ventes = [l for l in lignes if l["delta"] < 0]
+        print(f"\n{len(lignes)} order(s): {len(achats)} buy, {len(ventes)} sell")
+        print(f"{'ticker':12s} {'universe':11s} {'held':>10s} {'target':>10s} "
+              f"{'send':>10s} {'side':>5s}")
+        for l in sorted(lignes, key=lambda z: (z["universe"], z["ticker"])):
+            print(f"{l['ticker']:12s} {l['universe']:11s} {l['detenu']:10.0f} "
+                  f"{l['cible']:10.0f} {l['delta']:+10.0f} "
+                  f"{'BUY' if l['delta'] > 0 else 'SELL':>5s}")
+
+        if cfg.dry_run:
+            print(f"\n[DRY RUN] nothing sent. Re-run with --no-dry-run to place "
+                  f"these {len(lignes)} market order(s).")
+            return
+
+        envoyes, echecs = 0, []
+        for l in lignes:
+            try:
+                info = om.place_order(
+                    conn, l["ticker"], l["delta"],
+                    REGISTRY.get(l["universe"]).config,
+                    dry_run=False, entry_price=l["prix"],
+                    target_qty=abs(l["cible"]) or abs(l["delta"]),
+                )
+                if info and info.get("status") == "submitted":
+                    envoyes += 1
+                else:
+                    echecs.append(f"{l['ticker']} ({info.get('status') if info else 'no reply'})")
+            except Exception as e:
+                echecs.append(f"{l['ticker']} ({e})")
+        print(f"\n{envoyes} order(s) submitted.")
+        if echecs:
+            print(f"{len(echecs)} NOT submitted: " + ", ".join(echecs[:15]))
+            print("Re-run this mode to retry only what is still missing.")
+    finally:
+        try:
+            conn.ib.disconnect()
+        except Exception:
+            pass
+
+
 def run_cancel_orders(args, cfg) -> None:
     """
     List, and optionally cancel, every open order sitting in the account.
@@ -2337,6 +2491,8 @@ def main() -> None:
         run_beta(args, cfg)
     elif args.mode == "cancel-orders":
         run_cancel_orders(args, cfg)
+    elif args.mode == "execute-sheet":
+        run_execute_sheet(args, cfg)
     elif args.mode == "backfill-returns":
         run_backfill_returns(args, cfg)
     else:
