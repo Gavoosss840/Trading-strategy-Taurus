@@ -102,17 +102,10 @@ def parse_args() -> argparse.Namespace:
                    help="execute-sheet: the order sheet to execute. Defaults "
                         "to output/ordres_<today>.xlsx.")
     p.add_argument("--no-protective", action="store_true",
-                   help="place the MARKET order only and leave the stop and "
-                        "take-profit to be entered by hand from the order "
-                        "sheet, which carries both levels per line. Stale "
-                        "protective orders are still cancelled each rebalance.")
-    p.add_argument("--protective", action="store_true",
-                   help="execute-sheet only: also place the stop and "
-                        "take-profit. Off by default — the book is rebalanced "
-                        "monthly and runs without them. On US names the "
-                        "bracket is sent parent-first and transmits only once "
-                        "its last child is accepted, so a refused stop leaves "
-                        "the market order held and unsent.")
+                   help="accepted and ignored. This book holds no stops and "
+                        "no take-profits; no code path places one, so there "
+                        "is nothing to switch off. Kept so older commands "
+                        "still run.")
     p.add_argument("--cache-dir",   default=".cache")
     p.add_argument("--cache-ttl",   type=float, default=12.0, help="Cache TTL in hours")
 
@@ -180,7 +173,6 @@ def build_config(args: argparse.Namespace):
         live_trading=args.live,
         dry_run=not args.no_dry_run,
         nav_usd=(args.nav if args.nav else 100_000.0),
-        place_protective_orders=not getattr(args, "no_protective", False),
     )
 
 
@@ -762,345 +754,25 @@ def _cleanup_orphaned_protective_orders(conn, dry_run: bool = False) -> list:
 
 def run_refresh_protective(args, cfg) -> None:
     """
-    Scan ALL live positions and refresh STP/LMT orders to the correct prices.
+    Disabled. This mode existed to correct stops and take-profits whose
+    quantity or level had drifted from the position they protect.
 
-    Rules:
-      - STP = avg_cost × (1 ± stop_loss_pct)
-      - LMT = avg_cost × (1 ± mm_tp_pct)   [from last execution report, else flat 20%]
-      - If existing order price is within 0.5% of correct → leave it alone
-      - If wrong price OR missing → cancel stale order + place fresh GTC order
-      - MKT/entry orders are NEVER touched (no rebalancing)
+    The book holds neither, so there is nothing to correct and nothing here
+    may place one. To clear whatever is still sitting in the account:
 
-    Dry-run by default (shows what would change).
-    Use --no-dry-run to actually submit the corrected orders.
+        python main.py --mode cancel-orders              # list
+        python main.py --mode cancel-orders --no-dry-run # cancel
 
-    Writes a report to output/protective_adjustment_<date>.txt / .json
-
-    Usage:
-        python main.py --mode refresh-protective              # dry-run preview
-        python main.py --mode refresh-protective --no-dry-run # apply corrections
+    --mode check-protective still works and is read-only: it reports what
+    protective orders the account holds, which is how you confirm there are
+    none left.
     """
-    import os, json, glob as _glob
-    from datetime import datetime
-    from taurus.execution import IBKRConnection, OrderManager, _round_price
-    from taurus.risk import RiskConfig
-    from taurus.universe import REGISTRY
+    logger.error(
+        "refresh-protective is disabled: this book holds no stops and no "
+        "take-profits, and nothing in it places one. Use --mode "
+        "cancel-orders --no-dry-run to clear any that remain, and --mode "
+        "check-protective to confirm the account is clean.")
 
-    dry_run = not args.no_dry_run
-
-    conn = IBKRConnection(cfg)
-    if not conn.ensure_connected():
-        logger.error("Cannot connect to IBKR — is TWS/Gateway running?")
-        return
-
-    risk      = RiskConfig()
-    order_mgr = OrderManager()
-
-    # ── 0. Load MM take-profit pcts from last execution reports ─────────────
-    MIN_TP, MAX_TP  = 0.05, 0.80
-    FLAT_DEFAULT    = 0.20          # RiskConfig default — not MM-derived
-    mm_tp_pcts: dict = {}           # {ticker: tp_fraction}  — only truly MM-derived values
-    for report_path in _glob.glob(os.path.join(args.output, "execution_*.json")):
-        try:
-            with open(report_path) as f:
-                rep = json.load(f)
-            for order in rep.get("orders", []):
-                t      = order.get("ticker", "")
-                tp     = order.get("tp_pct", None)
-                src    = order.get("tp_source", "flat")   # "MM" or "flat"
-                if not t or tp is None:
-                    continue
-                tp_val = float(tp)
-                # Only use if flagged as MM-derived AND meaningfully different from flat default
-                if src == "MM" and abs(tp_val - FLAT_DEFAULT) > 0.005:
-                    mm_tp_pcts[t] = max(MIN_TP, min(tp_val, MAX_TP))
-        except Exception:
-            pass
-    if mm_tp_pcts:
-        logger.info("MM take-profit levels loaded for %d tickers (non-flat)", len(mm_tp_pcts))
-    else:
-        logger.info("No MM take-profit data in execution reports yet — using flat %.0f%% for all",
-                    FLAT_DEFAULT * 100)
-
-    # ── 0b. Build currency → universe_cfg for exchange lookup ───────────────
-    # REGISTRY.get() returns UniverseDef (wrapper); the UniverseConfig is in .config
-    currency_to_ucfg: dict = {}
-    for uname in REGISTRY.all_names():
-        ucfg = REGISTRY.get(uname).config   # UniverseConfig has .currency / .ibkr_exchange
-        currency_to_ucfg.setdefault(ucfg.currency, ucfg)
-
-    # ── 1. Live positions ────────────────────────────────────────────────────
-    raw_positions = conn.ib.positions(account=conn.cfg.ibkr_account or "")
-    live = [p for p in raw_positions if p.position != 0]
-    logger.info("Live positions fetched: %d total (%d non-zero)",
-                len(raw_positions), len(live))
-    if not live:
-        logger.info("No live positions found.")
-        conn.ib.disconnect()
-        return
-
-    # ── 1b. Current market prices — used to guard against immediate LMT fills
-    # A BUY LMT for a short executes immediately if market <= lmt_price.
-    # A SELL LMT for a long executes immediately if market >= lmt_price.
-    # We fetch prices here so we can skip placing an LMT that would fill at once.
-    live_prices: dict = {}   # {symbol: last_price}
-    try:
-        from ib_insync import Stock
-        from taurus.execution import OrderManager
-        _om = OrderManager()
-        all_syms = [p.contract.symbol for p in live]
-        for p in live:
-            ibkr_sym = p.contract.symbol.split(".")[0] if "." in p.contract.symbol else p.contract.symbol
-            currency = p.contract.currency
-            ucfg_tmp = currency_to_ucfg.get(currency)
-            if ucfg_tmp is None:
-                continue
-            price_map = _om.get_live_prices(conn, [ibkr_sym], ucfg_tmp)
-            if ibkr_sym in price_map and price_map[ibkr_sym] > 0:
-                live_prices[ibkr_sym] = price_map[ibkr_sym]
-        if live_prices:
-            logger.info("Live prices fetched for %d/%d positions", len(live_prices), len(live))
-    except Exception as e:
-        logger.warning("Could not fetch live prices (will skip LMT safety check): %s", e)
-
-    # ── 2. Open protective orders by symbol ─────────────────────────────────
-    PROTECTIVE = {"STP", "LMT"}
-    ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
-    open_prot: dict = {}
-    try:
-        for trade in conn.ib.openTrades():
-            if trade.order.orderType not in PROTECTIVE:
-                continue
-            if trade.orderStatus.status not in ACTIVE:
-                continue
-            sym = trade.contract.symbol
-            ot  = trade.order.orderType
-            open_prot.setdefault(sym, {}).setdefault(ot, []).append(trade)
-    except Exception as e:
-        logger.warning("Could not read open trades: %s", e)
-
-    # ── 3. Scan every position ───────────────────────────────────────────────
-    TOLERANCE    = 0.005   # 0.5% — don't replace if price is already close enough
-    rows_ok:     list = []
-    rows_changed: list = []
-
-    for p in live:
-        sym      = p.contract.symbol
-        qty      = p.position
-        avg_cost = p.avgCost
-        currency = p.contract.currency
-        is_long  = qty > 0
-
-        tp_frac = mm_tp_pcts.get(sym, risk.take_profit_pct)
-
-        if is_long:
-            correct_stp = _round_price(avg_cost * (1 - risk.stop_loss_pct), currency)
-            correct_lmt = _round_price(avg_cost * (1 + tp_frac),            currency)
-            protect_action = "SELL"
-        else:
-            correct_stp = _round_price(avg_cost * (1 + risk.stop_loss_pct), currency)
-            correct_lmt = _round_price(avg_cost * (1 - tp_frac),            currency)
-            protect_action = "BUY"
-
-        orders       = open_prot.get(sym, {})
-        exist_stps   = orders.get("STP", [])
-        exist_lmts   = orders.get("LMT", [])
-
-        # Check STP price
-        stp_ok = False
-        if exist_stps:
-            cur_stp = exist_stps[0].order.auxPrice
-            stp_ok  = (cur_stp > 0 and abs(cur_stp - correct_stp) / correct_stp < TOLERANCE)
-
-        # Check LMT price
-        lmt_ok = False
-        if exist_lmts:
-            cur_lmt = exist_lmts[0].order.lmtPrice
-            lmt_ok  = (cur_lmt > 0 and abs(cur_lmt - correct_lmt) / correct_lmt < TOLERANCE)
-
-        if stp_ok and lmt_ok:
-            rows_ok.append(sym)
-            logger.info("  ✓ %-10s  STP=%-10.4f  LMT=%-10.4f  [OK]", sym, correct_stp, correct_lmt)
-            continue
-
-        # Something needs fixing
-        change_tags = []
-        if not stp_ok:
-            old = exist_stps[0].order.auxPrice if exist_stps else None
-            change_tags.append(f"STP {old:.4f}→{correct_stp:.4f}" if old else f"STP missing→{correct_stp:.4f}")
-        if not lmt_ok:
-            old = exist_lmts[0].order.lmtPrice if exist_lmts else None
-            change_tags.append(f"LMT {old:.4f}→{correct_lmt:.4f}" if old else f"LMT missing→{correct_lmt:.4f}")
-
-        rows_changed.append({
-            "ticker":       sym,
-            "quantity":     int(qty),
-            "direction":    "LONG" if is_long else "SHORT",
-            "avg_cost":     round(avg_cost, 4),
-            "currency":     currency,
-            "action":       protect_action,
-            "correct_stp":  correct_stp,
-            "correct_lmt":  correct_lmt,
-            "tp_source":    "MM" if sym in mm_tp_pcts else "flat",
-            "tp_pct":       round(tp_frac * 100, 1),
-            "changes":      change_tags,
-            "applied":      not dry_run,
-        })
-
-        icon = "[DRY RUN]" if dry_run else "  ✗"
-        logger.info(
-            "%s %-10s  %s  →  STP=%.4f  LMT=%.4f  (tp_src=%s %.1f%%)",
-            icon, sym, " | ".join(change_tags),
-            correct_stp, correct_lmt,
-            "MM" if sym in mm_tp_pcts else "flat", tp_frac * 100,
-        )
-
-        if not dry_run:
-            ucfg = currency_to_ucfg.get(currency)
-            if ucfg is None:
-                logger.warning("  No universe config for currency %s — skipping %s", currency, sym)
-                continue
-
-            from ib_insync import Order, LimitOrder
-            # Use the LIVE position's own contract rather than rebuilding one
-            # from its symbol.  A rebuilt Stock(sym, exchange, currency) cannot
-            # tell two listings apart — "SAN" in EUR is both Sanofi (Paris) and
-            # Banco Santander (Madrid) — so a protective order could land on
-            # the wrong company.  The position already carries the exact
-            # contract IBKR filled it on, conId included.
-            contract = p.contract
-
-            pos_qty       = abs(qty)
-            protect_action = "SELL" if qty > 0 else "BUY"
-
-            # Surgical cancel + replace — only touch the order type that is wrong
-            # so a correct STP is never needlessly cancelled when only LMT is wrong
-
-            if not stp_ok:
-                # Cancel existing STP orders for this ticker
-                ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
-                for trade in conn.ib.openTrades():
-                    if (trade.contract.symbol == ibkr_sym
-                            and trade.order.orderType == "STP"
-                            and trade.orderStatus.status in ACTIVE):
-                        conn.ib.cancelOrder(trade.order)
-                conn.ib.sleep(1.0)
-                stp_o               = Order()
-                stp_o.action        = protect_action
-                stp_o.orderType     = "STP"
-                stp_o.tif           = "GTC"
-                stp_o.totalQuantity = pos_qty
-                stp_o.auxPrice      = correct_stp
-                stp_o.transmit      = True
-                try:
-                    t = conn.ib.placeOrder(contract, stp_o)
-                    conn.ib.sleep(0.5)
-                    logger.info("  STP placed %s: %g  [%s]", sym, correct_stp, t.orderStatus.status)
-                except Exception as e:
-                    logger.error("  STP FAILED %s: %s", sym, e)
-
-            if not lmt_ok:
-                # Safety check: would this LMT execute immediately?
-                # BUY LMT (short take profit) executes if current_price <= lmt_price
-                # SELL LMT (long take profit) executes if current_price >= lmt_price
-                current_price = live_prices.get(ibkr_sym, 0.0)
-                would_execute_immediately = False
-                if current_price > 0:
-                    if protect_action == "BUY"  and current_price <= correct_lmt:
-                        would_execute_immediately = True
-                    if protect_action == "SELL" and current_price >= correct_lmt:
-                        would_execute_immediately = True
-
-                if would_execute_immediately:
-                    logger.warning(
-                        "  SKIPPED LMT %s: price %.4f already at/past take-profit %.4f "
-                        "— position is in profit, close manually or wait for next rebalancing.",
-                        sym, current_price, correct_lmt,
-                    )
-                    # Mark in report
-                    for r in rows_changed:
-                        if r["ticker"] == sym:
-                            r["changes"] = [c for c in r["changes"] if "LMT" not in c]
-                            r["changes"].append(f"LMT SKIPPED (mkt {current_price:.4f} already past {correct_lmt:.4f})")
-                else:
-                    # Cancel existing LMT orders for this ticker
-                    ACTIVE = {"PreSubmitted", "Submitted", "PendingSubmit"}
-                    for trade in conn.ib.openTrades():
-                        if (trade.contract.symbol == ibkr_sym
-                                and trade.order.orderType == "LMT"
-                                and trade.orderStatus.status in ACTIVE):
-                            conn.ib.cancelOrder(trade.order)
-                    conn.ib.sleep(1.0)
-                    lmt_o           = LimitOrder(protect_action, pos_qty, correct_lmt)
-                    lmt_o.tif       = "GTC"
-                    lmt_o.transmit  = True
-                    try:
-                        t = conn.ib.placeOrder(contract, lmt_o)
-                        conn.ib.sleep(0.5)
-                        logger.info("  LMT placed %s: %g  [%s]", sym, correct_lmt, t.orderStatus.status)
-                    except Exception as e:
-                        logger.error("  LMT FAILED %s: %s", sym, e)
-
-    conn.ib.disconnect()
-
-    # ── 4. Report (always written — shows full scan result) ──────────────────
-    total      = len(rows_ok) + len(rows_changed)
-    now        = datetime.now()
-    date_str   = now.strftime("%Y-%m-%d_%H%M")
-    os.makedirs(args.output, exist_ok=True)
-
-    # Delete previous protective_adjustment reports before writing the new one
-    for old in _glob.glob(os.path.join(args.output, "protective_adjustment_*")):
-        try:
-            os.remove(old)
-        except Exception:
-            pass
-    base       = os.path.join(args.output, f"protective_adjustment_{date_str}")
-    mode_label = "DRY RUN — no orders submitted" if dry_run else "APPLIED — orders updated in TWS"
-
-    lines = [
-        f"PROTECTIVE ORDER REFRESH — {now.strftime('%Y-%m-%d %H:%M')}  [{mode_label}]",
-        "=" * 72,
-        f"Scanned: {total}  |  Already correct: {len(rows_ok)}  |  {'Would update' if dry_run else 'Updated'}: {len(rows_changed)}",
-        "",
-    ]
-
-    if rows_changed:
-        lines += [
-            f"  {'TICKER':<10}  {'DIR':<6}  {'QTY':>7}  {'AVG COST':>10}  {'STP':>10}  {'LMT':>10}  {'TP SRC':<8}  CHANGES",
-            "  " + "-" * 75,
-        ]
-        for r in rows_changed:
-            lines.append(
-                f"  {r['ticker']:<10}  {r['direction']:<6}  {r['quantity']:>7}"
-                f"  {r['avg_cost']:>10.4f}  {r['correct_stp']:>10.4f}  {r['correct_lmt']:>10.4f}"
-                f"  {r['tp_source']+' '+str(r['tp_pct'])+'%':<8}  {' | '.join(r['changes'])}"
-            )
-    else:
-        lines.append("  All positions already have correct STP + LMT prices. Nothing changed.")
-
-    if rows_ok:
-        lines += ["", "  Positions already OK (no changes):"]
-        for sym in rows_ok:
-            lines.append(f"    ✓ {sym}")
-    lines += [
-        "",
-        f"Stop-loss  : {risk.stop_loss_pct * 100:.0f}% from avg cost (fixed)",
-        f"Take-profit: MM fair-value divergence where available, else flat {risk.take_profit_pct*100:.0f}%",
-        "",
-        "Note: only STP/LMT orders were touched. Entry (MKT) orders and positions unchanged.",
-    ]
-
-    txt_path = base + ".txt"
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    json_path = base + ".json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(rows_changed, f, indent=2, default=str)
-
-    print("\n".join(lines))
-    logger.info("Report saved → %s (.txt / .json)", base)
 
 
 def run_check_protective(args, cfg) -> None:
@@ -1384,10 +1056,9 @@ def run_execute_sheet(args, cfg) -> None:
     rather than doubling.  And open entry orders are subtracted, so a rerun
     before fills settle does not re-send what is already working.
 
-    Dry-run by default.  No protective orders: the stop and target are in the
-    sheet for the operator to place.
+    Dry-run by default.  Plain market orders: this book holds no stops and no
+    take-profits, and no code path places one.
     """
-    import dataclasses
     from datetime import date
 
     import pandas as pd
@@ -1470,25 +1141,7 @@ def run_execute_sheet(args, cfg) -> None:
     logger.info("%d held position(s) resolved across %d universe(s).",
                 len(tenus), len(univers))
 
-    # No stops, no take-profits on this path.  The book is rebalanced monthly
-    # and the operator chose to run it without them; the sheet carries the
-    # levels in its own columns for anyone who wants to place them by hand.
-    #
-    # The flag defaulted to ON, which this mode's own docstring denied, so an
-    # ordinary run placed a bracket on all 300-odd lines.  On US names the
-    # bracket is sent parent-first with transmit=False, and only the LMT child
-    # transmits the three together: a stop or target the exchange refuses
-    # leaves the MARKET order sitting in PreSubmitted, unsent and invisible.
-    # That is a mechanism which turns "252 orders submitted" into a book that
-    # never moved, and it was live on this path.
-    protect = bool(getattr(args, "protective", False))
-    cfg_exec = dataclasses.replace(cfg, place_protective_orders=protect)
-    if protect:
-        logger.warning("Protective orders are ON for this run (--protective).")
-    else:
-        logger.info("Protective orders OFF: plain market orders only.")
-
-    conn = IBKRConnection(cfg_exec)
+    conn = IBKRConnection(cfg)
     if not conn.ensure_connected():
         logger.error("Cannot reach IBKR TWS/Gateway — nothing sent.")
         return
@@ -1725,11 +1378,10 @@ def run_execute_sheet(args, cfg) -> None:
         for t in conn.ib.trades():
             st = t.orderStatus.status
             etats[st] += 1
-            # PreSubmitted on a plain market order means IBKR is holding it:
-            # outside session hours, or a parent waiting on a child that never
-            # transmitted. Not a refusal, but not working either, and it is
-            # exactly what a frozen bracket looks like.
-            if st == "PreSubmitted" and not protect:
+            # Every order here is a plain market order, so PreSubmitted means
+            # IBKR is holding it — an exchange outside its session. Not a
+            # refusal, but not working either.
+            if st == "PreSubmitted":
                 retenus.append((t.contract.symbol, t.order.action,
                                 t.order.totalQuantity, t.order.orderType))
             if st in REFUSE:

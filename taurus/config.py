@@ -375,7 +375,9 @@ class TaurusConfig:
     # describe. Measured on daily paths, adding -10%/+20% exits moved the
     # combined book from +16.55%/Sharpe 1.88 to +14.75%/Sharpe 1.92 with the
     # maximum drawdown improving from -5.00% to -3.77%.
-    place_protective_orders: bool = True
+    # Kept so that an older saved config still loads. Nothing reads it any
+    # more: no code path places a stop or a take-profit.
+    place_protective_orders: bool = False
 
     transaction_cost_bps:  float = 10.0   # One-way cost in basis points
     slippage_bps:          float = 5.0

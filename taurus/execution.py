@@ -771,96 +771,17 @@ class OrderManager:
         dry_run:         bool  = False,
     ) -> None:
         """
-        Place standalone STP + LMT protective orders for an EXISTING position.
-        No parent MKT — these are independent GTC orders used when restoring
-        protective orders after rebalancing adjustments or initial placement.
-        Works on all exchanges (no bracket/OCA group → no Euronext Error 328).
+        Disabled. The book holds no stops and no take-profits.
+
+        It used to place a standalone STP + LMT pair on an existing position.
+        Keeping the function, inert, rather than deleting it leaves its two
+        callers working and means nothing in this module can place a
+        protective order: every path through it now returns here.
         """
-        from ib_insync import Stock, Order, LimitOrder
-
-        ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
-        pos_qty     = abs(target_qty)
-        stop_action = "SELL" if target_qty > 0 else "BUY"
-
-        stop_price = (
-            entry_price * (1 - stop_pct) if stop_action == "SELL"
-            else entry_price * (1 + stop_pct)
-        )
-        tp_price = (
-            entry_price * (1 + take_profit_pct) if stop_action == "SELL"
-            else entry_price * (1 - take_profit_pct)
-        )
-
-        if dry_run:
-            logger.info(
-                "[DRY RUN] Restore STP/LMT %s %s qty=%.0f  STP=%.4f  LMT=%.4f",
-                stop_action, ibkr_ticker, pos_qty,
-                round(stop_price, 4), round(tp_price, 4),
-            )
-            return
-
-        contract = _stock_contract(ticker, universe_cfg)
-        try:
-            conn.ib.qualifyContracts(contract)
-        except Exception as e:
-            logger.warning("qualifyContracts failed for %s: %s — using unqualified contract", ibkr_ticker, e)
-
-        stp_price_rounded = _round_price(stop_price, universe_cfg.currency)
-        lmt_price_rounded = _round_price(tp_price,   universe_cfg.currency)
-
-        # OCA group: when STP fills IBKR auto-cancels LMT and vice-versa.
-        # Prevents zombie orders after the position is closed by one of them.
-        oca_group = f"TRS_{ibkr_ticker}_{id(conn)}"
-
-        # Standalone STP (GTC, OCA)
-        stp               = Order()
-        stp.action        = stop_action
-        stp.orderType     = "STP"
-        stp.tif           = "GTC"
-        stp.totalQuantity = pos_qty
-        stp.auxPrice      = stp_price_rounded
-        stp.ocaGroup      = oca_group
-        stp.ocaType       = 1   # cancel with block
-        stp.transmit      = True
-        try:
-            stp_trade = conn.ib.placeOrder(contract, stp)
-            conn.ib.sleep(0.5)   # let IBKR process before placing the second order
-            if stp_trade.orderStatus.status == "Inactive":
-                logger.error(
-                    "STP order for %s was REJECTED by IBKR (Inactive) — price=%g",
-                    ibkr_ticker, stp_price_rounded,
-                )
-            else:
-                logger.info(
-                    "STP placed for %s: qty=%.0f  price=%g (-%.0f%%)  status=%s",
-                    ibkr_ticker, pos_qty, stp_price_rounded,
-                    stop_pct * 100, stp_trade.orderStatus.status,
-                )
-        except Exception as e:
-            logger.error("Failed to place STP for %s: %s", ibkr_ticker, e)
-
-        # Standalone LMT (GTC, same OCA group)
-        lmt           = LimitOrder(stop_action, pos_qty, lmt_price_rounded)
-        lmt.tif       = "GTC"
-        lmt.ocaGroup  = oca_group
-        lmt.ocaType   = 1
-        lmt.transmit  = True
-        try:
-            lmt_trade = conn.ib.placeOrder(contract, lmt)
-            conn.ib.sleep(0.3)
-            if lmt_trade.orderStatus.status == "Inactive":
-                logger.error(
-                    "LMT order for %s was REJECTED by IBKR (Inactive) — price=%g",
-                    ibkr_ticker, lmt_price_rounded,
-                )
-            else:
-                logger.info(
-                    "LMT placed for %s: qty=%.0f  price=%g (+%.0f%%)  status=%s",
-                    ibkr_ticker, pos_qty, lmt_price_rounded,
-                    take_profit_pct * 100, lmt_trade.orderStatus.status,
-                )
-        except Exception as e:
-            logger.error("Failed to place LMT for %s: %s", ibkr_ticker, e)
+        logger.debug(
+            "place_protective_only(%s): protective orders are not placed on "
+            "this book — nothing done.", ticker)
+        return
 
     def place_order(
         self,
@@ -869,84 +790,49 @@ class OrderManager:
         delta:            float,            # positive=buy, negative=sell/short (fractional ok)
         universe_cfg:     UniverseConfig,
         dry_run:          bool  = True,
-        trail_pct:        float = 0.10,     # stop loss % below/above entry (10%)
-        entry_price:      float = 0.0,      # last known price for STP/LMT calculation
-        take_profit_pct:  float = 0.20,     # take profit % above/below entry (20%)
-        target_qty:       float = None,     # full target position size (unsigned); if None, uses abs(delta)
+        trail_pct:        float = 0.10,     # ignored, kept for callers
+        entry_price:      float = 0.0,      # ignored, kept for callers
+        take_profit_pct:  float = 0.20,     # ignored, kept for callers
+        target_qty:       float = None,     # ignored, kept for callers
     ) -> Optional[dict]:
         """
-        Place MKT + STP (stop loss) + LMT (take profit) bracket order.
+        Place a plain market order. No stop, no take-profit, on any market.
 
-        US markets (bracket_mode=True): all three transmit together as IBKR bracket.
-          STP and LMT share the same parentId — IBKR auto-cancels one when the other fills.
-        EU markets (bracket_mode=False): MKT transmits immediately; STP and LMT sent
-          as standalone GTC orders (no parentId) so a rejection never freezes the MKT.
+        The account is rebalanced monthly and holds no protective orders by
+        decision, so none are placed here and there is no option to place
+        them.  What they used to cost is worth recording: on US names the
+        three went out as an IBKR bracket, market order first with
+        transmit=False, and only the take-profit — placed third — transmitted
+        all of them.  A stop or target the exchange refused therefore left the
+        MARKET order in PreSubmitted, unsent, after this function had already
+        reported "submitted".  A book reported as rebalanced had not moved.
 
-        trail_pct = 0.10 → stop follows the price, cuts if -10% from peak.
+        Stale protective orders are still cancelled before the order goes
+        out: a stop left from an earlier run is sized for a position that no
+        longer exists, and clearing it is the point.
+
+        trail_pct, entry_price, take_profit_pct and target_qty are kept so
+        that existing callers still work. They no longer do anything.
         """
-        from ib_insync import Stock, MarketOrder, Order, LimitOrder
+        from ib_insync import MarketOrder
 
-        action       = "BUY"  if delta > 0 else "SELL"
-        qty          = abs(delta)
+        action = "BUY" if delta > 0 else "SELL"
+        qty    = abs(delta)
 
-        # STP/LMT are sized to the FULL target position, not just the delta.
-        # On an adjustment (+10 on a 100-share long), we cancel the old STP/LMT
-        # (sized for 100) and place new ones sized for 110.
-        protective_qty = abs(target_qty) if target_qty is not None else qty
-
-        # Direction of protective orders depends on the final position direction
-        # (target sign), not the delta direction.
-        if target_qty is not None:
-            stop_action = "SELL" if target_qty > 0 else "BUY"
-        else:
-            stop_action = "SELL" if delta > 0 else "BUY"
-
-        # Protective orders are placed by the algorithm unless the book is run
-        # with them left to the operator.  Stale ones are cancelled either way:
-        # a stop sized for last month's position is wrong the moment the
-        # position is adjusted, and a wrong stop is worse than none.
-        protect = bool(getattr(conn.cfg, "place_protective_orders", True))
-
-        # Cancel stale protective orders before placing new ones
         if not dry_run:
             self.cancel_protective_orders(conn, ticker, dry_run=False)
 
-        # Fixed stop loss and take profit prices from entry
-        stop_pct   = trail_pct
-        stop_price = (entry_price * (1 - stop_pct)) if stop_action == "SELL" else (entry_price * (1 + stop_pct))
-        tp_price   = (entry_price * (1 + take_profit_pct)) if stop_action == "SELL" else (entry_price * (1 - take_profit_pct))
-
-        # For EU markets: MKT transmits independently; STP/LMT sent as standalone orders
-        bracket_mode = getattr(universe_cfg, "supports_trail_stop", True)
-
         order_info = {
-            "ticker":     ticker,
-            "action":     action,
-            "quantity":   qty,
-            "type":       "MKT+STP+LMT" if protect else "MKT",
-            "stop_price": round(stop_price, 4) if stop_price else None,
-            "tp_price":   round(tp_price, 4)   if tp_price   else None,
-            "stop_pct":   stop_pct,
-            "tp_pct":     take_profit_pct,
-            "tp_source":  "flat" if abs(take_profit_pct - 0.20) < 0.001 else "MM",
-            "dry_run":    dry_run,
-            "status":     "pending",
+            "ticker":   ticker,
+            "action":   action,
+            "quantity": qty,
+            "type":     "MKT",
+            "dry_run":  dry_run,
+            "status":   "pending",
         }
 
         if dry_run:
-            if protect:
-                logger.info(
-                    "[DRY RUN] %s %d %s @ MKT | STP %.4f (-%.0f%%) | LMT %.4f (+%.0f%%)",
-                    action, qty, ticker,
-                    stop_price, stop_pct * 100,
-                    tp_price, take_profit_pct * 100,
-                )
-            else:
-                logger.info(
-                    "[DRY RUN] %s %d %s @ MKT | no STP/LMT (placed by hand from "
-                    "the order sheet: stop %.4f, target %.4f)",
-                    action, qty, ticker, stop_price, tp_price,
-                )
+            logger.info("[DRY RUN] %s %d %s @ MKT", action, qty, ticker)
             order_info["status"] = "dry_run"
             return order_info
 
@@ -977,119 +863,29 @@ class OrderManager:
                 contract.exchange = "SMART"
                 conn.ib.qualifyContracts(contract)
 
-            if bracket_mode:
-                # ── Bracket: MKT (hold) + STP child (transmits both together) ──
-                # Works on US exchanges (NYSE/NASDAQ). Stop is attached to the parent.
-                parent          = MarketOrder(action, qty)
-                parent.tif      = "DAY"
+            # Plain market order, transmitted on the spot.
+            #
+            # There used to be a bracket here: the market order was sent with
+            # transmit=False and only the take-profit child, placed third,
+            # transmitted the three together.  A stop or a target the exchange
+            # refused therefore left the MARKET order sitting in PreSubmitted
+            # — unsent, while this function had already returned "submitted".
+            # A book reported as rebalanced had not moved.
+            #
+            # The account is rebalanced monthly and holds no stops by
+            # decision, so there is nothing to weigh up: the orders are gone,
+            # and with them the only path on which a market order could fail
+            # to transmit.  Stale protective orders are still cancelled above
+            # — removing a stop left over from an earlier run is the point.
+            ordre          = MarketOrder(action, qty)
+            ordre.tif      = "DAY"
+            ordre.transmit = True
 
-                if entry_price > 0 and protect:
-                    parent.transmit = False   # STP+LMT children will trigger transmission
-                elif not protect:
-                    parent.transmit = True    # protective orders left to the operator
-                else:
-                    # No price available — transmit MKT immediately, skip STP/LMT
-                    # (avoids MKT stuck in PreSubmitted when LMT price=0 gets rejected)
-                    parent.transmit = True
-                    logger.warning(
-                        "No entry_price for %s — MKT transmitted immediately, STP/LMT skipped",
-                        ticker,
-                    )
-
-                parent_trade = conn.ib.placeOrder(contract, parent)
-                order_info["ibkr_order_id"] = parent_trade.order.orderId
-
-                if entry_price > 0 and protect:
-                    # STP (stop loss) — second child, hold transmission
-                    stp               = Order()
-                    stp.action        = stop_action
-                    stp.orderType     = "STP"
-                    stp.tif           = "GTC"
-                    stp.totalQuantity = protective_qty   # full target position size
-                    stp.auxPrice      = _round_price(stop_price, universe_cfg.currency)
-                    stp.parentId      = parent_trade.order.orderId
-                    stp.transmit      = False   # LMT child will trigger final transmission
-
-                    stp_trade = conn.ib.placeOrder(contract, stp)
-
-                    # LMT (take profit) — third child, triggers transmission of all 3
-                    lmt               = LimitOrder(stop_action, protective_qty, _round_price(tp_price, universe_cfg.currency))
-                    lmt.tif           = "GTC"
-                    lmt.parentId      = parent_trade.order.orderId
-                    lmt.transmit      = True    # transmits MKT + STP + LMT together
-
-                    lmt_trade = conn.ib.placeOrder(contract, lmt)
-
-                    order_info["ibkr_stp_order_id"] = stp_trade.order.orderId
-                    order_info["ibkr_lmt_order_id"] = lmt_trade.order.orderId
-                order_info["status"] = "submitted"
-                if protect and entry_price > 0:
-                    logger.info(
-                        "Bracket submitted: %s %d %s | mkt=%d stp=%.2f lmt=%.2f",
-                        action, qty, ticker,
-                        parent_trade.order.orderId, stop_price, tp_price,
-                    )
-                else:
-                    logger.info(
-                        "MKT submitted: %s %d %s | mkt=%d | no STP/LMT — place "
-                        "them by hand (stop %.2f, target %.2f)",
-                        action, qty, ticker, parent_trade.order.orderId,
-                        stop_price, tp_price,
-                    )
-            else:
-                # ── EU markets: MKT transmits immediately; STP + LMT as standalone GTC ──
-                # If exchange rejects stop/limit, MKT is already through — no PreSubmitted freeze.
-                parent          = MarketOrder(action, qty)
-                parent.tif      = "DAY"
-                parent.transmit = True
-
-                parent_trade = conn.ib.placeOrder(contract, parent)
-                order_info["ibkr_order_id"] = parent_trade.order.orderId
-                order_info["status"] = "submitted"
-
-                def _try_order(o: Order, label: str) -> Optional[int]:
-                    try:
-                        t = conn.ib.placeOrder(contract, o)
-                        return t.order.orderId
-                    except Exception as err:
-                        logger.warning("Standalone %s failed for %s: %s", label, ticker, err)
-                        return None
-
-                if entry_price > 0 and protect:
-                    # OCA group: when STP fills, IBKR auto-cancels LMT and vice-versa.
-                    # Prevents zombie orders after position is closed by one of them.
-                    oca_group = f"TRS_{ibkr_ticker}_{parent_trade.order.orderId}"
-
-                    stp               = Order()
-                    stp.action        = stop_action
-                    stp.orderType     = "STP"
-                    stp.tif           = "GTC"
-                    stp.totalQuantity = protective_qty   # full target position size
-                    stp.auxPrice      = _round_price(stop_price, universe_cfg.currency)
-                    stp.ocaGroup      = oca_group
-                    stp.ocaType       = 1   # cancel with block (most protective)
-                    stp.transmit      = True
-                    stp_id = _try_order(stp, "STP")
-                    if stp_id:
-                        order_info["ibkr_stp_order_id"] = stp_id
-
-                    lmt = LimitOrder(stop_action, protective_qty, _round_price(tp_price, universe_cfg.currency))
-                    lmt.tif      = "GTC"
-                    lmt.ocaGroup = oca_group
-                    lmt.ocaType  = 1
-                    lmt.transmit = True
-                    lmt_id = _try_order(lmt, "LMT")
-                    if lmt_id:
-                        order_info["ibkr_lmt_order_id"] = lmt_id
-
-                    logger.info(
-                        "MKT+STP+LMT submitted: %s %d %s | mkt=%d stp=%s(%.2f) lmt=%s(%.2f)",
-                        action, qty, ticker,
-                        parent_trade.order.orderId,
-                        stp_id, stop_price, lmt_id, tp_price,
-                    )
-                else:
-                    logger.warning("No entry_price for %s — STP/LMT not placed", ticker)
+            trade = conn.ib.placeOrder(contract, ordre)
+            order_info["ibkr_order_id"] = trade.order.orderId
+            order_info["status"]        = "submitted"
+            logger.info("MKT submitted: %s %d %s | id=%d",
+                        action, qty, ticker, trade.order.orderId)
 
             return order_info
         except Exception as e:
@@ -1435,84 +1231,20 @@ class IBKRExecutor:
 
     def _restore_protective_orders(self, prices: dict, mm_tp_pcts: dict = None) -> None:
         """
-        Post-rebalancing pass: ensure every live position has correct STP + LMT.
+        Disabled. The book holds no stops and no take-profits.
 
-        For each live position in this universe's currency:
-          - If STP and LMT both exist with the exact right quantity → skip
-          - Otherwise: cancel stale protective orders + place fresh ones using
-            the current market price as reference for stop/limit levels
+        This was the post-rebalance pass that gave every live position a
+        fresh STP + LMT. It is kept inert so its two call sites in
+        execute_rebalance still work, and so that no path in this module
+        places a protective order.
 
-        mm_tp_pcts: per-ticker take-profit fractions from MM fair-value divergence.
-                    Falls back to flat RiskConfig.take_profit_pct when absent.
-
-        Called after wait_for_fills so new entries are already reflected in live
-        positions and their bracket STP/LMT have been placed by place_order().
+        Clearing stale ones is NOT done here: place_order cancels a
+        position's leftovers before it trades it, and --mode cancel-orders
+        wipes the account outright.
         """
-        from .risk import RiskConfig
-        risk_cfg = RiskConfig()
-        if mm_tp_pcts is None:
-            mm_tp_pcts = {}
-
-        live = self.reconciler.get_live_positions(self.conn, currency=self._position_currency())
-        if live.empty:
-            return
-
-        # Build map: ibkr_symbol → {orderType: (qty, trade)}
-        prot: dict = {}
-        try:
-            for trade in self.conn.ib.openTrades():
-                if trade.order.orderType not in {"STP", "LMT"}:
-                    continue
-                sym = trade.contract.symbol
-                qty = abs(float(trade.order.totalQuantity))
-                prot.setdefault(sym, {})[trade.order.orderType] = (qty, trade)
-        except Exception as e:
-            logger.warning("_restore_protective_orders: could not read open trades: %s", e)
-            return
-
-        for sym, row in live.iterrows():
-            pos_qty = abs(float(row["quantity"]))
-
-            if pos_qty == 0:
-                # Closed position — cancel any leftover protective orders
-                for otype, (_, trade) in prot.get(sym, {}).items():
-                    if not self.cfg.dry_run:
-                        self.conn.ib.cancelOrder(trade.order)
-                    logger.info("[%s] Cancelled orphaned %s for closed %s",
-                                self.udef_cfg.name, otype, sym)
-                continue
-
-            sym_orders = prot.get(sym, {})
-            stp_entry  = sym_orders.get("STP")
-            lmt_entry  = sym_orders.get("LMT")
-            stp_ok     = stp_entry is not None and stp_entry[0] == pos_qty
-            lmt_ok     = lmt_entry is not None and lmt_entry[0] == pos_qty
-
-            if stp_ok and lmt_ok:
-                continue  # both present and correctly sized → nothing to do
-
-            # Reference price: use current market price (stripped ticker)
-            entry_price = prices.get(sym, 0.0)
-            if entry_price <= 0:
-                logger.warning("[%s] No price for %s — cannot restore STP/LMT",
-                               self.udef_cfg.name, sym)
-                continue
-
-            # Cancel any stale protective orders for this ticker
-            self.order_mgr.cancel_protective_orders(self.conn, sym, dry_run=self.cfg.dry_run)
-
-            # Place fresh standalone STP + LMT
-            target_qty    = pos_qty if float(row["quantity"]) > 0 else -pos_qty
-            # Same flat level as the entry path: a restored protective order must
-            # not sit at a different distance from the one originally placed.
-            ticker_tp_pct = mm_tp_pcts.get(sym, risk_cfg.take_profit_pct)
-            self.order_mgr.place_protective_only(
-                self.conn, sym, target_qty, entry_price,
-                self.udef_cfg,
-                stop_pct        = risk_cfg.stop_loss_pct,
-                take_profit_pct = ticker_tp_pct,
-                dry_run         = self.cfg.dry_run,
-            )
+        logger.info("Protective orders are not placed on this book — "
+                    "post-rebalance restore skipped.")
+        return
 
     def _log_reconciliation(
         self,
