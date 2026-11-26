@@ -1468,6 +1468,71 @@ def run_execute_sheet(args, cfg) -> None:
             print("\nNothing to send: the book already matches the sheet.")
             return
 
+        # ── Pre-flight: every line must resolve to a contract at IBKR ────────
+        # place_order calls qualifyContracts and, on conId 0, retries on SMART
+        # — but if that fails too it carries on with an unqualified contract.
+        # IBKR then accepts the call and does nothing, and the loop below
+        # counts it as "submitted" because a Trade object came back.  That is
+        # an order that exists nowhere, reported as sent.
+        #
+        # 13 November: 44 shorts never opened while borrow was available on at
+        # least 27 of them.  An unresolved symbol produces exactly that, and
+        # nothing in the log said so.  So the check runs FIRST, it runs in dry
+        # run too — the point is to see it before sending, not after — and a
+        # line that does not resolve is withheld and named.
+        import logging as _lg
+
+        from taurus.execution import _stock_contract
+
+        _wrap = _lg.getLogger("ib_insync.wrapper")
+        _prev = _wrap.level
+        _wrap.setLevel(_lg.ERROR)          # error 200 floods on every miss
+        irresolus = []
+        try:
+            for i in range(0, len(lignes), 25):
+                paquet = lignes[i:i + 25]
+                contrats = []
+                for l in paquet:
+                    c = _stock_contract(l["ticker"], REGISTRY.get(l["universe"]).config)
+                    l["_contrat"] = c
+                    contrats.append(c)
+                try:
+                    conn.ib.qualifyContracts(*contrats)
+                except Exception as e:
+                    logger.debug("qualifyContracts batch raised: %s", e)
+                # Same SMART fallback place_order uses, for a market that is
+                # closed on its primary exchange.
+                for l in paquet:
+                    if l["_contrat"].conId:
+                        continue
+                    c2 = _stock_contract(l["ticker"], REGISTRY.get(l["universe"]).config)
+                    c2.exchange = "SMART"
+                    try:
+                        conn.ib.qualifyContracts(c2)
+                    except Exception:
+                        pass
+                    if c2.conId:
+                        l["_contrat"] = c2
+        finally:
+            _wrap.setLevel(_prev)
+
+        irresolus = [l for l in lignes if not l["_contrat"].conId]
+        lignes = [l for l in lignes if l["_contrat"].conId]
+        print(f"\nPre-flight: {len(lignes) + len(irresolus)} line(s) checked at "
+              f"IBKR — {len(lignes)} resolved, {len(irresolus)} unresolved.")
+        if irresolus:
+            print("\nNOT SENT — IBKR does not resolve these symbols. An order "
+                  "on one of them would be accepted and never exist:")
+            for l in sorted(irresolus, key=lambda z: (z["universe"], z["ticker"])):
+                ucfg = REGISTRY.get(l["universe"]).config
+                _sym, _ccy, _m, _pri = ticker_market(l["ticker"], ucfg)
+                print(f"   {l['ticker']:12s} {l['universe']:11s} "
+                      f"{_sym}/{_pri or ucfg.ibkr_exchange}/{_ccy:3s} "
+                      f"{l['delta']:+8.0f}")
+        if not lignes:
+            print("\nNo line resolves — nothing to send.")
+            return
+
         achats = [l for l in lignes if l["delta"] > 0]
         ventes = [l for l in lignes if l["delta"] < 0]
         print(f"\n{len(lignes)} order(s): {len(achats)} buy, {len(ventes)} sell")
@@ -1502,6 +1567,43 @@ def run_execute_sheet(args, cfg) -> None:
         if echecs:
             print(f"{len(echecs)} NOT submitted: " + ", ".join(echecs[:15]))
             print("Re-run this mode to retry only what is still missing.")
+
+        # ── Post-send audit: what IBKR actually holds, not what we counted ───
+        # place_order reports "submitted" as soon as placeOrder returns a Trade
+        # object.  A rejected order also returns one: it comes back Inactive
+        # with the reason in its log.  Counting replies therefore says 252 sent
+        # on a night when 44 of them were refused — which is how November's
+        # missing shorts went unnoticed for two weeks.  So the account is read
+        # back and asked what it has.
+        conn.ib.sleep(4)
+        from collections import Counter as _Counter
+
+        REFUSE = {"Inactive", "Cancelled", "ApiCancelled", "Expired"}
+        etats, refuses = _Counter(), []
+        for t in conn.ib.trades():
+            st = t.orderStatus.status
+            etats[st] += 1
+            if st in REFUSE:
+                motif = ""
+                for e in reversed(t.log):
+                    if e.message:
+                        motif = e.message[:90]
+                        break
+                refuses.append((t.contract.symbol, t.order.action,
+                                t.order.totalQuantity, st, motif))
+        print("\nIBKR order book after sending: "
+              + ", ".join(f"{n}x {k}" for k, n in etats.most_common()))
+        if refuses:
+            print(f"\n{len(refuses)} order(s) REFUSED by IBKR — these legs are "
+                  f"NOT in the book:")
+            print(f"{'symbol':10s} {'side':5s} {'qty':>9s} {'status':13s} reason")
+            for s, a, q, st, m in sorted(refuses):
+                print(f"{s:10s} {a:5s} {q:9.0f} {st:13s} {m}")
+            print("\nA short refused here is usually borrow: the book is now "
+                  "long-biased by that amount. Check --mode beta before "
+                  "leaving it overnight.")
+        else:
+            print("No order refused.")
     finally:
         try:
             conn.ib.disconnect()
