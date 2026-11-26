@@ -51,32 +51,50 @@ class TaurusConfig:
     # ------------------------------------------------------------------ #
     #  Factor model  (FF5/FF6 + SML alpha)                                #
     # ------------------------------------------------------------------ #
-    # Rolling OLS window.  60 → 48 months, measured, not guessed.
+    # Rolling OLS window.  48 → 42 months, measured, not guessed.
     #
-    # The ±20% sensitivity sweep found this to be the one parameter that
-    # genuinely moves the result: of seven parameters displaced in both
-    # directions, five shifted the combined Sharpe by 0.01 to 0.12 while this
-    # one moved it by 0.68.  Mapping the whole curve on the combined book:
+    # The ±20% sweep found this to be the one parameter that genuinely moves
+    # the result: of seven displaced in both directions, five shifted the
+    # combined Sharpe by 0.01 to 0.12 while this one moved it by 0.68.
     #
-    #     36 months  Sharpe 1.77     48 months  Sharpe 2.40
-    #     42 months  Sharpe 2.68     60 months  Sharpe 2.00  (previous)
-    #                                72 months  Sharpe 1.72
+    # 42 was REFUSED at the 48-month step, on the grounds that it sat six
+    # months from a point losing 0.91 of Sharpe. That objection has since been
+    # retired, because the cliff was an artefact of the measurement: min_obs
+    # was pinned at 36, so a 36-month window demanded a complete history and
+    # discarded much of the universe. Re-measured with min_obs at 75% of the
+    # window, so every length faces the same RELATIVE history requirement:
     #
-    # The curve has an interior maximum, which is what makes the effect
-    # credible: had the Sharpe simply climbed to the floor, the measurement
-    # would have been the regression degrading rather than a shorter window
-    # helping.  48 beats 60 in ALL FOUR sub-periods (2.21/1.70, 3.52/2.77,
-    # 2.46/1.89, 1.91/1.90), so the gain is not one period's accident.
+    #     30 months  Sharpe 0.69      48 months  Sharpe 2.34  (previous)
+    #     36 months  Sharpe 1.89      54 months  Sharpe 2.08
+    #     42 months  Sharpe 2.59      60 months  Sharpe 1.90
     #
-    # 42 scores higher still and is NOT taken.  Its edge over 48 comes almost
-    # entirely from 2016-2018 (+1.11 Sharpe; the other three periods give
-    # +0.29, -0.05, +0.14), and it sits six months from a point that loses
-    # 0.91 — a cliff that is partly mechanical, since at a 36-month window
-    # min_obs=36 demands a complete history and discards much of the universe.
-    # Taking the sample maximum next to a cliff is the overfitting this sweep
-    # exists to catch.  48 is on the safe side and still well clear of 60.
-    lookback_months: int = 48            # Rolling OLS window
-    min_obs: int = 36                    # Minimum observations for fit
+    # 36 rises from 1.77 to 1.89 once the filter is fair, so part of the cliff
+    # was indeed artificial — but 30 collapses to 0.69, and THAT is a real
+    # statistical limit: six regressors on thirty observations is noise. The
+    # maximum is interior and genuine, and 42 stands twelve months clear of
+    # the collapse rather than six.
+    #
+    # 42 beats or matches 48 in all four sub-periods (3.35/2.21, 3.74/3.43,
+    # 2.45/2.46, 1.82/1.79) and never loses one. The edge is still
+    # concentrated in 2016-2018 (+1.14 of the Sharpe gap) with the three later
+    # periods flat inside the 0.06 of measurement noise this project exhibits
+    # between data refreshes, so the expected gain is smaller than the +0.25
+    # the full sample shows.
+    #
+    # Checked against the stated objective rather than the Sharpe alone: the
+    # shorter window does NOT cost beta neutrality. Realised beta of the
+    # combined book improves (+0.0273 → +0.0204 against the US market, t 0.83
+    # → 0.64), and against all three regional markets the worst t-statistic
+    # moves only from 1.57 to 1.65 — both far from significance. The ex-ante
+    # dispersion of the net beta is marginally higher (0.0324 → 0.0355), which
+    # is the one count on which 48 is better.
+    #
+    # Cost: the maximum drawdown deepens from -5.93% to -6.16%.
+    lookback_months: int = 42            # Rolling OLS window
+    # Three quarters of the window, not a fixed 36.  Pinned at 36 it made the
+    # filter's severity depend on the window length, which is what produced a
+    # phantom cliff and nearly cost this measurement.
+    min_obs: int = 31                    # Minimum observations for fit
     alpha_tstat_threshold: float = 2.0   # |t| > threshold (Student-t when return_df set)
     use_umd_factor: bool = False         # FF6: include UMD momentum factor in regression
                                          # When True, removes momentum from alpha (weaker signal)
