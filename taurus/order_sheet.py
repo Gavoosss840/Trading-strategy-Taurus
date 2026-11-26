@@ -890,13 +890,25 @@ def annoter_emprunt(rows_by_universe: Dict[str, List[dict]],
         except Exception:
             pass
 
-    if bloques:
+    inconnus = sum(1 for rs in rows_by_universe.values() for r in rs
+                   if r.get("Emprunt") == "INCONNU")
+    if total and inconnus == total:
+        # Every answer unknown is not a result, it is a failed check. Say so,
+        # because an operator reading a column of UNKNOWN could reasonably
+        # conclude the borrow was fine.
+        logger.warning(
+            "Borrow UNKNOWN on all %d short line(s) — the check did not run. "
+            "The usual cause is no API market-data subscription (IBKR error "
+            "10089); delayed data is requested but may also be refused. Treat "
+            "every short in this sheet as unverified.", total)
+    elif bloques:
         logger.warning(
             "%d short(s) of %d cannot be borrowed in the size requested — see "
-            "the Emprunt column. Placing them anyway leaves the book LONG.",
-            bloques, total)
+            "the Emprunt column. Placing them anyway leaves the book LONG. "
+            "%d further line(s) came back UNKNOWN.", bloques, total, inconnus)
     else:
-        logger.info("Borrow checked on %d short line(s): all available.", total)
+        logger.info("Borrow checked on %d short line(s): all available "
+                    "(%d unknown).", total, inconnus)
 
 
 def consolider_entre_univers(rows_by_universe: Dict[str, List[dict]]) -> None:

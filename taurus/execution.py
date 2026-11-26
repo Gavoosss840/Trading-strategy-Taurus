@@ -584,13 +584,31 @@ class OrderManager:
                 pass
         _wrap.setLevel(_lvl)
 
+        # Fall back to DELAYED data before asking.
+        #
+        # A paper account without the API market-data subscription answers
+        # every tick-236 request with error 10089 — "requires an additional
+        # subscription for API connections" — and then floods the log with
+        # error 300 as the never-established requests are cancelled. The borrow
+        # column then reads UNKNOWN for every short, which is the one answer it
+        # must not give by default. IBKR's own message says delayed data is
+        # available, and shortable-share counts do not need to be real time: a
+        # locate that existed fifteen minutes ago is the information wanted.
+        #
+        # reqMarketDataType(3) = delayed, (4) = delayed frozen. Live is tried
+        # first and the fallback only matters where live is refused.
+        try:
+            conn.ib.reqMarketDataType(3)
+        except Exception as e:
+            logger.debug("Could not switch to delayed market data: %s", e)
+
         tds = []
         for c in qualified:
             try:
                 tds.append((c, conn.ib.reqMktData(c, "236", False, False)))
             except Exception as e:
                 logger.debug("shortable request failed for %s: %s", c.symbol, e)
-        conn.ib.sleep(3.0)          # 236 arrives asynchronously
+        conn.ib.sleep(4.0)          # 236 arrives asynchronously; delayed is slower
 
         for c, td in tds:
             orig = tmap.get(c.symbol, c.symbol)
