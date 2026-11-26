@@ -1387,6 +1387,7 @@ def run_execute_sheet(args, cfg) -> None:
                 )
                 if info and info.get("status") == "submitted":
                     envoyes += 1
+                    l["_order_id"] = info.get("ibkr_order_id")
                 else:
                     echecs.append(f"{l['ticker']} ({info.get('status') if info else 'no reply'})")
             except Exception as e:
@@ -1399,64 +1400,97 @@ def run_execute_sheet(args, cfg) -> None:
             print(f"{len(echecs)} NOT submitted: " + ", ".join(echecs[:15]))
             print("Re-run this mode to retry only what is still missing.")
 
-        # ── Post-send audit: what IBKR actually holds, not what we counted ───
-        # place_order reports "submitted" as soon as placeOrder returns a Trade
-        # object.  A rejected order also returns one: it comes back Inactive
-        # with the reason in its log.  Counting replies therefore says 252 sent
-        # on a night when 44 of them were refused — which is how November's
-        # missing shorts went unnoticed for two weeks.  So the account is read
-        # back and asked what it has.
+        # ── Post-send audit: what IBKR did with OUR orders ──────────────────
+        # place_order reports "submitted" as soon as placeOrder returns a
+        # Trade object. A refused order returns one too, Cancelled or Inactive
+        # with the reason in its log, so counting replies says 252 sent on a
+        # night when 44 were refused — which is how November's missing shorts
+        # went unnoticed for a fortnight.
+        #
+        # The audit is restricted to the order ids this run placed. Reading
+        # the whole book instead counted the stale stops and take-profits that
+        # place_order had just cancelled on purpose — 60 of them, in pairs, on
+        # the opposite side to the order being sent, plus names not even on
+        # the sheet — and reported every one as a leg missing from the book.
+        # Alarming, and wrong: 11 orders had actually failed, not 60.
         from collections import Counter as _Counter
 
-        # Let the statuses settle. 300-odd acknowledgements do not all arrive
-        # in one tick, and a status read too early reads PendingSubmit for an
-        # order that is about to be refused.
+        par_id = {l["_order_id"]: l for l in lignes if l.get("_order_id")}
+
+        # Let the statuses settle. 300-odd acknowledgements do not arrive in
+        # one tick, and a status read too early shows PendingSubmit for an
+        # order about to be refused.
         for _ in range(12):
             conn.ib.sleep(2)
-            if not any(t.orderStatus.status in ("PendingSubmit", "ApiPending")
-                       for t in conn.ib.trades()):
+            encore = [t for t in conn.ib.trades()
+                      if t.order.orderId in par_id
+                      and t.orderStatus.status in ("PendingSubmit", "ApiPending")]
+            if not encore:
                 break
 
         REFUSE = {"Inactive", "Cancelled", "ApiCancelled", "Expired"}
         etats, refuses, retenus = _Counter(), [], []
+        vus = set()
         for t in conn.ib.trades():
+            l = par_id.get(t.order.orderId)
+            if l is None:
+                continue                       # not ours: a cancelled stop
+            vus.add(t.order.orderId)
             st = t.orderStatus.status
             etats[st] += 1
             # Every order here is a plain market order, so PreSubmitted means
-            # IBKR is holding it — an exchange outside its session. Not a
-            # refusal, but not working either.
+            # IBKR is holding it — an exchange outside its session.
             if st == "PreSubmitted":
-                retenus.append((t.contract.symbol, t.order.action,
-                                t.order.totalQuantity, t.order.orderType))
+                retenus.append((l["ticker"], t.order.action,
+                                t.order.totalQuantity))
             if st in REFUSE:
                 motif = ""
                 for e in reversed(t.log):
                     if e.message:
-                        motif = e.message[:90]
+                        # Not truncated to 90: that cut "directly routed to
+                        # LSE. Direct routed orders ..." exactly where the
+                        # cause was about to be named.
+                        motif = e.message.strip()[:220]
                         break
-                refuses.append((t.contract.symbol, t.order.action,
-                                t.order.totalQuantity, st, motif))
-        print("\nIBKR order book after sending: "
+                refuses.append((l["ticker"], l["universe"], t.order.action,
+                                t.order.totalQuantity, st, motif,
+                                l.get("_route", ""), l["detenu"]))
+        manquants = [l for i, l in par_id.items() if i not in vus]
+
+        print(f"\nOur {len(par_id)} order(s), as IBKR has them: "
               + ", ".join(f"{n}x {k}" for k, n in etats.most_common()))
+        if manquants:
+            print(f"{len(manquants)} order(s) IBKR never acknowledged: "
+                  + ", ".join(l["ticker"] for l in manquants[:15]))
+
         if refuses:
-            print(f"\n{len(refuses)} order(s) REFUSED by IBKR — these legs are "
-                  f"NOT in the book:")
-            print(f"{'symbol':10s} {'side':5s} {'qty':>9s} {'status':13s} reason")
-            for s, a, q, st, m in sorted(refuses):
-                print(f"{s:10s} {a:5s} {q:9.0f} {st:13s} {m}")
-            print("\nA short refused here is usually borrow: the book is now "
-                  "long-biased by that amount. Check --mode beta before "
-                  "leaving it overnight.")
+            print(f"\n{len(refuses)} of OUR orders were REFUSED — these legs "
+                  f"are NOT in the book:")
+            for t_, u, a, q, st, m, route, det in sorted(refuses):
+                print(f"\n   {t_:12s} {u:11s} {a} {q:.0f}  [{st}]  "
+                      f"route {route or '?'}  holds {det:+.0f}")
+                if m:
+                    print(f"      {m}")
+            bloques = [r for r in refuses if abs(r[7]) >= 1]
+            if bloques:
+                print(f"\n   {len(bloques)} of them are positions the account "
+                      f"HOLDS, so they could not be adjusted or closed. That "
+                      f"is exposure outside the model until it resolves.")
+            print("\nA refused short leaves the book long-biased by that "
+                  "amount. Check --mode beta before leaving it overnight.")
         else:
-            print("No order refused.")
+            print("\nNone of our orders was refused.")
+
         if retenus:
-            print(f"\n{len(retenus)} order(s) HELD by IBKR, not working — "
-                  f"normally an exchange outside its session:")
-            print(f"{'symbol':10s} {'side':5s} {'qty':>9s} {'type':6s}")
-            for s, a, q, ty in sorted(retenus):
-                print(f"{s:10s} {a:5s} {q:9.0f} {ty:6s}")
-            print("These fill at the next open if IBKR carries them. Verify "
-                  "with --mode cancel-orders before the next sheet.")
+            print(f"\n{len(retenus)} of our orders are HELD by IBKR, not "
+                  f"working — their exchange is outside its session:")
+            for t_, a, q in sorted(retenus):
+                print(f"   {t_:12s} {a:5s} {q:9.0f}")
+            print("\nThese fill at the next open if IBKR carries them to it. "
+                  "Re-run this mode after that open: it recomputes against "
+                  "the live book and subtracts working orders, so it sends "
+                  "only what is still missing and never doubles a fill.")
+
     finally:
         try:
             conn.ib.disconnect()

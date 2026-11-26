@@ -127,12 +127,19 @@ def resolve_contract(conn, ticker: str, universe_cfg):
     essais = []
 
     def _q(c, etiquette):
+        # qualifyContracts RETURNS the contracts it resolved, and that return
+        # is the only trustworthy signal. Checking c.conId instead passes
+        # unconditionally for a contract built from a conId we already had —
+        # which is how five Athens lines cleared the pre-flight with an empty
+        # symbol and were then refused at order time with error 200, "no
+        # security definition found". A full contract also carries a symbol
+        # once IBKR has confirmed it, so an empty one means no confirmation.
         try:
-            conn.ib.qualifyContracts(c)
+            ok = conn.ib.qualifyContracts(c)
         except Exception as e:
             essais.append(f"{etiquette}: {type(e).__name__}")
             return None
-        if getattr(c, "conId", 0):
+        if ok and getattr(c, "conId", 0) and getattr(c, "symbol", ""):
             return c
         essais.append(f"{etiquette}: no match")
         return None
@@ -141,18 +148,27 @@ def resolve_contract(conn, ticker: str, universe_cfg):
     # ordinary path from a fallback without parsing prose: every US line
     # resolves on route 1 and listing them all as "a second route" buries the
     # handful that matter.
+    # Route 1 — the Yahoo stem, routed through SMART.
     if primary:
         c = _q(Stock(sym, smart, ccy, primaryExchange=primary), f"{smart}+{primary}")
         if c:
             return c, f"smart:{smart}/{primary}"
-        c = _q(Stock(sym, primary, ccy), primary)
-        if c:
-            return c, f"native:{primary}"
     else:
         c = _q(Stock(sym, smart, ccy), smart)
         if c:
             return c, f"smart:{smart}"
 
+    # Route 2 — ask IBKR what it files under this stem, then route THAT
+    # through SMART too.
+    #
+    # Qualifying a contract and being allowed to send an order to it are two
+    # different things. Naming the exchange directly qualifies fine and is
+    # then refused at order time with error 10311, "this order will be
+    # directly routed to LSE" — direct routing is off on the account. So the
+    # symbol the search gives back is used to build an ordinary SMART
+    # contract, which is what fixes RR./SN./UU.: London files Rolls-Royce as
+    # "RR.", and the trailing dot is part of the ticker that stripping ".L"
+    # from the Yahoo name throws away.
     try:
         trouves = conn.ib.reqMatchingSymbols(sym) or []
     except Exception as e:
@@ -165,10 +181,22 @@ def resolve_contract(conn, ticker: str, universe_cfg):
             continue
         if primary and dc.primaryExchange and dc.primaryExchange != primary:
             continue
-        c = _q(Contract(conId=dc.conId, secType="STK",
-                        exchange=primary or smart), f"search {dc.symbol}")
+        if dc.symbol == sym and not primary:
+            continue                      # route 1 already tried that spec
+        pri = primary or dc.primaryExchange
+        c = _q(Stock(dc.symbol, smart, ccy, primaryExchange=pri) if pri
+               else Stock(dc.symbol, smart, ccy), f"search {dc.symbol}+{smart}")
         if c:
-            return c, f"search:{dc.symbol}@{c.exchange}"
+            return c, f"search:{dc.symbol}/{smart}"
+
+    # Route 3 — the exchange itself, last. It qualifies where SMART does not
+    # reach, but the order may still be refused for direct routing, which is
+    # a setting on the account rather than anything this code can fix. Taking
+    # it last means a name that has any SMART route uses it.
+    if primary:
+        c = _q(Stock(sym, primary, ccy), primary)
+        if c:
+            return c, f"native:{primary}"
 
     return None, "; ".join(essais) or "no route"
 
