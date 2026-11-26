@@ -203,7 +203,22 @@ def load_current_positions(
 # serving a stale broker state silently.
 _POSITIONS_BRUTES = None
 _POSITIONS_LUES_A = 0.0
-_POSITIONS_TTL_S = 300.0      # 5 minutes
+# No expiry inside a process, and that is deliberate.
+#
+# A five-minute TTL was tried and was worse than either extreme: an order
+# sheet spends about two minutes per universe downloading fundamentals, so the
+# cache expired BETWEEN universes and the broker was reconnected five times —
+# reintroducing exactly the connection storm the single read was added to
+# stop, while protecting against a staleness that does not matter here. The
+# sheet is a snapshot the operator reads and acts on later; positions read at
+# its start are the right positions to describe.
+#
+# Only run_orders and run_beta read through here, and both are read-only
+# snapshots: one writes a spreadsheet, the other prints a measurement. No mode
+# that PLACES an order uses this cache — run_flatten reads the broker by its
+# own path — so there is no order sized on a stale holding to guard against.
+# reset_positions_cache() exists for a caller that would need otherwise.
+_POSITIONS_TTL_S = float("inf")
 
 
 def reset_positions_cache() -> None:

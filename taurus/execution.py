@@ -96,12 +96,26 @@ class IBKRConnection:
             return False
 
     def ensure_connected(self) -> bool:
-        """Called before every operation. Reconnects with exponential backoff."""
+        """Called before every operation. Connects, then retries with backoff.
+
+        The first attempt is made IMMEDIATELY.  It used to be preceded by the
+        first 60-second wait, because a freshly built connection reports
+        isConnected() False and the loop slept before trying: every connection
+        in the program cost a minute before a single packet was sent, and the
+        log said "disconnected, reconnecting" about a connection that had never
+        been attempted.  With a connection opened per universe plus one for the
+        NAV, that was seven minutes of pure waiting per order sheet, and it
+        looked exactly like a broker problem.
+
+        The backoff still applies BETWEEN attempts, which is what it is for.
+        """
         if self.ib.isConnected():
             return True
-        waits = [60, 120, 240, 480, 900, 1800]   # seconds
+        if self.connect():
+            return True
+        waits = [60, 120, 240, 480, 900, 1800]   # seconds, between retries
         for wait in waits:
-            logger.warning("IBKR disconnected. Reconnecting in %ds...", wait)
+            logger.warning("IBKR unreachable — retrying in %ds...", wait)
             time.sleep(wait)
             if self.connect():
                 return True
