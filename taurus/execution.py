@@ -812,6 +812,7 @@ class OrderManager:
         conn:     IBKRConnection,
         ticker:   str,
         dry_run:  bool = False,
+        symbol:   str  = None,
     ) -> list:
         """
         Cancel all open STP/LMT protective orders for a ticker before rebalancing.
@@ -820,7 +821,11 @@ class OrderManager:
         """
         PROTECTIVE = {"STP", "LMT"}
         ACTIVE     = {"PreSubmitted", "Submitted", "PendingSubmit"}
-        ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
+        # The Yahoo stem is not always IBKR's symbol: London files Rolls-Royce
+        # as "RR.", so stripping ".L" leaves "RR" and a stale stop on it would
+        # never be matched. Callers that already hold a resolved contract pass
+        # its symbol.
+        ibkr_ticker = symbol or (ticker.split(".")[0] if "." in ticker else ticker)
         cancelled: list = []
         try:
             for trade in conn.ib.openTrades():
@@ -939,9 +944,6 @@ class OrderManager:
         action = "BUY" if delta > 0 else "SELL"
         qty    = abs(delta)
 
-        if not dry_run:
-            self.cancel_protective_orders(conn, ticker, dry_run=False)
-
         order_info = {
             "ticker":   ticker,
             "action":   action,
@@ -976,6 +978,13 @@ class OrderManager:
                     order_info["status"] = "unresolved"
                     order_info["error"]  = route
                     return order_info
+
+            # Stale protective orders are cleared now that the contract is
+            # resolved, so the cancel matches on IBKR's own symbol rather than
+            # the Yahoo stem. A stop left from an earlier run is sized for a
+            # position that no longer exists.
+            self.cancel_protective_orders(conn, ticker, dry_run=False,
+                                          symbol=contract.symbol)
 
             # Plain market order, transmitted on the spot.
             #

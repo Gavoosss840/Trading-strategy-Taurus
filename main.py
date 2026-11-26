@@ -1369,8 +1369,16 @@ def run_execute_sheet(args, cfg) -> None:
                   f"these {len(lignes)} market order(s).")
             return
 
+        # IBKR caps the API connection at roughly 50 messages a second and
+        # answers a burst above it with error 100, "max rate of messages
+        # exceeded", after which it can drop the connection outright. This
+        # loop sent 296 orders as fast as the socket would take them, each
+        # preceded by a cancel scan — comfortably over the cap. A 40 ms pause
+        # holds it near 25 a second and costs twelve seconds on the whole
+        # book, which is nothing against losing the connection halfway
+        # through a rebalance and not knowing which half went out.
         envoyes, echecs = 0, []
-        for l in lignes:
+        for i, l in enumerate(lignes):
             try:
                 info = om.place_order(
                     conn, l["ticker"], l["delta"],
@@ -1383,6 +1391,9 @@ def run_execute_sheet(args, cfg) -> None:
                     echecs.append(f"{l['ticker']} ({info.get('status') if info else 'no reply'})")
             except Exception as e:
                 echecs.append(f"{l['ticker']} ({e})")
+            conn.ib.sleep(0.04)
+            if (i + 1) % 50 == 0:
+                logger.info("%d/%d orders sent...", i + 1, len(lignes))
         print(f"\n{envoyes} order(s) submitted.")
         if echecs:
             print(f"{len(echecs)} NOT submitted: " + ", ".join(echecs[:15]))
