@@ -1170,59 +1170,49 @@ def run_execute_sheet(args, cfg) -> None:
             return
 
         # ── Pre-flight: every line must resolve to a contract at IBKR ────────
-        # place_order calls qualifyContracts and, on conId 0, retries on SMART
-        # — but if that fails too it carries on with an unqualified contract.
-        # IBKR then accepts the call and does nothing, and the loop below
-        # counts it as "submitted" because a Trade object came back.  That is
-        # an order that exists nowhere, reported as sent.
+        # place_order used to send an unqualified contract when it could not
+        # resolve one: IBKR accepts the call, returns a Trade object, and the
+        # order exists nowhere — reported as submitted. 13 November: 44 shorts
+        # never opened while borrow was available on at least 27 of them, and
+        # nothing in the log said so.
         #
-        # 13 November: 44 shorts never opened while borrow was available on at
-        # least 27 of them.  An unresolved symbol produces exactly that, and
-        # nothing in the log said so.  So the check runs FIRST, it runs in dry
-        # run too — the point is to see it before sending, not after — and a
-        # line that does not resolve is withheld and named.
+        # resolve_contract tries SMART, then the exchange itself, then IBKR's
+        # symbol search. The first version of this check tried "SMART" as its
+        # fallback, which _stock_contract already sets — so it retried the
+        # identical spec and twelve lines, five of them positions the account
+        # holds, were reported unresolvable when only the spec was wrong.
         import logging as _lg
 
-        from taurus.execution import _stock_contract
+        from taurus.execution import resolve_contract, session_state
 
         _wrap = _lg.getLogger("ib_insync.wrapper")
         _prev = _wrap.level
         _wrap.setLevel(_lg.ERROR)          # error 200 floods on every miss
-        irresolus = []
         try:
-            for i in range(0, len(lignes), 25):
-                paquet = lignes[i:i + 25]
-                contrats = []
-                for l in paquet:
-                    c = _stock_contract(l["ticker"], REGISTRY.get(l["universe"]).config)
-                    l["_contrat"] = c
-                    contrats.append(c)
-                try:
-                    conn.ib.qualifyContracts(*contrats)
-                except Exception as e:
-                    logger.debug("qualifyContracts batch raised: %s", e)
-                # Same SMART fallback place_order uses, for a market that is
-                # closed on its primary exchange.
-                for l in paquet:
-                    if l["_contrat"].conId:
-                        continue
-                    c2 = _stock_contract(l["ticker"], REGISTRY.get(l["universe"]).config)
-                    c2.exchange = "SMART"
-                    try:
-                        conn.ib.qualifyContracts(c2)
-                    except Exception:
-                        pass
-                    if c2.conId:
-                        l["_contrat"] = c2
+            for l in lignes:
+                c, route = resolve_contract(conn, l["ticker"],
+                                            REGISTRY.get(l["universe"]).config)
+                l["_contrat"], l["_route"] = c, route
         finally:
             _wrap.setLevel(_prev)
 
-        irresolus = [l for l in lignes if not l["_contrat"].conId]
-        lignes = [l for l in lignes if l["_contrat"].conId]
+        irresolus = [l for l in lignes if l["_contrat"] is None]
+        lignes = [l for l in lignes if l["_contrat"] is not None]
         print(f"\nPre-flight: {len(lignes) + len(irresolus)} line(s) checked at "
               f"IBKR — {len(lignes)} resolved, {len(irresolus)} unresolved.")
+
+        # Routes other than the plain one are worth seeing: they are the names
+        # whose IBKR identity differs from the Yahoo ticker.
+        detours = [l for l in lignes
+                   if not l["_route"].startswith("smart:")]
+        if detours:
+            print(f"\n{len(detours)} line(s) resolved on a second route:")
+            for l in sorted(detours, key=lambda z: (z["universe"], z["ticker"])):
+                print(f"   {l['ticker']:12s} {l['universe']:11s} -> "
+                      f"{l['_route']}  conId {l['_contrat'].conId}")
+
         if irresolus:
-            print("\nNOT SENT — IBKR does not resolve these symbols. An order "
+            print("\nNOT SENT — IBKR resolves no contract for these. An order "
                   "on one of them would be accepted and never exist:")
             for l in sorted(irresolus, key=lambda z: (z["universe"], z["ticker"])):
                 ucfg = REGISTRY.get(l["universe"]).config
@@ -1230,9 +1220,16 @@ def run_execute_sheet(args, cfg) -> None:
                 print(f"   {l['ticker']:12s} {l['universe']:11s} "
                       f"{_sym}/{_pri or ucfg.ibkr_exchange}/{_ccy:3s} "
                       f"held {l['detenu']:+8.0f} target {l['cible']:+8.0f}")
+                print(f"      tried: {l['_route']}")
+            tenus_bloques = [l for l in irresolus if abs(l["detenu"]) >= 1]
+            if tenus_bloques:
+                print(f"\n   {len(tenus_bloques)} of them are positions the "
+                      f"account HOLDS and therefore cannot be adjusted or "
+                      f"closed. That is open exposure outside the model.")
         if not lignes:
             print("\nNo line resolves — nothing to send.")
             return
+
 
         # ── In-flight orders, keyed by the symbol IBKR actually files ────────
         # get_pending_shares keys on trade.contract.symbol.  This loop looked
@@ -1271,6 +1268,29 @@ def run_execute_sheet(args, cfg) -> None:
             logger.info("%d line(s) need no order; %d of those are a non-zero "
                         "adjustment smaller than one lot.",
                         len(ignorees), len(sous_lot))
+
+        # Truncating to whole shares strands whatever fraction the broker
+        # holds. Closing a 9.5-share position sends 9 and leaves 0.5 long,
+        # which is why two lines showed "held 10, send -9": the display
+        # rounded 9.5 up and the order truncated it down. Rounding the other
+        # way would sell more than is held and open a short, so the fragment
+        # stays — but it is named rather than left to be discovered.
+        restes = []
+        for l in lignes + ignorees:
+            reste = (l["cible"] - l["detenu"] - l["en_cours"]) - l["delta"]
+            if abs(reste) > 1e-6:
+                restes.append((l["ticker"], l["universe"], l["detenu"], reste))
+        if restes:
+            fract = [r for r in restes if abs(r[3]) < 1]
+            if fract:
+                print(f"\n{len(fract)} line(s) leave a fraction of a share "
+                      f"behind, because the broker holds a fractional "
+                      f"position and an order cannot:")
+                for t, u, det, r in sorted(fract)[:12]:
+                    print(f"   {t:12s} {u:11s} holds {det:+.4f}, "
+                          f"{r:+.4f} share left over")
+                if len(fract) > 12:
+                    print(f"   ... and {len(fract) - 12} more")
         if not lignes:
             print("\nNothing to send: the book already matches the sheet.")
             return
@@ -1290,24 +1310,38 @@ def run_execute_sheet(args, cfg) -> None:
             try:
                 det = conn.ib.reqContractDetails(l["_contrat"])
                 if det:
-                    heures = (det[0].tradingHours or "").split(";")[0]
+                    # liquidHours is the regular session; tradingHours adds
+                    # the extended ones. Tokyo's tradingHours ran 17:00-06:00,
+                    # so the table called it open at 20:00 local when the
+                    # auction had closed hours earlier. A market order wants
+                    # the liquid session — that is where it fills at a price
+                    # worth having.
+                    heures = det[0].liquidHours or det[0].tradingHours or ""
                     fuseau = det[0].timeZoneId or ""
             except Exception as e:
                 logger.debug("reqContractDetails failed for %s: %s", ex, e)
             n = sum(1 for z in lignes
                     if (z["_contrat"].primaryExchange or z["_contrat"].exchange) == ex)
-            ferme = "CLOSED" in heures.upper()
-            etat_marche.append((ex, n, heures, fuseau, ferme))
+            ouvert, texte = session_state(heures, fuseau)
+            etat_marche.append((ex, n, ouvert, texte, fuseau))
         if etat_marche:
-            print(f"\n{'exchange':12s} {'orders':>6s}  {'session (exchange time)':34s} tz")
-            for ex, n, heures, fuseau, ferme in etat_marche:
-                marque = "  <-- CLOSED TODAY" if ferme else ""
-                print(f"{ex:12s} {n:6d}  {heures or '?':34s} {fuseau}{marque}")
-            if any(f for *_, f in etat_marche):
-                print("\nOrders to an exchange closed today will not fill "
-                      "today. They sit as DAY orders and IBKR may expire them "
-                      "at its daily reset rather than carry them to the next "
-                      "session — check them tomorrow with --mode cancel-orders.")
+            print(f"\n{'exchange':12s} {'orders':>6s}  {'session now':34s} tz")
+            for ex, n, ouvert, texte, fuseau in sorted(
+                    etat_marche, key=lambda z: (z[2] is not False, z[0])):
+                print(f"{ex:12s} {n:6d}  {texte:34s} {fuseau}")
+            fermes = [(ex, n) for ex, n, ouvert, _t, _f in etat_marche
+                      if ouvert is False]
+            if fermes:
+                total = sum(n for _e, n in fermes)
+                print(f"\n{total} of these {len(lignes)} orders go to an "
+                      f"exchange that is CLOSED right now "
+                      f"({', '.join(f'{e} {n}' for e, n in fermes)}).")
+                print("They cannot fill until that market opens. A market-"
+                      "neutral book whose legs fill on different days carries "
+                      "the unmatched side overnight, which is the one thing "
+                      "this strategy is built not to do. Weigh that before "
+                      "sending: a sheet regenerated when the markets you need "
+                      "are open costs a day and keeps the legs together.")
 
         # ── Reducing orders before increasing ones ──────────────────────────
         # execution.py states "exits before entries (margin safety)" as a
@@ -1341,8 +1375,7 @@ def run_execute_sheet(args, cfg) -> None:
                 info = om.place_order(
                     conn, l["ticker"], l["delta"],
                     REGISTRY.get(l["universe"]).config,
-                    dry_run=False, entry_price=l["prix"],
-                    target_qty=abs(l["cible"]) or abs(l["delta"]),
+                    dry_run=False, contract=l["_contrat"],
                 )
                 if info and info.get("status") == "submitted":
                     envoyes += 1

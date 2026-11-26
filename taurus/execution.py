@@ -54,6 +54,125 @@ def _stock_contract(ticker: str, universe_cfg):
 logger = logging.getLogger(__name__)
 
 
+def session_state(trading_hours: str, time_zone_id: str):
+    """
+    Is this exchange in session right now? -> (open?, human text)
+
+    open? is None when IBKR's own strings cannot be read, in which case the
+    text is the raw first segment and no claim is made.
+
+    IBKR gives tradingHours as "20261126:0930-20261126:1600;2026...", or
+    "20261126:CLOSED", in the exchange's own zone, named by timeZoneId —
+    "US/Eastern", "Japan", "MET", "GB-Eire". Those are tz database names, so
+    the comparison can be done properly instead of eyeballing the first
+    segment: Tokyo's string read 20261125:1700-20261126:0600, which looks
+    like a live session and is in fact one that ended hours ago.
+    """
+    from datetime import datetime
+
+    brut = (trading_hours or "").split(";")[0]
+    try:
+        from zoneinfo import ZoneInfo
+        maintenant = datetime.now(ZoneInfo(time_zone_id)).replace(tzinfo=None)
+    except Exception:
+        return None, brut or "?"
+
+    prochain = None
+    for seg in (trading_hours or "").split(";"):
+        if not seg or "CLOSED" in seg.upper():
+            continue
+        deb, _, fin = seg.partition("-")
+        try:
+            a = datetime.strptime(deb.strip(), "%Y%m%d:%H%M")
+            b = datetime.strptime(fin.strip(), "%Y%m%d:%H%M")
+        except ValueError:
+            continue
+        if a <= maintenant <= b:
+            return True, f"open, closes {b:%H:%M}"
+        if maintenant < a and (prochain is None or a < prochain):
+            prochain = a
+    if prochain is not None:
+        return False, f"CLOSED, opens {prochain:%a %d %b %H:%M}"
+    return False, "CLOSED"
+
+
+def resolve_contract(conn, ticker: str, universe_cfg):
+    """
+    Resolve a Yahoo ticker to a contract IBKR will actually accept.
+
+    Returns (contract, route) on success, (None, why) on failure.
+
+    Three routes, tried in order, because one spec does not cover every
+    venue:
+
+      1. SMART with the primary listing named. Works for the US, and for the
+         European venues SMART routes.
+      2. The exchange itself. SMART does not route everything — Athens and
+         Dublin among them — and naming it as primaryExchange is not the same
+         as sending the order there. A book that holds ETE.AT and cannot
+         qualify it is proof the instrument exists and the spec is wrong.
+      3. IBKR's own symbol search. The Yahoo stem is not always IBKR's
+         symbol: London files Rolls-Royce as "RR.", Smith & Nephew as "SN."
+         and United Utilities as "UU.", which Yahoo writes RR.L, SN.L, UU.L —
+         the trailing dot is part of the ticker, and stripping ".L" loses it.
+         The search is asked what it knows under the stem and the answer is
+         matched on security type, currency and listing.
+    """
+    from ib_insync import Contract, Stock
+
+    from .universe import ticker_market
+
+    sym, ccy, _minor, primary = ticker_market(ticker, universe_cfg)
+    smart = getattr(universe_cfg, "ibkr_exchange", "SMART")
+    essais = []
+
+    def _q(c, etiquette):
+        try:
+            conn.ib.qualifyContracts(c)
+        except Exception as e:
+            essais.append(f"{etiquette}: {type(e).__name__}")
+            return None
+        if getattr(c, "conId", 0):
+            return c
+        essais.append(f"{etiquette}: no match")
+        return None
+
+    # The route is tagged, not just described, so a caller can tell the
+    # ordinary path from a fallback without parsing prose: every US line
+    # resolves on route 1 and listing them all as "a second route" buries the
+    # handful that matter.
+    if primary:
+        c = _q(Stock(sym, smart, ccy, primaryExchange=primary), f"{smart}+{primary}")
+        if c:
+            return c, f"smart:{smart}/{primary}"
+        c = _q(Stock(sym, primary, ccy), primary)
+        if c:
+            return c, f"native:{primary}"
+    else:
+        c = _q(Stock(sym, smart, ccy), smart)
+        if c:
+            return c, f"smart:{smart}"
+
+    try:
+        trouves = conn.ib.reqMatchingSymbols(sym) or []
+    except Exception as e:
+        trouves = []
+        essais.append(f"symbol search: {type(e).__name__}")
+
+    for d in trouves:
+        dc = getattr(d, "contract", None)
+        if dc is None or dc.secType != "STK" or dc.currency != ccy:
+            continue
+        if primary and dc.primaryExchange and dc.primaryExchange != primary:
+            continue
+        c = _q(Contract(conId=dc.conId, secType="STK",
+                        exchange=primary or smart), f"search {dc.symbol}")
+        if c:
+            return c, f"search:{dc.symbol}@{c.exchange}"
+
+    return None, "; ".join(essais) or "no route"
+
+
 # --------------------------------------------------------------------------- #
 #  IBKR Connection manager                                                    #
 # --------------------------------------------------------------------------- #
@@ -794,6 +913,7 @@ class OrderManager:
         entry_price:      float = 0.0,      # ignored, kept for callers
         take_profit_pct:  float = 0.20,     # ignored, kept for callers
         target_qty:       float = None,     # ignored, kept for callers
+        contract                = None,     # pre-resolved contract, if any
     ) -> Optional[dict]:
         """
         Place a plain market order. No stop, no take-profit, on any market.
@@ -842,26 +962,20 @@ class OrderManager:
             return order_info
 
         try:
-            # Strip Yahoo Finance exchange suffixes (.L, .PA, .T, .HK, .SR, etc.)
-            ibkr_ticker = ticker.split(".")[0] if "." in ticker else ticker
-            contract = _stock_contract(ticker, universe_cfg)
-
-            # Try to qualify with primary exchange; fall back to SMART if market is closed
-            # (e.g. ENXTPA/LSE/TSEJ during overnight US session).
-            # ib_insync logs Error 200 as a WARNING without raising — check conId instead.
-            try:
-                conn.ib.qualifyContracts(contract)
-            except Exception:
-                contract.conId = 0   # force fallback below
-
-            if not contract.conId:
-                logger.warning(
-                    "qualifyContracts failed for %s on %s (conId=0) — retrying with SMART",
-                    ibkr_ticker, universe_cfg.ibkr_exchange,
-                )
-                contract = _stock_contract(ticker, universe_cfg)
-                contract.exchange = "SMART"
-                conn.ib.qualifyContracts(contract)
+            # A contract the caller has already resolved is used as it stands.
+            # The point is that what was checked is what gets sent: resolving
+            # again here could pick a different route than the one verified,
+            # and the old fallback "retry with SMART" was no fallback at all —
+            # _stock_contract already builds the contract with exchange=SMART,
+            # so it retried the identical spec and reported the same failure.
+            if contract is None:
+                contract, route = resolve_contract(conn, ticker, universe_cfg)
+                if contract is None:
+                    logger.error("Cannot resolve %s at IBKR (%s) — not sent.",
+                                 ticker, route)
+                    order_info["status"] = "unresolved"
+                    order_info["error"]  = route
+                    return order_info
 
             # Plain market order, transmitted on the spot.
             #
